@@ -1,0 +1,20 @@
+[package]
+name = "screenshot-rs-rebuild"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "screenshot"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+png = "0.17"
+tempfile = "3"
+wayland-client = { version = "0.31", default-features = false }
+wayland-protocols = { version = "0.32", default-features = false, features = ["client", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", default-features = false, features = ["client"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
