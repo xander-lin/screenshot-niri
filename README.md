@@ -12,10 +12,10 @@
 
 ## Runtime Flow
 
-1. Parse CLI output and clipboard options.
+1. Parse CLI arguments, output path, and clipboard options.
 2. Reject normal capture outside a niri session with a niri-only diagnostic.
 3. Capture and freeze all outputs with `zwlr_screencopy_manager_v1`.
-4. Run a layer-shell overlay for drag-based region selection.
+4. Run a layer-shell overlay for drag-based region selection over the frozen captured frames.
 5. Composite selected output regions into one image.
 6. Write PNG to the selected path.
 7. Serve the written file to the clipboard through `wlr-data-control` as either `image/png` or file URI data.
@@ -29,8 +29,8 @@
 - `image`: captured-image representation, compositing, and PNG writing.
 - `clipboard`: detached clipboard provider and `wlr-data-control` source handling.
 - `wayland::screencopy`: wlroots screencopy capture and frozen-output collection.
-- `wayland::selection`: niri/wlr layer-shell overlay selection.
+- `wayland::selection`: niri/wlr layer-shell selection over frozen-frame overlay.
 
 ## Verification
 
-Developer implementation did not run commands. Expected validation is `cargo test` for pure logic followed by `cargo check`, then a manual niri session test for selection, capture, file writing, and clipboard modes.
+Automated validation for the frozen-background implementation passed with `cargo test selection`, `cargo test`, and `cargo check`. Manual niri testing before the frozen-background change was reported successful for selection, capture, file writing, and clipboard behavior; a niri retest is still needed to confirm the visual frozen-screen selection behavior.

@@ -115,3 +115,65 @@ fn validate_image(image: &Image) -> Result<(), Box<dyn Error>> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wayland::screencopy::Region;
+
+    #[test]
+    fn xrgb8888_to_rgba_sets_alpha_to_255() {
+        let image = Image {
+            width: 2,
+            height: 1,
+            stride: 8,
+            format: Format::Xrgb8888,
+            data: vec![3, 2, 1, 0, 6, 5, 4, 7],
+        };
+
+        assert_eq!(to_rgba(&image).unwrap(), vec![1, 2, 3, 255, 4, 5, 6, 255]);
+    }
+
+    #[test]
+    fn argb8888_to_rgba_preserves_source_alpha() {
+        let image = Image { width: 1, height: 1, stride: 4, format: Format::Argb8888, data: vec![30, 20, 10, 40] };
+
+        assert_eq!(to_rgba(&image).unwrap(), vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn validation_rejects_short_buffers_and_invalid_geometry() {
+        let short = Image { width: 2, height: 2, stride: 8, format: Format::Xrgb8888, data: vec![0; 15] };
+        let zero_width = Image { width: 0, height: 1, stride: 4, format: Format::Xrgb8888, data: vec![0; 4] };
+        let short_stride = Image { width: 2, height: 1, stride: 4, format: Format::Xrgb8888, data: vec![0; 4] };
+
+        assert!(validate_image(&short).is_err());
+        assert!(validate_image(&zero_width).is_err());
+        assert!(validate_image(&short_stride).is_err());
+    }
+
+    #[test]
+    fn composite_captured_region_blits_subregion_to_destination() {
+        let source = CapturedOutput {
+            output_name: 7,
+            image: Image {
+                width: 3,
+                height: 2,
+                stride: 12,
+                format: Format::Xrgb8888,
+                data: vec![
+                    1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255,
+                    4, 4, 4, 255, 5, 5, 5, 255, 6, 6, 6, 255,
+                ],
+            },
+        };
+        let region = CaptureOutputRegion { output_name: 7, region: Region { x: 1, y: 0, width: 2, height: 2 }, dst_x: 1, dst_y: 1 };
+
+        let image = composite_captured_region(&[region], 4, 4, &[source]).unwrap();
+
+        let mut expected = vec![0; 4 * 4 * 4];
+        expected[20..28].copy_from_slice(&[2, 2, 2, 255, 3, 3, 3, 255]);
+        expected[36..44].copy_from_slice(&[5, 5, 5, 255, 6, 6, 6, 255]);
+        assert_eq!(image.data, expected);
+    }
+}

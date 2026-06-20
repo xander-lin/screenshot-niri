@@ -24,6 +24,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 };
 
 use crate::geometry::{LogicalRect, OutputInfo, SelectedViewport};
+use crate::wayland::screencopy::CapturedOutput;
 
 const BTN_LEFT: u32 = 0x110;
 const KEY_ESC: u32 = 1;
@@ -130,8 +131,24 @@ struct OverlaySurface {
     surface: WlSurface,
     layer_surface: ZwlrLayerSurfaceV1,
     buffers: Vec<OverlayBuffer>,
+    render_cache: Option<OverlayRenderCache>,
     width: i32,
     height: i32,
+}
+
+struct OverlayRenderCache {
+    width: i32,
+    height: i32,
+    base: Vec<u8>,
+    dimmed: Vec<u8>,
+}
+
+struct FrozenOutput {
+    info: OutputInfo,
+    width: i32,
+    height: i32,
+    stride: i32,
+    data: Vec<u8>,
 }
 
 impl Drop for OverlaySurface {
@@ -150,6 +167,7 @@ struct UiState {
     pointer: Option<WlPointer>,
     keyboard: Option<WlKeyboard>,
     outputs: Vec<OutputRuntime>,
+    frozen_outputs: Vec<FrozenOutput>,
     overlays: Vec<OverlaySurface>,
     pointer_output_name: Option<u32>,
     pointer_x: i32,
@@ -174,7 +192,7 @@ impl UiState {
     }
 }
 
-pub fn select_viewport() -> Result<SelectionOutcome, Box<dyn Error>> {
+pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOutcome, Box<dyn Error>> {
     let conn = Connection::connect_to_env()?;
     let mut event_queue = conn.new_event_queue::<UiState>();
     let qh = event_queue.handle();
@@ -187,6 +205,7 @@ pub fn select_viewport() -> Result<SelectionOutcome, Box<dyn Error>> {
         pointer: None,
         keyboard: None,
         outputs: Vec::new(),
+        frozen_outputs: frozen_outputs_from_captures(frozen_outputs)?,
         overlays: Vec::new(),
         pointer_output_name: None,
         pointer_x: 0,
@@ -213,6 +232,7 @@ pub fn select_viewport() -> Result<SelectionOutcome, Box<dyn Error>> {
     if state.pointer.is_none() {
         return Err("no wl_pointer from wl_seat is available for selection".into());
     }
+    validate_frozen_outputs(&state.outputs, &state.frozen_outputs)?;
     create_overlays(&mut state, &qh)?;
     conn.flush()?;
 
@@ -258,6 +278,7 @@ fn create_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Result<(),
             surface,
             layer_surface,
             buffers: Vec::new(),
+            render_cache: None,
             width: output.info.logical.width.max(1),
             height: output.info.logical.height.max(1),
         });
@@ -284,10 +305,14 @@ fn render_overlays(state: &mut UiState) {
         let Some(damage) = damage else {
             continue;
         };
+        let Some(render_cache) = overlay.render_cache.as_ref() else {
+            state.drag = DragState::Cancelled;
+            continue;
+        };
         if buffer.initialized {
-            draw_overlay_region(data, overlay.width, output.info.logical, rect, damage);
+            draw_overlay_region(data, render_cache, output.info, rect, damage);
         } else {
-            draw_overlay(data, overlay.width, overlay.height, output.info.logical, rect);
+            draw_overlay(data, render_cache, output.info, rect);
             buffer.initialized = true;
         }
         buffer.last_selected = current_selected;
@@ -298,52 +323,136 @@ fn render_overlays(state: &mut UiState) {
     }
 }
 
-fn draw_overlay(data: &mut [u8], width: i32, height: i32, output: LogicalRect, selected: Option<LogicalRect>) {
+fn frozen_outputs_from_captures(captures: &[CapturedOutput]) -> Result<Vec<FrozenOutput>, Box<dyn Error>> {
+    let mut frozen_outputs = Vec::with_capacity(captures.len());
+    for capture in captures {
+        let image = &capture.image;
+        if !matches!(image.format, Format::Xrgb8888 | Format::Argb8888) {
+            return Err(format!("unsupported frozen output format for output {}: {:?}", capture.output_name, image.format).into());
+        }
+        if image.width <= 0 || image.height <= 0 {
+            return Err(format!("frozen output {} dimensions must be positive", capture.output_name).into());
+        }
+        let minimum_stride = image.width.checked_mul(4).ok_or("frozen output stride overflow")?;
+        if image.stride < minimum_stride {
+            return Err(format!("frozen output {} stride is smaller than width * 4", capture.output_name).into());
+        }
+        let minimum_len = usize::try_from(image.stride)?.checked_mul(usize::try_from(image.height)?).ok_or("frozen output data length overflow")?;
+        if image.data.len() < minimum_len {
+            return Err(format!("frozen output {} data is shorter than stride * height", capture.output_name).into());
+        }
+        let width = i32::try_from(image.width)?;
+        let height = i32::try_from(image.height)?;
+        let stride = i32::try_from(image.stride)?;
+        frozen_outputs.push(FrozenOutput {
+            info: OutputInfo {
+                global_name: capture.output_name,
+                logical: LogicalRect { x: 0, y: 0, width, height },
+                scale: 1,
+            },
+            width,
+            height,
+            stride,
+            data: image.data.clone(),
+        });
+    }
+    Ok(frozen_outputs)
+}
+
+fn validate_frozen_outputs(outputs: &[OutputRuntime], frozen_outputs: &[FrozenOutput]) -> Result<(), Box<dyn Error>> {
+    for output in outputs {
+        if !frozen_outputs.iter().any(|frozen| frozen.info.global_name == output.info.global_name) {
+            return Err(format!("missing frozen screenshot for advertised output {}", output.info.global_name).into());
+        }
+    }
+    Ok(())
+}
+
+fn frozen_pixel(frozen: &FrozenOutput, output: OutputInfo, overlay_width: i32, overlay_height: i32, local_x: i32, local_y: i32) -> [u8; 4] {
+    if frozen.width <= 0 || frozen.height <= 0 || frozen.stride <= 0 || overlay_width <= 0 || overlay_height <= 0 {
+        return [0, 0, 0, 255];
+    }
+
+    let scale = output.scale.max(1);
+    let exact_scaled = frozen.width == output.logical.width.saturating_mul(scale) && frozen.height == output.logical.height.saturating_mul(scale);
+    let (source_x, source_y) = if exact_scaled {
+        (local_x.saturating_mul(scale), local_y.saturating_mul(scale))
+    } else {
+        (
+            ((local_x as i64 * frozen.width as i64) / overlay_width as i64) as i32,
+            ((local_y as i64 * frozen.height as i64) / overlay_height as i64) as i32,
+        )
+    };
+    let source_x = source_x.clamp(0, frozen.width - 1);
+    let source_y = source_y.clamp(0, frozen.height - 1);
+    let Ok(offset) = usize::try_from(source_y)
+        .and_then(|y| usize::try_from(frozen.stride).map(|stride| y * stride))
+        .and_then(|row| usize::try_from(source_x).map(|x| row + x * 4))
+    else {
+        return [0, 0, 0, 255];
+    };
+    let Some(pixel) = frozen.data.get(offset..offset + 4) else {
+        return [0, 0, 0, 255];
+    };
+    [pixel[0], pixel[1], pixel[2], 255]
+}
+
+fn build_overlay_render_cache(width: i32, height: i32, output: OutputInfo, frozen: &FrozenOutput) -> OverlayRenderCache {
     let buffer_width = width.max(0) as usize;
     let buffer_height = height.max(0) as usize;
-    fill_overlay(data, buffer_width, buffer_height, OVERLAY_OUTSIDE_MASK_BGRA);
-
-    let Some(selected) = selected else {
-        return;
-    };
-    let Some(local) = selected_local_intersection_for_buffer(output, selected, width, height) else {
-        return;
-    };
-    for local_y in local.y as usize..local.bottom() as usize {
-        for local_x in local.x as usize..local.right() as usize {
-            let global_x = output.x + local_x as i32;
-            let global_y = output.y + local_y as i32;
+    let len = buffer_width.saturating_mul(buffer_height).saturating_mul(4);
+    let mut base = vec![0; len];
+    let mut dimmed = vec![0; len];
+    for local_y in 0..buffer_height {
+        for local_x in 0..buffer_width {
             let offset = (local_y * buffer_width + local_x) * 4;
-            data[offset..offset + 4].copy_from_slice(&selected_overlay_pixel(global_x, global_y, selected));
+            let pixel = frozen_pixel(frozen, output, width, height, local_x as i32, local_y as i32);
+            base[offset..offset + 4].copy_from_slice(&pixel);
+            dimmed[offset..offset + 4].copy_from_slice(&composited_overlay_pixel(pixel, output.logical.x + local_x as i32, output.logical.y + local_y as i32, None));
         }
     }
+    OverlayRenderCache { width, height, base, dimmed }
 }
 
-fn draw_overlay_region(data: &mut [u8], width: i32, output: LogicalRect, selected: Option<LogicalRect>, dirty: LogicalRect) {
-    let width = width.max(0) as usize;
+fn composited_overlay_pixel(base: [u8; 4], global_x: i32, global_y: i32, selected: Option<LogicalRect>) -> [u8; 4] {
+    let overlay = overlay_pixel(global_x, global_y, selected);
+    let alpha = overlay[3] as u32;
+    if alpha == 0 {
+        return base;
+    }
+    if alpha == 255 {
+        return [overlay[0], overlay[1], overlay[2], 255];
+    }
+    let inverse_alpha = 255 - alpha;
+    [
+        (((overlay[0] as u32 * alpha) + (base[0] as u32 * inverse_alpha) + 127) / 255) as u8,
+        (((overlay[1] as u32 * alpha) + (base[1] as u32 * inverse_alpha) + 127) / 255) as u8,
+        (((overlay[2] as u32 * alpha) + (base[2] as u32 * inverse_alpha) + 127) / 255) as u8,
+        255,
+    ]
+}
+
+fn draw_overlay(data: &mut [u8], cache: &OverlayRenderCache, output: OutputInfo, selected: Option<LogicalRect>) {
+    draw_overlay_region(data, cache, output, selected, LogicalRect { x: 0, y: 0, width: cache.width, height: cache.height });
+}
+
+fn draw_overlay_region(data: &mut [u8], cache: &OverlayRenderCache, output: OutputInfo, selected: Option<LogicalRect>, dirty: LogicalRect) {
+    let width = cache.width.max(0) as usize;
     for local_y in dirty.y as usize..dirty.bottom() as usize {
         for local_x in dirty.x as usize..dirty.right() as usize {
-            let global_x = output.x + local_x as i32;
-            let global_y = output.y + local_y as i32;
+            let global_x = output.logical.x + local_x as i32;
+            let global_y = output.logical.y + local_y as i32;
             let offset = (local_y * width + local_x) * 4;
-            data[offset..offset + 4].copy_from_slice(&overlay_pixel(global_x, global_y, selected));
+            let source = match overlay_pixel(global_x, global_y, selected) {
+                OVERLAY_SELECTED_TRANSPARENT_BGRA => &cache.base,
+                OVERLAY_OUTSIDE_MASK_BGRA => &cache.dimmed,
+                border => {
+                    data[offset..offset + 4].copy_from_slice(&border);
+                    continue;
+                }
+            };
+            data[offset..offset + 4].copy_from_slice(&source[offset..offset + 4]);
         }
-    }
-}
-
-fn fill_overlay(data: &mut [u8], width: usize, height: usize, pixel: [u8; 4]) {
-    let len = width.saturating_mul(height).saturating_mul(4).min(data.len());
-    if len < 4 {
-        return;
-    }
-
-    data[..4].copy_from_slice(&pixel);
-    let mut filled = 4;
-    while filled < len {
-        let copy_len = filled.min(len - filled);
-        let (src, dst) = data[..len].split_at_mut(filled);
-        dst[..copy_len].copy_from_slice(&src[..copy_len]);
-        filled += copy_len;
     }
 }
 
@@ -558,11 +667,23 @@ impl Dispatch<ZwlrLayerSurfaceV1, u32> for UiState {
                 state.drag = DragState::Cancelled;
                 return;
             };
+            let configured_width = width as i32;
+            let configured_height = height as i32;
+            let Some(output) = state.outputs.iter().find(|output| output.info.global_name == *name) else {
+                state.drag = DragState::Cancelled;
+                return;
+            };
+            let Some(frozen) = state.frozen_outputs.iter().find(|frozen| frozen.info.global_name == *name) else {
+                state.drag = DragState::Cancelled;
+                return;
+            };
+            let render_cache = build_overlay_render_cache(configured_width, configured_height, output.info, frozen);
             let Some(overlay) = state.overlays.iter_mut().find(|overlay| overlay.output_name == *name) else {
                 return;
             };
-            overlay.width = width as i32;
-            overlay.height = height as i32;
+            overlay.width = configured_width;
+            overlay.height = configured_height;
+            overlay.render_cache = Some(render_cache);
             match create_overlay_buffers(&shm, *name, overlay.width, overlay.height, qh) {
                 Ok(buffers) => overlay.buffers = buffers,
                 Err(_) => state.drag = DragState::Cancelled,
@@ -735,15 +856,21 @@ mod tests {
 
     #[test]
     fn draw_overlay_masks_output_and_clears_only_local_selection() {
-        let output = LogicalRect { x: 100, y: 50, width: 6, height: 6 };
-        let selected = LogicalRect { x: 102, y: 52, width: 4, height: 4 };
+        let output = LogicalRect { x: 100, y: 50, width: 10, height: 10 };
+        let selected = LogicalRect { x: 102, y: 52, width: 8, height: 8 };
         let mut data = vec![0; (output.width * output.height * 4) as usize];
 
-        draw_overlay(&mut data, output.width, output.height, output, Some(selected));
+        let output_info = OutputInfo { global_name: 1, logical: output, scale: 1 };
+        let frozen_pixel = [10, 20, 30, 255];
+        let frozen = frozen_test_output(output_info, output.width, output.height, frozen_pixel);
+        let cache = build_overlay_render_cache(output.width, output.height, output_info, &frozen);
 
-        assert_eq!(pixel_at(&data, output.width as usize, 0, 0), OVERLAY_OUTSIDE_MASK_BGRA);
+        draw_overlay(&mut data, &cache, output_info, Some(selected));
+
+        assert_eq!(pixel_at(&data, output.width as usize, 0, 0), [6, 11, 17, 255]);
         assert_eq!(pixel_at(&data, output.width as usize, 2, 2), OVERLAY_BORDER_DARK_BGRA);
         assert_eq!(pixel_at(&data, output.width as usize, 3, 3), OVERLAY_BORDER_WHITE_BGRA);
+        assert_eq!(pixel_at(&data, output.width as usize, 5, 5), frozen_pixel);
     }
 
     #[test]
@@ -760,15 +887,52 @@ mod tests {
         .unwrap();
         let mut data = vec![0; (output.width * output.height * 4) as usize];
 
-        draw_overlay(&mut data, output.width, output.height, output, Some(previous));
-        draw_overlay_region(&mut data, output.width, output, Some(current), dirty);
+        let output_info = OutputInfo { global_name: 1, logical: output, scale: 1 };
+        let frozen_pixel = [10, 20, 30, 255];
+        let frozen = frozen_test_output(output_info, output.width, output.height, frozen_pixel);
+        let cache = build_overlay_render_cache(output.width, output.height, output_info, &frozen);
 
-        assert_eq!(pixel_at(&data, output.width as usize, 1, 1), OVERLAY_OUTSIDE_MASK_BGRA);
+        draw_overlay(&mut data, &cache, output_info, Some(previous));
+        draw_overlay_region(&mut data, &cache, output_info, Some(current), dirty);
+
+        assert_eq!(pixel_at(&data, output.width as usize, 1, 1), [6, 11, 17, 255]);
         assert_eq!(pixel_at(&data, output.width as usize, 3, 3), OVERLAY_BORDER_DARK_BGRA);
+    }
+
+    #[test]
+    fn build_overlay_render_cache_stores_base_and_dimmed_pixels() {
+        let output = LogicalRect { x: 0, y: 0, width: 2, height: 1 };
+        let output_info = OutputInfo { global_name: 1, logical: output, scale: 1 };
+        let mut frozen = frozen_test_output(output_info, output.width, output.height, [10, 20, 30, 255]);
+        frozen.data[4..8].copy_from_slice(&[40, 50, 60, 255]);
+
+        let cache = build_overlay_render_cache(output.width, output.height, output_info, &frozen);
+
+        assert_eq!(pixel_at(&cache.base, output.width as usize, 0, 0), [10, 20, 30, 255]);
+        assert_eq!(pixel_at(&cache.base, output.width as usize, 1, 0), [40, 50, 60, 255]);
+        assert_eq!(pixel_at(&cache.dimmed, output.width as usize, 0, 0), [6, 11, 17, 255]);
+        assert_eq!(pixel_at(&cache.dimmed, output.width as usize, 1, 0), [23, 28, 34, 255]);
+    }
+
+    #[test]
+    fn frozen_pixel_samples_scale_two_outputs() {
+        let output_info = OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 0, width: 2, height: 2 }, scale: 2 };
+        let mut frozen = frozen_test_output(output_info, 4, 4, [0, 0, 0, 255]);
+        frozen.data[(2 * frozen.stride + 2 * 4) as usize..(2 * frozen.stride + 3 * 4) as usize].copy_from_slice(&[11, 22, 33, 255]);
+
+        assert_eq!(frozen_pixel(&frozen, output_info, 2, 2, 1, 1), [11, 22, 33, 255]);
     }
 
     fn pixel_at(data: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
         let offset = (y * width + x) * 4;
         data[offset..offset + 4].try_into().unwrap()
+    }
+
+    fn frozen_test_output(info: OutputInfo, width: i32, height: i32, pixel: [u8; 4]) -> FrozenOutput {
+        let mut data = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..width * height {
+            data.extend_from_slice(&pixel);
+        }
+        FrozenOutput { info, width, height, stride: width * 4, data }
     }
 }

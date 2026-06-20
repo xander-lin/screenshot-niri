@@ -19,7 +19,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 fn run_normal(args: crate::cli::Args) -> Result<(), Box<dyn Error>> {
     crate::runtime::ensure_niri_session()?;
     let frozen_outputs = crate::wayland::screencopy::capture_outputs(true)?;
-    let viewport = match crate::wayland::selection::select_viewport()? {
+    let viewport = match crate::wayland::selection::select_viewport(&frozen_outputs)? {
         crate::wayland::selection::SelectionOutcome::Selected(viewport) => viewport,
         crate::wayland::selection::SelectionOutcome::Cancelled => return Err("selection cancelled".into()),
     };

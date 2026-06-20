@@ -205,4 +205,23 @@ fn file_uri_for_path(path: &Path) -> Result<String, Box<dyn Error>> {
     Ok(uri)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_uri_preserves_separators_and_safe_characters() {
+        let uri = file_uri_for_path(Path::new("/tmp/screenshot-1_alpha.~png")).unwrap();
+
+        assert_eq!(uri, "file:///tmp/screenshot-1_alpha.~png");
+    }
+
+    #[test]
+    fn file_uri_percent_encodes_spaces_reserved_and_non_ascii_bytes() {
+        let uri = file_uri_for_path(Path::new("/tmp/a b/#résumé?.png")).unwrap();
+
+        assert_eq!(uri, "file:///tmp/a%20b/%23r%C3%A9sum%C3%A9%3F.png");
+    }
+}
+
 delegate_noop!(ClipboardState: ignore WlSeat);
