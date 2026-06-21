@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::sync::mpsc::{self, TryRecvError};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 use crate::cli::{Command, Mode};
@@ -135,8 +135,8 @@ impl LongCaptureWorker {
         Self { stop, receiver, thread: Some(thread) }
     }
 
-    fn try_recv(&self) -> Result<CaptureMessage, TryRecvError> {
-        self.receiver.try_recv()
+    fn recv_timeout(&self, dur: Duration) -> Result<CaptureMessage, RecvTimeoutError> {
+        self.receiver.recv_timeout(dur)
     }
 
     fn stop(&mut self) {
@@ -175,80 +175,75 @@ fn run_long_capture(
     let mut capture_error: Option<String> = None;
     let mut prev_raw: Option<crate::image::Image> = None;
 
-    loop {
-        let mut processed = false;
-        for _ in 0..4 {
-            match worker.try_recv() {
-                Ok(CaptureMessage::PrepareCapture { ack, .. }) => {
-                    let _ = selection_session.prepare_capture_clean();
-                    let _ = ack.send(());
-                    processed = true;
+    while !capture_finished {
+        match worker.recv_timeout(LONG_UI_POLL_INTERVAL) {
+            Ok(CaptureMessage::PrepareCapture { ack, .. }) => {
+                let _ = selection_session.prepare_capture_clean();
+                let _ = ack.send(());
+            }
+            Ok(CaptureMessage::Frame(frame)) => {
+                if let Some(ref prev) = prev_raw {
+                    if raw_frame_nearly_identical(prev, &frame) {
+                        continue;
+                    }
                 }
-                Ok(CaptureMessage::Frame(frame)) => {
-                    // Cheap raw-frame dedup before expensive stitch pipeline
-                    if let Some(ref prev) = prev_raw {
-                        if raw_frame_nearly_identical(prev, &frame) {
-                            processed = true;
-                            continue;
+                let current_frame = prev_raw.insert(frame);
+                let direction: Option<SearchDirection> = match selection_session.long_direction() {
+                    Some(crate::wayland::selection::SearchDirection::Down) => Some(SearchDirection::Down),
+                    Some(crate::wayland::selection::SearchDirection::Up) => Some(SearchDirection::Up),
+                    Some(crate::wayland::selection::SearchDirection::Vertical) => Some(SearchDirection::Down),
+                    None => None,
+                };
+                let compose = match ImageRgbView::new(current_frame) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let analysis = match ImageRgbView::new(current_frame) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let outcome = match stitcher.push_frame_views(compose, analysis, direction) {
+                    Ok(o) => o,
+                    Err(_) => continue,
+                };
+                if matches!(outcome, PushResult::Initialized | PushResult::Accepted { .. }) {
+                    if let Some(s) = stitcher.stitched() {
+                        if let Ok(image) = crate::stitch::image_from_stitched_frame(s) {
+                            let snapshot = crate::wayland::selection::LongPreviewSnapshot {
+                                image,
+                                current_origin_x: s.current_origin_x,
+                                current_origin_y: s.current_origin_y,
+                                viewport_rect: viewport.rect,
+                                capture_width: viewport.capture_size().map(|(w, _)| w).unwrap_or(1),
+                                capture_height: viewport.capture_size().map(|(_, h)| h).unwrap_or(1),
+                            };
+                            let _ = selection_session.update_long_capture_preview(snapshot);
                         }
                     }
-                    let current_frame = prev_raw.insert(frame);
-                    let direction: Option<SearchDirection> = match selection_session.long_direction() {
-                        Some(crate::wayland::selection::SearchDirection::Down) => Some(SearchDirection::Down),
-                        Some(crate::wayland::selection::SearchDirection::Up) => Some(SearchDirection::Up),
-                        Some(crate::wayland::selection::SearchDirection::Vertical) => Some(SearchDirection::Down),
-                        None => None,
-                    };
-                    let compose = match ImageRgbView::new(current_frame) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    let analysis = match ImageRgbView::new(current_frame) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    let outcome = match stitcher.push_frame_views(compose, analysis, direction) {
-                        Ok(o) => o,
-                        Err(_) => continue,
-                    };
-                    if matches!(outcome, PushResult::Initialized | PushResult::Accepted { .. }) {
-                        if let Some(s) = stitcher.stitched() {
-                            if let Ok(image) = crate::stitch::image_from_stitched_frame(s) {
-                                let snapshot = crate::wayland::selection::LongPreviewSnapshot {
-                                    image,
-                                    current_origin_x: s.current_origin_x,
-                                    current_origin_y: s.current_origin_y,
-                                    viewport_rect: viewport.rect,
-                                    capture_width: viewport.capture_size().map(|(w, _)| w).unwrap_or(1),
-                                    capture_height: viewport.capture_size().map(|(_, h)| h).unwrap_or(1),
-                                };
-                                let _ = selection_session.update_long_capture_preview(snapshot);
-                            }
-                        }
-                    }
-                    processed = true;
-                }
-                Ok(CaptureMessage::Error(err)) => {
-                    capture_error = Some(err);
-                    break;
-                }
-                Ok(CaptureMessage::Finished) => {
-                    capture_finished = true;
-                    break;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    capture_finished = true;
-                    break;
                 }
             }
+            Ok(CaptureMessage::Error(err)) => {
+                capture_error = Some(err);
+                capture_finished = true;
+            }
+            Ok(CaptureMessage::Finished) => {
+                capture_finished = true;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                capture_finished = true;
+            }
         }
-        if capture_error.is_some() || capture_finished {
+        if capture_finished {
+            // Drain remaining frames from queue before exit
+            while let Ok(msg) = worker.recv_timeout(Duration::from_millis(0)) {
+                if let CaptureMessage::PrepareCapture { ack, .. } = msg {
+                    let _ = ack.send(());
+                }
+            }
             break;
         }
-        if let Err(_) = selection_session.dispatch_poll(if processed { 0 } else { LONG_UI_POLL_INTERVAL.as_millis() as i32 }) {
-            break;
-        }
+        let _ = selection_session.dispatch_poll(0);
         match selection_session.long_status() {
             crate::wayland::selection::LongSessionStatus::Running => {}
             crate::wayland::selection::LongSessionStatus::FinishRequested => break,
