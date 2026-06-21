@@ -25,6 +25,9 @@ fn run_normal(args: crate::cli::Args) -> Result<(), Box<dyn Error>> {
     let frozen_outputs = crate::wayland::screencopy::capture_outputs(true)?;
     let viewport = match crate::wayland::selection::select_viewport(&frozen_outputs)? {
         crate::wayland::selection::SelectionOutcome::Selected(viewport) => viewport,
+        crate::wayland::selection::SelectionOutcome::LongModeRequested(viewport) => {
+            return run_long_with_viewport(args, viewport);
+        }
         crate::wayland::selection::SelectionOutcome::Cancelled => return Err("selection cancelled".into()),
     };
     let (width, height) = viewport.capture_size()?;
@@ -100,11 +103,27 @@ fn run_long(args: crate::cli::Args) -> Result<(), Box<dyn Error>> {
     let mut selection_session = crate::wayland::selection::SelectionSession::new_long()?;
     let viewport = match selection_session.run_selection()? {
         crate::wayland::selection::SelectionOutcome::Selected(viewport) => viewport,
+        crate::wayland::selection::SelectionOutcome::LongModeRequested(viewport) => viewport,
         crate::wayland::selection::SelectionOutcome::Cancelled => {
             selection_session.close()?;
             return Err("selection cancelled".into());
         }
     };
+    run_long_capture(args, viewport, selection_session)
+}
+
+fn run_long_with_viewport(args: crate::cli::Args, viewport: crate::geometry::SelectedViewport) -> Result<(), Box<dyn Error>> {
+    let mut selection_session = crate::wayland::selection::SelectionSession::new_long()?;
+    selection_session.dispatch_blocking()?;
+    selection_session.dispatch_pending()?;
+    run_long_capture(args, viewport, selection_session)
+}
+
+fn run_long_capture(
+    args: crate::cli::Args,
+    viewport: crate::geometry::SelectedViewport,
+    mut selection_session: crate::wayland::selection::SelectionSession,
+) -> Result<(), Box<dyn Error>> {
     if viewport.regions.len() != 1 {
         selection_session.close()?;
         return Err("long capture selection must be contained within a single output".into());

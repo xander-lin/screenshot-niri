@@ -30,6 +30,7 @@ use crate::wayland::screencopy::CapturedOutput;
 
 const BTN_LEFT: u32 = 0x110;
 const KEY_ESC: u32 = 1;
+const KEY_L: u32 = 38;
 const KEY_ENTER: u32 = 28;
 const KEY_SPACE: u32 = 57;
 const KEY_DOWN: u32 = 108;
@@ -44,6 +45,7 @@ const OVERLAY_BORDER_DARK_BGRA: [u8; 4] = [0, 0, 0, 220];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectionOutcome {
     Selected(SelectedViewport),
+    LongModeRequested(SelectedViewport),
     Cancelled,
 }
 
@@ -183,6 +185,7 @@ struct UiState {
     pointer_x: i32,
     pointer_y: i32,
     drag: DragState,
+    long_requested: bool,
     long_finish_requested: bool,
     long_direction: Option<SearchDirection>,
     long_preview: Option<LongPreviewSnapshot>,
@@ -224,6 +227,7 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
         pointer_x: 0,
         pointer_y: 0,
         drag: DragState::Idle,
+            long_requested: false,
         long_finish_requested: false,
         long_direction: None,
             long_preview: None,
@@ -257,6 +261,8 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
     }
     if state.drag == DragState::Cancelled {
         Ok(SelectionOutcome::Cancelled)
+    } else if state.long_requested {
+        Ok(SelectionOutcome::LongModeRequested(state.selected_viewport()?))
     } else {
         Ok(SelectionOutcome::Selected(state.selected_viewport()?))
     }
@@ -314,6 +320,7 @@ impl SelectionSession {
             pointer_x: 0,
             pointer_y: 0,
             drag: DragState::Idle,
+            long_requested: false,
             long_finish_requested: false,
             long_direction: None,
             long_preview: None,
@@ -350,6 +357,8 @@ impl SelectionSession {
         self.event_queue.dispatch_pending(&mut self.state)?;
         if self.state.drag == DragState::Cancelled {
             Ok(SelectionOutcome::Cancelled)
+        } else if self.state.long_requested {
+            Ok(SelectionOutcome::LongModeRequested(self.state.selected_viewport()?))
         } else {
             Ok(SelectionOutcome::Selected(self.state.selected_viewport()?))
         }
@@ -421,6 +430,16 @@ impl SelectionSession {
             }
         }
         guard.read()?;
+        self.event_queue.dispatch_pending(&mut self.state)?;
+        Ok(())
+    }
+
+    pub fn dispatch_blocking(&mut self) -> Result<(), Box<dyn Error>> {
+        self.event_queue.blocking_dispatch(&mut self.state)?;
+        Ok(())
+    }
+
+    pub fn dispatch_pending(&mut self) -> Result<(), Box<dyn Error>> {
         self.event_queue.dispatch_pending(&mut self.state)?;
         Ok(())
     }
@@ -1035,6 +1054,13 @@ impl Dispatch<WlKeyboard, ()> for UiState {
         if let wl_keyboard::Event::Key { key, state: key_state, .. } = event {
             if key == KEY_ESC && matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed)) {
                 state.drag = DragState::Cancelled;
+            } else if key == KEY_L
+                && matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed))
+            {
+                state.long_requested = true;
+                if state.drag.is_finished() {
+                    state.drag.finish(state.pointer_x, state.pointer_y);
+                }
             } else if state.drag.is_finished()
                 && matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed))
             {
