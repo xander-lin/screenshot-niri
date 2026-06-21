@@ -302,9 +302,21 @@ pub struct SelectionSession {
 
 impl SelectionSession {
     pub fn new_long() -> Result<Self, Box<dyn Error>> {
+        Self::new_internal(None)
+    }
+
+    pub fn with_frozen(frozen_outputs: &[CapturedOutput]) -> Result<Self, Box<dyn Error>> {
+        Self::new_internal(Some(frozen_outputs))
+    }
+
+    fn new_internal(frozen_outputs: Option<&[CapturedOutput]>) -> Result<Self, Box<dyn Error>> {
         let conn = Connection::connect_to_env()?;
         let mut event_queue = conn.new_event_queue::<UiState>();
         let qh = event_queue.handle();
+        let frozen_outputs = match frozen_outputs {
+            Some(captures) => frozen_outputs_from_captures(captures)?,
+            None => Vec::new(),
+        };
         let mut state = UiState {
             compositor: None,
             shm: None,
@@ -314,7 +326,7 @@ impl SelectionSession {
             pointer: None,
             keyboard: None,
             outputs: Vec::new(),
-            frozen_outputs: Vec::new(),
+            frozen_outputs,
             overlays: Vec::new(),
             pointer_output_name: None,
             pointer_x: 0,
@@ -374,6 +386,9 @@ impl SelectionSession {
         self.state.long_finish_requested = false;
         self.state.long_direction = None;
         self.state.long_preview = None;
+        for overlay in &mut self.state.overlays {
+            overlay.render_cache = None;
+        }
         render_overlays_full_dim(&mut self.state);
         set_overlay_keyboard_exclusive(&mut self.state);
         set_overlay_pointer_passthrough(&mut self.state, &qh)?;

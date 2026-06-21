@@ -23,13 +23,18 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 fn run_normal(args: crate::cli::Args) -> Result<(), Box<dyn Error>> {
     crate::runtime::ensure_niri_session()?;
     let frozen_outputs = crate::wayland::screencopy::capture_outputs(true)?;
-    let viewport = match crate::wayland::selection::select_viewport(&frozen_outputs)? {
+    let mut session = crate::wayland::selection::SelectionSession::with_frozen(&frozen_outputs)?;
+    let viewport = match session.run_selection()? {
         crate::wayland::selection::SelectionOutcome::Selected(viewport) => viewport,
         crate::wayland::selection::SelectionOutcome::LongModeRequested(viewport) => {
-            return run_long_with_viewport(args, viewport);
+            return run_long_capture(args, viewport, session);
         }
-        crate::wayland::selection::SelectionOutcome::Cancelled => return Err("selection cancelled".into()),
+        crate::wayland::selection::SelectionOutcome::Cancelled => {
+            session.close()?;
+            return Err("selection cancelled".into());
+        }
     };
+    session.close()?;
     let (width, height) = viewport.capture_size()?;
     let frame = crate::image::composite_captured_region(
         &viewport.capture_regions(),
@@ -109,12 +114,6 @@ fn run_long(args: crate::cli::Args) -> Result<(), Box<dyn Error>> {
             return Err("selection cancelled".into());
         }
     };
-    run_long_capture(args, viewport, selection_session)
-}
-
-fn run_long_with_viewport(args: crate::cli::Args, viewport: crate::geometry::SelectedViewport) -> Result<(), Box<dyn Error>> {
-    let mut selection_session = crate::wayland::selection::SelectionSession::new_long()?;
-    selection_session.wait_configured()?;
     run_long_capture(args, viewport, selection_session)
 }
 
