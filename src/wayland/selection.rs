@@ -469,6 +469,13 @@ impl SelectionSession {
         Ok(())
     }
 
+    pub fn prepare_capture_clean(&mut self) -> Result<(), Box<dyn Error>> {
+        render_overlays_capture_clean(&mut self.state);
+        self.event_queue.dispatch_pending(&mut self.state)?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
     pub fn close(self) -> Result<(), Box<dyn Error>> {
         drop(self.state);
         drop(self.event_queue);
@@ -509,6 +516,14 @@ fn create_live_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Resul
 }
 
 fn render_overlays_full_dim(state: &mut UiState) {
+    render_overlays_inner(state, true);
+}
+
+fn render_overlays_capture_clean(state: &mut UiState) {
+    render_overlays_inner(state, false);
+}
+
+fn render_overlays_inner(state: &mut UiState, draw_border: bool) {
     for overlay in &mut state.overlays {
         let Some(buffer) = overlay.buffers.iter_mut().find(|buffer| buffer.available) else {
             continue;
@@ -535,7 +550,9 @@ fn render_overlays_full_dim(state: &mut UiState) {
                             data[offset + 3] = 0;
                         }
                     }
-                    draw_selection_border(data, overlay.width, overlay.height, local.x, local.y, local.width, local.height);
+                    if draw_border {
+                        draw_selection_border(data, overlay.width, overlay.height, local.x, local.y, local.width, local.height);
+                    }
                 }
                 selection_local = local;
             }

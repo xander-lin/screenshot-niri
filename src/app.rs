@@ -137,6 +137,10 @@ fn run_long_capture(
     let mut cancelled = false;
 
     loop {
+        // Drain queued frames captured with border, then render clean for next capture
+        while worker.try_recv().is_ok() {}
+        let _ = selection_session.prepare_capture_clean();
+        selection_session.dispatch_poll(0)?;
         for _ in 0..LONG_FRAMES_PER_UI_TICK {
             let frame = match worker.try_recv() {
                 Ok(frame) => frame,
