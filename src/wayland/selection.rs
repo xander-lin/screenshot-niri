@@ -278,6 +278,14 @@ pub enum SearchDirection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LongDirection {
+    Down,
+    Up,
+    Right,
+    Left,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LongSessionStatus {
     Running,
     FinishRequested,

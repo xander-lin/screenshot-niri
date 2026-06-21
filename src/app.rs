@@ -3,7 +3,8 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 use crate::cli::{Command, Mode};
-use crate::stitch::{ImageRgbView, PushResult, RawStitcher, SearchDirection};
+use crate::stitch::{ImageRgbView, PushResult, RawStitcher};
+use crate::wayland::selection::LongDirection;
 
 const LONG_UI_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const LONG_MAX_FRAME_RATE: u32 = 120;
@@ -188,10 +189,10 @@ fn run_long_capture(
                     }
                 }
                 let current_frame = prev_raw.insert(frame);
-                let direction: Option<SearchDirection> = match selection_session.long_direction() {
-                    Some(crate::wayland::selection::SearchDirection::Down) => Some(SearchDirection::Down),
-                    Some(crate::wayland::selection::SearchDirection::Up) => Some(SearchDirection::Up),
-                    Some(crate::wayland::selection::SearchDirection::Vertical) => Some(SearchDirection::Down),
+                let direction: Option<LongDirection> = match selection_session.long_direction() {
+                    Some(crate::wayland::selection::SearchDirection::Down) => Some(LongDirection::Down),
+                    Some(crate::wayland::selection::SearchDirection::Up) => Some(LongDirection::Up),
+                    Some(crate::wayland::selection::SearchDirection::Vertical) => None,
                     None => None,
                 };
                 let compose = match ImageRgbView::new(current_frame) {

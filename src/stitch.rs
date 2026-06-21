@@ -6,7 +6,7 @@ use wayland_client::protocol::wl_shm::Format;
 
 #[cfg(test)]
 use crate::image::Image;
-
+use crate::wayland::selection::LongDirection;
 
 mod canvas;
 mod fixed_bands;
@@ -385,11 +385,39 @@ impl RawStitcher {
         }
     }
 
+    pub fn push_frame(
+        &mut self,
+        frame: RgbFrame,
+        direction: Option<LongDirection>,
+    ) -> Result<PushResult, Box<dyn Error>> {
+        self.push_frame_with_analysis(frame.clone(), frame, direction)
+    }
+
+    pub fn push_frame_with_analysis(
+        &mut self,
+        compose_frame: RgbFrame,
+        analysis_frame: RgbFrame,
+        direction: Option<LongDirection>,
+    ) -> Result<PushResult, Box<dyn Error>> {
+        validate_rgb_frame(&compose_frame)?;
+        validate_rgb_frame(&analysis_frame)?;
+        self.push_frame_sources(&compose_frame, &analysis_frame, direction)
+    }
+
+    pub fn push_frame_views(
+        &mut self,
+        compose_frame: ImageRgbView<'_>,
+        analysis_frame: ImageRgbView<'_>,
+        direction: Option<LongDirection>,
+    ) -> Result<PushResult, Box<dyn Error>> {
+        self.push_frame_sources(&compose_frame, &analysis_frame, direction)
+    }
+
     fn push_frame_sources<C, A>(
         &mut self,
         compose_frame: &C,
         analysis_frame: &A,
-        direction: Option<SearchDirection>,
+        direction: Option<LongDirection>,
     ) -> Result<PushResult, Box<dyn Error>>
     where
         C: RgbSource,
@@ -455,6 +483,13 @@ impl RawStitcher {
             return Ok(PushResult::Duplicate);
         }
 
+        let search_direction = direction.map(|direction| match direction {
+            LongDirection::Down => SearchDirection::Down,
+            LongDirection::Up => SearchDirection::Up,
+            LongDirection::Right => SearchDirection::Right,
+            LongDirection::Left => SearchDirection::Left,
+        });
+
         let compose_frame = rgb_frame_from_source(compose_frame)?;
         let active_compose_frame = crop_rgb_frame(&compose_frame, active_crop)?;
         let mut placement_pipeline = DefaultPlacementPipeline;
@@ -465,7 +500,7 @@ impl RawStitcher {
             active_compose: &active_compose,
             analysis_frame,
             previous_perceptual_frame: self.previous_perceptual_frame.as_ref(),
-            search_direction: direction,
+            search_direction,
             profile_enabled,
         });
 
@@ -590,43 +625,6 @@ impl RawStitcher {
         self.previous_compose_frame = Some(compose_frame);
         self.last_profile_breakdown.path = Some(StitchDecisionPath::NoMatch);
         Ok(PushResult::NoMatch)
-    }
-
-    pub fn push_frame_views(
-        &mut self,
-        compose_frame: ImageRgbView<'_>,
-        analysis_frame: ImageRgbView<'_>,
-        direction: Option<SearchDirection>,
-    ) -> Result<PushResult, Box<dyn Error>> {
-        self.push_frame_sources(&compose_frame, &analysis_frame, direction)
-    }
-
-    pub fn finish(self) -> Option<StitchedFrame> {
-        self.stitched
-    }
-
-    pub fn stitched(&self) -> Option<&StitchedFrame> {
-        self.stitched.as_ref()
-    }
-
-    pub fn last_duplicate_difference(&self) -> Option<f64> {
-        self.last_duplicate_difference
-    }
-
-    pub fn last_duplicate_analysis_difference(&self) -> Option<f64> {
-        self.last_duplicate_analysis_difference
-    }
-
-    pub fn last_duplicate_analysis_motion(&self) -> Option<DuplicateAnalysisMotion> {
-        self.last_duplicate_analysis_motion
-    }
-
-    pub fn last_fast_motion_trace(&self) -> Option<FastMotionTrace> {
-        self.last_fast_motion_trace
-    }
-
-    pub fn last_profile_breakdown(&self) -> StitchProfileBreakdown {
-        self.last_profile_breakdown
     }
 
     fn find_nomatch_recovery(
@@ -821,6 +819,34 @@ impl RawStitcher {
             let _ = observation;
         }
     }
+
+    pub fn finish(self) -> Option<StitchedFrame> {
+        self.stitched
+    }
+
+    pub fn stitched(&self) -> Option<&StitchedFrame> {
+        self.stitched.as_ref()
+    }
+
+    pub fn last_duplicate_difference(&self) -> Option<f64> {
+        self.last_duplicate_difference
+    }
+
+    pub fn last_duplicate_analysis_difference(&self) -> Option<f64> {
+        self.last_duplicate_analysis_difference
+    }
+
+    pub fn last_duplicate_analysis_motion(&self) -> Option<DuplicateAnalysisMotion> {
+        self.last_duplicate_analysis_motion
+    }
+
+    pub fn last_fast_motion_trace(&self) -> Option<FastMotionTrace> {
+        self.last_fast_motion_trace
+    }
+
+    pub fn last_profile_breakdown(&self) -> StitchProfileBreakdown {
+        self.last_profile_breakdown
+    }
 }
 
 impl FixedBands {
@@ -886,6 +912,14 @@ fn duplicate_analysis_motion(
         strongest_y,
         strongest_diff,
     })
+}
+
+pub fn find_frame_shift_match(
+    previous: &RgbFrame,
+    current: &RgbFrame,
+    search_direction: Option<SearchDirection>,
+) -> FrameMatch {
+    find_frame_shift_match_source(previous, current, search_direction)
 }
 
 fn find_frame_shift_match_source(
@@ -1061,6 +1095,10 @@ fn recover_stale_bottom_edge(
     previous_rect: ViewportRect,
     frame: &RgbFrame,
 ) -> Option<NoMatchRecovery> {
+    // Dirty-canvas recovery is a last-resort path after normal placement fails.
+    // Search locally first to avoid global false positives, then fall back to a
+    // full prefix search for cases where stale stitched content displaced the
+    // previous viewport relation.
     let local_radius = i32::try_from(frame.height).ok()?.saturating_mul(2);
     let local_start = previous_rect.y.saturating_sub(local_radius).max(0);
     let local_end = previous_rect
@@ -1864,39 +1902,1732 @@ fn line_average_difference(total: u64, pixels: u32) -> f64 {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::image::Image as CrateImage;
-    use wayland_client::protocol::wl_shm::Format as WlFormat;
+
+    fn frame(width: u32, height: u32, seed: u8) -> RgbFrame {
+        let stride = width * 3;
+        let mut data = vec![0; stride as usize * height as usize];
+        for y in 0..height {
+            for x in 0..width {
+                let offset = (y * stride + x * 3) as usize;
+                data[offset] = seed.wrapping_add(x as u8);
+                data[offset + 1] = seed.wrapping_add((y * 3) as u8);
+                data[offset + 2] = seed.wrapping_add((x + y) as u8);
+            }
+        }
+        RgbFrame {
+            width,
+            height,
+            stride,
+            data,
+        }
+    }
+
+    fn textured_frame(width: u32, height: u32) -> RgbFrame {
+        let stride = width * 3;
+        let mut data = vec![0; stride as usize * height as usize];
+        for y in 0..height {
+            for x in 0..width {
+                let offset = (y * stride + x * 3) as usize;
+                data[offset] = ((x * 13 + y * 17 + (x * y) % 19) % 251) as u8;
+                data[offset + 1] = ((x * 7 + y * 29 + (x + y * 3) % 23) % 251) as u8;
+                data[offset + 2] = ((x * 3 + y * 11 + (x * 5 + y) % 31) % 251) as u8;
+            }
+        }
+        RgbFrame {
+            width,
+            height,
+            stride,
+            data,
+        }
+    }
+
+    fn periodic_textured_frame(width: u32, height: u32, period: u32) -> RgbFrame {
+        let stride = width * 3;
+        let mut data = vec![0; stride as usize * height as usize];
+        for row in 0..height {
+            let pattern_y = row % period;
+            for x in 0..width {
+                let offset = (row * stride + x * 3) as usize;
+                data[offset] = ((x * 13 + pattern_y * 17 + (x * pattern_y) % 19) % 251) as u8;
+                data[offset + 1] =
+                    ((x * 7 + pattern_y * 29 + (x + pattern_y * 3) % 23) % 251) as u8;
+                data[offset + 2] =
+                    ((x * 3 + pattern_y * 11 + (x * 5 + pattern_y) % 31) % 251) as u8;
+            }
+        }
+        RgbFrame {
+            width,
+            height,
+            stride,
+            data,
+        }
+    }
+
+    fn shifted_top_with_tiny_difference(previous: &RgbFrame, shift: u32) -> RgbFrame {
+        let mut current = textured_frame(previous.width, previous.height);
+        for y in 0..previous.height - shift {
+            for x in 0..previous.width {
+                let prev_offset = pixel_offset(previous, x, y);
+                let cur_offset = pixel_offset(&current, x, y + shift);
+                current.data[cur_offset] = previous.data[prev_offset].saturating_add(1);
+                current.data[cur_offset + 1] = previous.data[prev_offset + 1].saturating_add(1);
+                current.data[cur_offset + 2] = previous.data[prev_offset + 2].saturating_add(1);
+            }
+        }
+        current
+    }
+
+    fn shifted_bottom_with_difference(previous: &RgbFrame, shift: u32, difference: u8) -> RgbFrame {
+        let mut current = textured_frame(previous.width, previous.height);
+        for y in 0..previous.height - shift {
+            for x in 0..previous.width {
+                let prev_offset = pixel_offset(previous, x, y + shift);
+                let cur_offset = pixel_offset(&current, x, y);
+                current.data[cur_offset] = previous.data[prev_offset].saturating_add(difference);
+                current.data[cur_offset + 1] =
+                    previous.data[prev_offset + 1].saturating_add(difference);
+                current.data[cur_offset + 2] =
+                    previous.data[prev_offset + 2].saturating_add(difference);
+            }
+        }
+        current
+    }
+
+    fn shifted_bottom(previous: &RgbFrame, shift: u32) -> RgbFrame {
+        let mut current = frame(previous.width, previous.height, 200);
+        for y in 0..previous.height - shift {
+            for x in 0..previous.width {
+                let prev_offset = pixel_offset(previous, x, y + shift);
+                let cur_offset = pixel_offset(&current, x, y);
+                current.data[cur_offset..cur_offset + 3]
+                    .copy_from_slice(&previous.data[prev_offset..prev_offset + 3]);
+            }
+        }
+        current
+    }
+
+    fn shifted_top(previous: &RgbFrame, shift: u32) -> RgbFrame {
+        let mut current = frame(previous.width, previous.height, 180);
+        for y in 0..previous.height - shift {
+            for x in 0..previous.width {
+                let prev_offset = pixel_offset(previous, x, y);
+                let cur_offset = pixel_offset(&current, x, y + shift);
+                current.data[cur_offset..cur_offset + 3]
+                    .copy_from_slice(&previous.data[prev_offset..prev_offset + 3]);
+            }
+        }
+        current
+    }
+
+    fn shifted_right(previous: &RgbFrame, shift: u32) -> RgbFrame {
+        let mut current = frame(previous.width, previous.height, 160);
+        for y in 0..previous.height {
+            for x in 0..previous.width - shift {
+                let prev_offset = pixel_offset(previous, x + shift, y);
+                let cur_offset = pixel_offset(&current, x, y);
+                current.data[cur_offset..cur_offset + 3]
+                    .copy_from_slice(&previous.data[prev_offset..prev_offset + 3]);
+            }
+        }
+        current
+    }
+
+    fn shifted_left(previous: &RgbFrame, shift: u32) -> RgbFrame {
+        let mut current = frame(previous.width, previous.height, 140);
+        for y in 0..previous.height {
+            for x in 0..previous.width - shift {
+                let prev_offset = pixel_offset(previous, x, y);
+                let cur_offset = pixel_offset(&current, x + shift, y);
+                current.data[cur_offset..cur_offset + 3]
+                    .copy_from_slice(&previous.data[prev_offset..prev_offset + 3]);
+            }
+        }
+        current
+    }
+
+    fn crop_frame(source: &RgbFrame, x: u32, y: u32, width: u32, height: u32) -> RgbFrame {
+        crop_rgb_frame(
+            source,
+            ComposeCrop {
+                x,
+                y,
+                width,
+                height,
+            },
+        )
+        .unwrap()
+    }
+
+    fn row_texture(width: u32, row: u32) -> Vec<u8> {
+        let mut data = vec![0; width as usize * 3];
+        for x in 0..width {
+            let offset = x as usize * 3;
+            data[offset] = ((x * 37 + row * 17 + (x * row) % 29) % 251) as u8;
+            data[offset + 1] = ((x * 19 + row * 31 + (x + row * 3) % 23) % 251) as u8;
+            data[offset + 2] = ((x * 11 + row * 7 + (x * 5 + row) % 41) % 251) as u8;
+        }
+        data
+    }
+
+    fn frame_from_world_rows(width: u32, rows: &[u32]) -> RgbFrame {
+        let stride = width * 3;
+        let mut data = Vec::with_capacity(stride as usize * rows.len());
+        for row in rows {
+            data.extend_from_slice(&row_texture(width, *row));
+        }
+        RgbFrame {
+            width,
+            height: rows.len() as u32,
+            stride,
+            data,
+        }
+    }
+
+    fn paint_full_row(target: &mut RgbFrame, y: u32, seed: u8) {
+        for x in 0..target.width {
+            let offset = pixel_offset(target, x, y);
+            target.data[offset] = seed.wrapping_add((x * 13 + y * 3) as u8);
+            target.data[offset + 1] = seed.wrapping_add((x * 7 + y * 11) as u8);
+            target.data[offset + 2] = seed.wrapping_add((x * 5 + y * 17) as u8);
+        }
+    }
+
+    fn stitched_pixel_rgb(frame: &StitchedFrame, x: u32, y: u32) -> [u8; 3] {
+        let offset = y as usize * frame.stride as usize + x as usize * 3;
+        [
+            frame.data[offset],
+            frame.data[offset + 1],
+            frame.data[offset + 2],
+        ]
+    }
+
+    fn fixed_band_estimate(delta_y: i32) -> PerceptualMotionEstimate {
+        PerceptualMotionEstimate {
+            delta_y,
+            median: 1.0,
+            p75: 1.0,
+            p90: 1.0,
+            mean: 1.0,
+            second_best_delta_y: None,
+            second_best_median: None,
+            non_adjacent_second_best_delta_y: None,
+            non_adjacent_second_best_median: None,
+            no_motion_median: Some(20.0),
+            separation: Some(19.0),
+            overlap_rows: 40,
+            band_count: 8,
+        }
+    }
+
+    fn copy_same_rows(source: &RgbFrame, target: &mut RgbFrame, start_y: u32, height: u32) {
+        for y in start_y..start_y + height {
+            for x in 0..source.width {
+                let src = pixel_offset(source, x, y);
+                let dst = pixel_offset(target, x, y);
+                target.data[dst..dst + 3].copy_from_slice(&source.data[src..src + 3]);
+            }
+        }
+    }
+
+    fn paint_rows(target: &mut RgbFrame, start_y: u32, height: u32, seed: u8) {
+        for y in start_y..start_y + height {
+            for x in 0..target.width {
+                let dst = pixel_offset(target, x, y);
+                target.data[dst] = seed.wrapping_add((x * 5 + y * 11) as u8);
+                target.data[dst + 1] = seed.wrapping_add((x * 3 + y * 7) as u8);
+                target.data[dst + 2] = seed.wrapping_add((x * 13 + y * 2) as u8);
+            }
+        }
+    }
 
     #[test]
-    fn raw_stitcher_creates_and_accepts() {
+    fn default_fixed_bands_active_crop_returns_full_frame() {
+        let crop = FixedBands::default().active_crop(120, 80).unwrap();
+
+        assert_eq!(
+            crop,
+            ComposeCrop {
+                x: 0,
+                y: 0,
+                width: 120,
+                height: 80,
+            }
+        );
+    }
+
+    #[test]
+    fn non_empty_fixed_bands_active_crop_skips_bands() {
+        let crop = FixedBands { top: 12, bottom: 8 }
+            .active_crop(120, 80)
+            .unwrap();
+
+        assert_eq!(
+            crop,
+            ComposeCrop {
+                x: 0,
+                y: 12,
+                width: 120,
+                height: 60,
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_fixed_bands_active_crop_returns_none() {
+        assert!(FixedBands {
+            top: 30,
+            bottom: 50
+        }
+        .active_crop(120, 80)
+        .is_none());
+        assert!(FixedBands {
+            top: 40,
+            bottom: 40
+        }
+        .active_crop(120, 80)
+        .is_none());
+    }
+
+    #[test]
+    fn from_first_frame_fills_full_frame_layout_metadata() {
+        let frame = frame(32, 24, 10);
+        let stitched = StitchedFrame::from_first_frame(&frame);
+
+        assert_eq!(stitched.width, frame.width);
+        assert_eq!(stitched.height, frame.height);
+        assert_eq!(stitched.stride, frame.stride);
+        assert_eq!(stitched.data, frame.data);
+        assert_eq!(stitched.current_origin_x, 0);
+        assert_eq!(stitched.current_origin_y, 0);
+        assert_eq!(stitched.compose_width, frame.width);
+        assert_eq!(stitched.compose_height, frame.height);
+        assert_eq!(
+            stitched.active_crop,
+            ComposeCrop {
+                x: 0,
+                y: 0,
+                width: frame.width,
+                height: frame.height,
+            }
+        );
+        assert_eq!(stitched.fixed_bands, FixedBands::default());
+        assert!(stitched.fixed_bands.is_empty());
+    }
+
+    #[test]
+    fn crop_rgb_frame_copies_expected_pixels_and_layout() {
+        let frame = frame(5, 4, 10);
+        let crop = ComposeCrop {
+            x: 1,
+            y: 1,
+            width: 3,
+            height: 2,
+        };
+
+        let cropped = crop_rgb_frame(&frame, crop).unwrap();
+
+        assert_eq!(cropped.width, 3);
+        assert_eq!(cropped.height, 2);
+        assert_eq!(cropped.stride, 9);
+        assert_eq!(cropped.data.len(), 18);
+        for y in 0..crop.height {
+            for x in 0..crop.width {
+                let src = pixel_offset(&frame, crop.x + x, crop.y + y);
+                let dst = pixel_offset(&cropped, x, y);
+                assert_eq!(cropped.data[dst..dst + 3], frame.data[src..src + 3]);
+            }
+        }
+    }
+
+    #[test]
+    fn crop_rgb_frame_rejects_out_of_bounds_crop() {
+        let frame = frame(5, 4, 10);
+
+        assert!(crop_rgb_frame(
+            &frame,
+            ComposeCrop {
+                x: 3,
+                y: 1,
+                width: 3,
+                height: 2,
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn raw_stitcher_sets_default_active_crop_to_full_frame_after_first_push() {
+        let frame = frame(32, 24, 10);
         let mut stitcher = RawStitcher::new();
 
-        fn make_image(width: u32, rows: &[u8]) -> CrateImage {
-            let stride = width * 4;
-            CrateImage { width, height: rows.len() as u32, stride, format: WlFormat::Xrgb8888, data: rows.iter().flat_map(|v| [*v; 4]).collect() }
+        assert_eq!(
+            stitcher.push_frame(frame.clone(), None).unwrap(),
+            PushResult::Initialized
+        );
+
+        assert_eq!(
+            stitcher.active_crop,
+            Some(ComposeCrop {
+                x: 0,
+                y: 0,
+                width: frame.width,
+                height: frame.height,
+            })
+        );
+        assert_eq!(stitcher.viewport_rect.unwrap().width, frame.width);
+        assert_eq!(stitcher.viewport_rect.unwrap().height, frame.height);
+    }
+
+    #[test]
+    fn fixed_band_detector_detects_fixed_top_band() {
+        let previous = textured_frame(48, 60);
+        let mut current = shifted_bottom_with_difference(&previous, 8, 12);
+        paint_rows(&mut current, 52, 8, 90);
+        copy_same_rows(&previous, &mut current, 0, 8);
+
+        let bands = detect_fixed_bands(&previous, &current, Some(fixed_band_estimate(-8))).unwrap();
+
+        assert_eq!(bands.top, 8);
+        assert_eq!(bands.bottom, 0);
+    }
+
+    #[test]
+    fn fixed_band_detector_detects_fixed_bottom_band() {
+        let previous = textured_frame(48, 60);
+        let mut current = shifted_top_with_tiny_difference(&previous, 8);
+        paint_rows(&mut current, 0, 8, 90);
+        copy_same_rows(&previous, &mut current, 52, 8);
+
+        let bands = detect_fixed_bands(&previous, &current, Some(fixed_band_estimate(8))).unwrap();
+
+        assert_eq!(bands.top, 0);
+        assert_eq!(bands.bottom, 8);
+    }
+
+    #[test]
+    fn fixed_band_detector_detects_top_and_bottom_bands() {
+        let previous = textured_frame(48, 64);
+        let mut current = shifted_bottom_with_difference(&previous, 8, 12);
+        paint_rows(&mut current, 56, 8, 90);
+        copy_same_rows(&previous, &mut current, 0, 8);
+        copy_same_rows(&previous, &mut current, 56, 8);
+
+        let bands = detect_fixed_bands(&previous, &current, Some(fixed_band_estimate(-8))).unwrap();
+
+        assert_eq!(bands.top, 8);
+        assert_eq!(bands.bottom, 8);
+    }
+
+    #[test]
+    fn fixed_band_detector_ignores_fixed_region_in_middle() {
+        let previous = textured_frame(48, 64);
+        let mut current = shifted_bottom_with_difference(&previous, 8, 12);
+        paint_rows(&mut current, 56, 8, 90);
+        copy_same_rows(&previous, &mut current, 28, 8);
+
+        let bands = detect_fixed_bands(&previous, &current, Some(fixed_band_estimate(-8))).unwrap();
+
+        assert_eq!(bands, FixedBands::default());
+    }
+
+    #[test]
+    fn fixed_band_detector_ignores_duplicate_no_motion_pair() {
+        let previous = textured_frame(48, 60);
+
+        let bands = detect_fixed_bands(&previous, &previous, Some(fixed_band_estimate(0)));
+
+        assert_eq!(bands, None);
+    }
+
+    #[test]
+    fn fixed_band_detector_ignores_duplicate_compose_pair_with_analysis_motion() {
+        let previous = textured_frame(48, 60);
+
+        let bands = detect_fixed_bands(&previous, &previous, Some(fixed_band_estimate(-8)));
+
+        assert_eq!(bands, None);
+    }
+
+    #[test]
+    fn fixed_band_detector_requires_multiple_stable_observations() {
+        let previous = textured_frame(48, 60);
+        let mut current = shifted_bottom_with_difference(&previous, 8, 12);
+        paint_rows(&mut current, 52, 8, 90);
+        copy_same_rows(&previous, &mut current, 0, 8);
+        let mut detector = FixedBandDetector::default();
+
+        let first = detector.observe(&previous, &current, Some(fixed_band_estimate(-8)));
+        assert_eq!(first.count, 1);
+        assert_eq!(detector.stable, FixedBands::default());
+        assert!(!detector.frozen);
+
+        let second = detector.observe(&previous, &current, Some(fixed_band_estimate(-8)));
+        assert_eq!(second.count, 2);
+        assert_eq!(detector.stable, FixedBands { top: 8, bottom: 0 });
+        assert!(detector.frozen);
+    }
+
+    #[test]
+    fn fixed_band_detector_does_not_promote_small_band_after_empty_observation() {
+        let empty_previous = textured_frame(48, 60);
+        let empty_current = empty_previous.clone();
+        let fixed_previous = textured_frame(48, 60);
+        let mut fixed_current = shifted_bottom_with_difference(&fixed_previous, 8, 12);
+        copy_same_rows(&fixed_previous, &mut fixed_current, 0, 4);
+        paint_rows(&mut fixed_current, 52, 8, 90);
+        let mut detector = FixedBandDetector::default();
+
+        let empty = detector.observe(
+            &empty_previous,
+            &empty_current,
+            Some(fixed_band_estimate(-8)),
+        );
+        let fixed = detector.observe(
+            &fixed_previous,
+            &fixed_current,
+            Some(fixed_band_estimate(-8)),
+        );
+
+        assert_eq!(empty.bands, FixedBands::default());
+        assert_eq!(fixed.bands, FixedBands { top: 4, bottom: 0 });
+        assert_eq!(fixed.count, 1);
+        assert_eq!(detector.stable, FixedBands::default());
+        assert!(!detector.frozen);
+    }
+
+    #[test]
+    fn detects_append_bottom_shift() {
+        let previous = frame(32, 24, 10);
+        let current = shifted_bottom(&previous, 2);
+        let result = find_frame_shift_match(&previous, &current, Some(SearchDirection::Down));
+        assert_eq!(result.direction, AppendDirection::Bottom);
+        assert_eq!(result.delta_y, 2);
+        assert_eq!(result.overlap, 22);
+    }
+
+    #[test]
+    fn detects_append_top_shift() {
+        let previous = frame(32, 24, 10);
+        let current = shifted_top(&previous, 2);
+        let result = find_frame_shift_match(&previous, &current, Some(SearchDirection::Up));
+        assert_eq!(result.direction, AppendDirection::Top);
+        assert_eq!(result.delta_y, -2);
+        assert_eq!(result.overlap, 22);
+    }
+
+    #[test]
+    fn detects_append_right_shift() {
+        let previous = frame(32, 24, 10);
+        let current = shifted_right(&previous, 3);
+        let result = find_frame_shift_match(&previous, &current, Some(SearchDirection::Right));
+        assert_eq!(result.direction, AppendDirection::Right);
+        assert_eq!(result.delta_x, 3);
+        assert_eq!(result.overlap, 29);
+    }
+
+    #[test]
+    fn detects_append_left_shift() {
+        let previous = frame(32, 24, 10);
+        let current = shifted_left(&previous, 3);
+        let result = find_frame_shift_match(&previous, &current, Some(SearchDirection::Left));
+        assert_eq!(result.direction, AppendDirection::Left);
+        assert_eq!(result.delta_x, -3);
+        assert_eq!(result.overlap, 29);
+    }
+
+    #[test]
+    fn rejects_tiny_overlap() {
+        let previous = frame(32, 40, 10);
+        let current = shifted_bottom(&previous, 30);
+        let result = find_frame_shift_match(&previous, &current, Some(SearchDirection::Down));
+        assert_eq!(result.overlap, 0);
+    }
+
+    #[test]
+    fn best_match_beats_smaller_wrong_valid_shift() {
+        let previous = frame(32, 24, 10);
+        let current = shifted_bottom(&previous, 3);
+        let result = find_frame_shift_match(&previous, &current, Some(SearchDirection::Down));
+        assert_eq!(result.direction, AppendDirection::Bottom);
+        assert_eq!(result.delta_y, 3);
+        assert_eq!(result.score, 0.0);
+    }
+
+    #[test]
+    fn automatic_mode_detects_vertical_shifts() {
+        let previous = frame(32, 24, 10);
+        let current_down = shifted_bottom(&previous, 2);
+        let down = find_frame_shift_match(&previous, &current_down, None);
+        assert_eq!(down.direction, AppendDirection::Bottom);
+
+        let current_up = shifted_top(&previous, 2);
+        let up = find_frame_shift_match(&previous, &current_up, None);
+        assert_eq!(up.direction, AppendDirection::Top);
+    }
+
+    #[test]
+    fn automatic_mode_ignores_horizontal_shifts() {
+        let previous = frame(32, 24, 10);
+        let mut current_right = shifted_right(&previous, 3);
+        for y in 0..current_right.height {
+            let offset = pixel_offset(&current_right, 0, y);
+            current_right.data[offset..offset + 3].copy_from_slice(&[255, 0, 255]);
         }
+        let right = find_frame_shift_match(&previous, &current_right, None);
+        assert_eq!(right.overlap, 0);
 
-        let img1 = make_image(1, &[10, 20, 30]);
-        let img1b = make_image(1, &[10, 20, 30]);
-        let img2 = make_image(1, &[20, 30, 40]);
-        let img2b = make_image(1, &[20, 30, 40]);
+        let mut current_left = shifted_left(&previous, 3);
+        for y in 0..current_left.height {
+            let offset = pixel_offset(&current_left, current_left.width - 1, y);
+            current_left.data[offset..offset + 3].copy_from_slice(&[0, 255, 255]);
+        }
+        let left = find_frame_shift_match(&previous, &current_left, None);
+        assert_eq!(left.overlap, 0);
+    }
 
-        let view1 = ImageRgbView::new(&img1).unwrap();
-        let view1b = ImageRgbView::new(&img1b).unwrap();
-        let view2 = ImageRgbView::new(&img2).unwrap();
-        let view2b = ImageRgbView::new(&img2b).unwrap();
+    #[test]
+    fn duplicate_frame_is_rejected() {
+        let frame = frame(32, 24, 10);
+        let mut stitcher = RawStitcher::new();
+        assert_eq!(
+            stitcher
+                .push_frame(frame.clone(), Some(LongDirection::Down))
+                .unwrap(),
+            PushResult::Initialized
+        );
+        assert_eq!(
+            stitcher
+                .push_frame(frame, Some(LongDirection::Down))
+                .unwrap(),
+            PushResult::Duplicate
+        );
+    }
 
-        assert_eq!(stitcher.push_frame_views(view1, view1b, Some(SearchDirection::Down)).unwrap(), PushResult::Initialized);
+    #[test]
+    fn duplicate_frame_is_rejected_before_perceptual_matching() {
+        let frame = textured_frame(160, 48);
+        let previous_analysis = textured_frame(160, 120);
+        let current_analysis = shifted_bottom(&previous_analysis, 12);
+        let mut stitcher = RawStitcher::new();
+        stitcher
+            .push_frame_with_analysis(frame.clone(), previous_analysis, None)
+            .unwrap();
 
-        let result = stitcher.push_frame_views(view2, view2b, Some(SearchDirection::Down)).unwrap();
+        assert_eq!(
+            stitcher
+                .push_frame_with_analysis(frame, current_analysis, None)
+                .unwrap(),
+            PushResult::Duplicate
+        );
+        assert!(stitcher.fixed_detector.pending.is_none());
+    }
+
+    #[test]
+    fn duplicate_frame_does_not_advance_perceptual_baseline() {
+        let frame = textured_frame(160, 48);
+        let previous_analysis = textured_frame(160, 120);
+        let duplicate_analysis = shifted_bottom_with_difference(&previous_analysis, 12, 6);
+        let mut stitcher = RawStitcher::new();
+        stitcher
+            .push_frame_with_analysis(frame.clone(), previous_analysis, None)
+            .unwrap();
+        let baseline = stitcher.previous_perceptual_frame.clone().unwrap();
+
+        assert_eq!(
+            stitcher
+                .push_frame_with_analysis(frame, duplicate_analysis, None)
+                .unwrap(),
+            PushResult::Duplicate
+        );
+
+        let current = stitcher.previous_perceptual_frame.unwrap();
+        assert_eq!(current.width, baseline.width);
+        assert_eq!(current.height, baseline.height);
+        assert_eq!(current.luminance, baseline.luminance);
+    }
+
+    #[test]
+    fn duplicate_frame_does_not_record_fast_motion_trace() {
+        let frame = textured_frame(160, 48);
+        let previous_analysis = textured_frame(160, 120);
+        let duplicate_analysis = shifted_bottom_with_difference(&previous_analysis, 12, 6);
+        let mut stitcher = RawStitcher::new();
+        stitcher
+            .push_frame_with_analysis(frame.clone(), previous_analysis, None)
+            .unwrap();
+
+        assert_eq!(
+            stitcher
+                .push_frame_with_analysis(frame, duplicate_analysis, None)
+                .unwrap(),
+            PushResult::Duplicate
+        );
+        assert!(stitcher.last_fast_motion_trace().is_none());
+    }
+
+    #[test]
+    fn push_frame_with_analysis_rejects_short_rgb_frame_without_panic() {
+        let mut bad = frame(8, 8, 10);
+        bad.data.truncate(3);
+        let mut stitcher = RawStitcher::new();
+
+        assert!(stitcher
+            .push_frame_with_analysis(bad.clone(), bad, None)
+            .is_err());
+    }
+
+    #[test]
+    fn push_frame_uses_perceptual_bottom_when_old_match_is_brittle() {
+        let previous = textured_frame(160, 48);
+        let current = shifted_bottom_with_difference(&previous, 12, 6);
+        assert_eq!(
+            find_frame_shift_match(&previous, &current, Some(SearchDirection::Down)).overlap,
+            0
+        );
+        let estimate = estimate_vertical_perceptual_motion(&previous, &current).unwrap();
+        assert_eq!(estimate.delta_y, -12);
+        assert!(estimate.no_motion_median.unwrap() > estimate.median + PERCEPTUAL_MOTION_MARGIN);
+
+        let mut stitcher = RawStitcher::new();
+        stitcher
+            .push_frame(previous, Some(LongDirection::Down))
+            .unwrap();
+        let result = stitcher
+            .push_frame(current, Some(LongDirection::Down))
+            .unwrap();
+
+        let PushResult::Accepted { match_info } = result else {
+            panic!("expected perceptual acceptance, got {result:?}");
+        };
+        assert_eq!(match_info.direction, AppendDirection::Bottom);
+        assert_eq!(match_info.delta_y, 12);
+        assert_eq!(match_info.overlap, 36);
+        assert!(match_info.score > MATCH_LINE_MAX_AVERAGE_DIFF);
+    }
+
+    #[test]
+    fn push_frame_with_analysis_rejects_unsafe_hash_analysis_when_compose_frames_do_not_match() {
+        let previous_compose = frame(160, 48, 10);
+        let current_compose = frame(160, 48, 90);
+        assert_eq!(
+            find_frame_shift_match(
+                &previous_compose,
+                &current_compose,
+                Some(SearchDirection::Down)
+            )
+            .overlap,
+            0
+        );
+
+        let previous_analysis = textured_frame(160, 120);
+        let current_analysis = shifted_bottom_with_difference(&previous_analysis, 12, 1);
+        let mut stitcher = RawStitcher::new();
+        stitcher
+            .push_frame_with_analysis(
+                previous_compose,
+                previous_analysis,
+                Some(LongDirection::Down),
+            )
+            .unwrap();
+        let result = stitcher
+            .push_frame_with_analysis(current_compose, current_analysis, Some(LongDirection::Down))
+            .unwrap();
+
+        assert_eq!(result, PushResult::NoMatch);
+    }
+
+    #[test]
+    fn nomatch_recovery_replaces_stale_bottom_edge_after_known_down_scroll() {
+        let width = 64;
+        let first = frame_from_world_rows(width, &(0..48).collect::<Vec<_>>());
+        let normal_next = frame_from_world_rows(width, &(12..60).collect::<Vec<_>>());
+        let mut stale_edge = frame_from_world_rows(width, &(24..72).collect::<Vec<_>>());
+        for y in 36..48 {
+            paint_full_row(&mut stale_edge, y, 170 + y as u8);
+        }
+        let refreshed = frame_from_world_rows(width, &(48..96).collect::<Vec<_>>());
+        let mut stitcher = RawStitcher::new();
+        stitcher
+            .push_frame(first, Some(LongDirection::Down))
+            .unwrap();
+        let normal_result = stitcher
+            .push_frame(normal_next, Some(LongDirection::Down))
+            .unwrap();
+        assert!(matches!(normal_result, PushResult::Accepted { .. }));
+        let stale_result = stitcher
+            .push_frame(stale_edge, Some(LongDirection::Down))
+            .unwrap();
+        assert!(matches!(stale_result, PushResult::Accepted { .. }));
+
+        let result = stitcher
+            .push_frame(refreshed, Some(LongDirection::Down))
+            .unwrap();
+
+        let PushResult::Accepted { match_info } = result else {
+            panic!("expected stale-edge recovery acceptance, got {result:?}");
+        };
+        assert_eq!(match_info.direction, AppendDirection::Bottom);
+        let stitched = stitcher.stitched.as_ref().unwrap();
+        assert_eq!(stitched.height, 96);
+        assert_eq!(stitched.current_origin_y, 48);
+        assert_eq!(
+            stitched_pixel_rgb(stitched, 11, 70),
+            row_texture(width, 70)[33..36]
+        );
+        assert_eq!(
+            stitched_pixel_rgb(stitched, 11, 95),
+            row_texture(width, 95)[33..36]
+        );
+    }
+
+    fn image_from_rgb_frame(frame: &RgbFrame) -> Image {
+        let stride = frame.width * 4;
+        let mut data = vec![0; stride as usize * frame.height as usize];
+        for y in 0..frame.height {
+            for x in 0..frame.width {
+                let src = pixel_offset(frame, x, y);
+                let dst = (y * stride + x * 4) as usize;
+                data[dst] = frame.data[src + 2];
+                data[dst + 1] = frame.data[src + 1];
+                data[dst + 2] = frame.data[src];
+                data[dst + 3] = 255;
+            }
+        }
+        Image {
+            width: frame.width,
+            height: frame.height,
+            stride,
+            format: Format::Xrgb8888,
+            data,
+        }
+    }
+
+    #[test]
+    fn push_frame_views_matches_rgb_frame_path_with_compose_crop() {
+        let crop_y = 4;
+        let previous_analysis = textured_frame(160, 120);
+        let current_analysis = shifted_bottom_with_difference(&previous_analysis, 12, 6);
+        let crop = ComposeCrop {
+            x: 0,
+            y: crop_y,
+            width: 160,
+            height: 48,
+        };
+        let previous_compose = crop_rgb_frame(&previous_analysis, crop).unwrap();
+        let current_compose = crop_rgb_frame(&current_analysis, crop).unwrap();
+        let previous_image = image_from_rgb_frame(&previous_analysis);
+        let current_image = image_from_rgb_frame(&current_analysis);
+
+        let mut rgb_stitcher = RawStitcher::new();
+        rgb_stitcher
+            .push_frame_with_analysis(
+                previous_compose,
+                previous_analysis,
+                Some(LongDirection::Down),
+            )
+            .unwrap();
+        let rgb_result = rgb_stitcher
+            .push_frame_with_analysis(current_compose, current_analysis, Some(LongDirection::Down))
+            .unwrap();
+
+        let mut view_stitcher = RawStitcher::new();
+        view_stitcher
+            .push_frame_views(
+                ImageRgbView::with_crop(&previous_image, crop).unwrap(),
+                ImageRgbView::new(&previous_image).unwrap(),
+                Some(LongDirection::Down),
+            )
+            .unwrap();
+        let view_result = view_stitcher
+            .push_frame_views(
+                ImageRgbView::with_crop(&current_image, crop).unwrap(),
+                ImageRgbView::new(&current_image).unwrap(),
+                Some(LongDirection::Down),
+            )
+            .unwrap();
+
+        assert_eq!(view_result, rgb_result);
+        assert_eq!(view_stitcher.finish(), rgb_stitcher.finish());
+    }
+
+    #[test]
+    fn perceptual_frame_match_rejects_when_not_better_than_zero() {
+        let estimate = PerceptualMotionEstimate {
+            delta_y: -8,
+            median: 3.0,
+            p75: 3.0,
+            p90: 3.0,
+            mean: 3.0,
+            second_best_delta_y: None,
+            second_best_median: None,
+            non_adjacent_second_best_delta_y: None,
+            non_adjacent_second_best_median: None,
+            no_motion_median: Some(3.4),
+            separation: None,
+            overlap_rows: 40,
+            band_count: 9,
+        };
+        let frame = textured_frame(160, 48);
+
+        assert_eq!(
+            perceptual_frame_match(Some(estimate), &frame, Some(SearchDirection::Down)),
+            Err("weak-zero-margin")
+        );
+    }
+
+    #[test]
+    fn perceptual_frame_match_rejects_ambiguous_non_adjacent_candidate() {
+        let estimate = PerceptualMotionEstimate {
+            delta_y: -8,
+            median: 3.0,
+            p75: 3.0,
+            p90: 3.0,
+            mean: 3.0,
+            second_best_delta_y: Some(-20),
+            second_best_median: Some(3.2),
+            non_adjacent_second_best_delta_y: Some(-20),
+            non_adjacent_second_best_median: Some(3.2),
+            no_motion_median: Some(20.0),
+            separation: Some(0.2),
+            overlap_rows: 40,
+            band_count: 9,
+        };
+        let frame = textured_frame(160, 48);
+
+        assert_eq!(
+            perceptual_frame_match(Some(estimate), &frame, Some(SearchDirection::Down)),
+            Err("weak-second-margin")
+        );
+    }
+
+    #[test]
+    fn perceptual_frame_match_allows_adjacent_second_best() {
+        let estimate = PerceptualMotionEstimate {
+            delta_y: -8,
+            median: 3.0,
+            p75: 3.0,
+            p90: 3.0,
+            mean: 3.0,
+            second_best_delta_y: Some(-9),
+            second_best_median: Some(3.1),
+            non_adjacent_second_best_delta_y: Some(-20),
+            non_adjacent_second_best_median: Some(5.0),
+            no_motion_median: Some(20.0),
+            separation: Some(2.0),
+            overlap_rows: 40,
+            band_count: 9,
+        };
+        let frame = textured_frame(160, 48);
+
+        let match_info =
+            perceptual_frame_match(Some(estimate), &frame, Some(SearchDirection::Down)).unwrap();
+        assert_eq!(match_info.direction, AppendDirection::Bottom);
+        assert_eq!(match_info.delta_y, 8);
+    }
+
+    #[test]
+    fn vertical_mode_rejects_horizontal_motion() {
+        let previous = textured_frame(160, 48);
+        let current = shifted_right(&previous, 12);
+        let mut stitcher = RawStitcher::new();
+        stitcher
+            .push_frame(previous, Some(LongDirection::Down))
+            .unwrap();
+
+        assert_eq!(
+            stitcher
+                .push_frame(current, Some(LongDirection::Down))
+                .unwrap(),
+            PushResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn perceptual_motion_prefers_small_positive_shift_over_zero_with_tiny_differences() {
+        let previous = textured_frame(160, 48);
+        let current = shifted_top_with_tiny_difference(&previous, 1);
+
+        let estimate = estimate_vertical_perceptual_motion(&previous, &current).unwrap();
+
+        assert_eq!(estimate.delta_y, 1);
+        assert!(estimate.median < 2.0);
+        assert!(estimate.second_best_delta_y.is_some());
+        assert!(estimate.second_best_median.is_some());
+        assert!(estimate.no_motion_median.is_some());
+        assert_eq!(estimate.overlap_rows, 47);
+    }
+
+    #[test]
+    fn perceptual_motion_uses_positive_and_negative_dy_convention() {
+        let previous = textured_frame(160, 48);
+        let current_positive = shifted_top(&previous, 3);
+        let current_negative = shifted_bottom(&previous, 4);
+
+        let positive = estimate_vertical_perceptual_motion(&previous, &current_positive).unwrap();
+        let negative = estimate_vertical_perceptual_motion(&previous, &current_negative).unwrap();
+
+        assert_eq!(positive.delta_y, 3);
+        assert_eq!(negative.delta_y, -4);
+    }
+
+    #[test]
+    fn fast_motion_candidate_detects_vertical_delta_signs() {
+        let previous = PerceptualFrame::from_source(&textured_frame(160, 48));
+        let bottom = PerceptualFrame::from_source(&shifted_bottom(&textured_frame(160, 48), 4));
+        let top = PerceptualFrame::from_source(&shifted_top(&textured_frame(160, 48), 3));
+
+        let bottom_candidate =
+            scan_fast_vertical_motion_candidate(&previous, &bottom, Some(SearchDirection::Down))
+                .unwrap();
+        let top_candidate =
+            scan_fast_vertical_motion_candidate(&previous, &top, Some(SearchDirection::Up))
+                .unwrap();
+
+        assert_eq!(bottom_candidate.delta_y, -4);
+        assert_eq!(top_candidate.delta_y, 3);
+        assert!(
+            scan_fast_vertical_motion_candidate(&previous, &bottom, Some(SearchDirection::Up))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fast_motion_ranked_scan_orders_lower_scores_first() {
+        let previous = PerceptualFrame::from_source(&textured_frame(160, 80));
+        let current = PerceptualFrame::from_source(&shifted_bottom(&textured_frame(160, 80), 11));
+
+        let scan =
+            scan_fast_vertical_motion(&previous, &current, Some(SearchDirection::Down)).unwrap();
+
+        assert_eq!(scan.ranked.first().unwrap().delta_y, -11);
+        assert!(scan
+            .ranked
+            .windows(2)
+            .all(|window| compare_fast_motion_candidates(&window[0], &window[1]).is_le()));
+        assert_eq!(scan.candidate.unwrap().delta_y, -11);
+    }
+
+    #[test]
+    fn progressive_perceptual_search_accepts_fast_top_candidate() {
+        let previous = textured_frame(160, 80);
+        let current = shifted_bottom_with_difference(&previous, 12, 6);
+        let previous_frame = PerceptualFrame::from_source(&previous);
+        let current_frame = PerceptualFrame::from_source(&current);
+        let scan =
+            scan_fast_vertical_motion(&previous_frame, &current_frame, Some(SearchDirection::Down))
+                .unwrap();
+
+        assert!(scan
+            .ranked
+            .iter()
+            .take(FAST_MOTION_PERCEPTUAL_FIRST_PASS)
+            .any(|candidate| candidate.delta_y == -12));
+        let (estimate, verify_pass) = estimate_vertical_perceptual_motion_from_ranked_deltas(
+            &previous_frame,
+            &current_frame,
+            &current,
+            Some(SearchDirection::Down),
+            &scan.ranked,
+        );
+        let estimate = estimate.unwrap();
+
+        assert_eq!(estimate.delta_y, -12);
+        assert_eq!(verify_pass, Some(FastMotionVerifyPass::Top20));
+        let match_info =
+            perceptual_frame_match(Some(estimate), &current, Some(SearchDirection::Down)).unwrap();
+        assert_eq!(match_info.direction, AppendDirection::Bottom);
+        assert_eq!(match_info.delta_y, 12);
+    }
+
+    #[test]
+    fn progressive_perceptual_search_falls_back_when_top_candidates_miss() {
+        let previous = textured_frame(160, 80);
+        let current = shifted_bottom_with_difference(&previous, 12, 6);
+        let previous_frame = PerceptualFrame::from_source(&previous);
+        let current_frame = PerceptualFrame::from_source(&current);
+        let ranked: Vec<_> = (1..=FAST_MOTION_PERCEPTUAL_SECOND_PASS as i32)
+            .map(|delta_y| {
+                score_fast_motion_delta(&previous_frame, &current_frame, delta_y).unwrap()
+            })
+            .collect();
+
+        let (estimate, verify_pass) = estimate_vertical_perceptual_motion_from_ranked_deltas(
+            &previous_frame,
+            &current_frame,
+            &current,
+            Some(SearchDirection::Down),
+            &ranked,
+        );
+        assert!(estimate.is_none());
+        assert_eq!(verify_pass, None);
+        let full = estimate_vertical_perceptual_motion_from_frame(&previous_frame, &current_frame)
+            .unwrap();
+        assert_eq!(full.delta_y, -12);
+    }
+
+    #[test]
+    fn progressive_perceptual_search_falls_back_when_partial_is_ambiguous() {
+        let previous = periodic_textured_frame(160, 80, 10);
+        let current = shifted_bottom_with_difference(&previous, 12, 6);
+        let previous_frame = PerceptualFrame::from_source(&previous);
+        let current_frame = PerceptualFrame::from_source(&current);
+        let ranked = vec![
+            score_fast_motion_delta(&previous_frame, &current_frame, -12).unwrap(),
+            score_fast_motion_delta(&previous_frame, &current_frame, -22).unwrap(),
+        ];
+
+        let (estimate, verify_pass) = estimate_vertical_perceptual_motion_from_ranked_deltas(
+            &previous_frame,
+            &current_frame,
+            &current,
+            Some(SearchDirection::Down),
+            &ranked,
+        );
+        assert!(estimate.is_none());
+        assert_eq!(verify_pass, None);
+        let full = estimate_vertical_perceptual_motion_from_frame(&previous_frame, &current_frame)
+            .unwrap();
+        assert_eq!(full.delta_y, -12);
+    }
+
+    #[test]
+    fn fast_motion_trace_compares_against_negative_frame_match_delta() {
+        let candidate = FastMotionCandidate {
+            delta_y: -12,
+            score: 0.5,
+            overlap_rows: 36,
+        };
+        let match_info = FrameMatch {
+            direction: AppendDirection::Bottom,
+            overlap: 36,
+            delta_x: 0,
+            delta_y: 12,
+            score: 1.0,
+        };
+
+        let trace = compare_fast_motion_candidate(
+            Some(candidate),
+            Some(match_info),
+            false,
+            Some(FastMotionVerifyPass::Top20),
+        );
+
+        assert_eq!(trace.reference_delta_y, Some(-12));
+        assert_eq!(trace.agreement, FastMotionAgreement::HeavyExactDelta);
+        assert_eq!(trace.verify_pass, Some(FastMotionVerifyPass::Top20));
+    }
+
+    #[test]
+    fn fast_motion_candidate_frame_match_uses_append_delta_sign() {
+        let frame = textured_frame(160, 48);
+        let bottom = fast_motion_candidate_frame_match(
+            FastMotionCandidate {
+                delta_y: -12,
+                score: 0.5,
+                overlap_rows: 36,
+            },
+            &frame,
+            Some(SearchDirection::Down),
+        )
+        .unwrap();
+        let top = fast_motion_candidate_frame_match(
+            FastMotionCandidate {
+                delta_y: 12,
+                score: 0.5,
+                overlap_rows: 36,
+            },
+            &frame,
+            Some(SearchDirection::Up),
+        )
+        .unwrap();
+
+        assert_eq!(bottom.direction, AppendDirection::Bottom);
+        assert_eq!(bottom.delta_y, 12);
+        assert_eq!(bottom.overlap, 36);
+        assert_eq!(top.direction, AppendDirection::Top);
+        assert_eq!(top.delta_y, -12);
+        assert_eq!(top.overlap, 36);
+    }
+
+    #[test]
+    fn fast_motion_candidate_frame_match_rejects_direction_mismatch() {
+        let frame = textured_frame(160, 48);
+
+        assert_eq!(
+            fast_motion_candidate_frame_match(
+                FastMotionCandidate {
+                    delta_y: -12,
+                    score: 0.5,
+                    overlap_rows: 36,
+                },
+                &frame,
+                Some(SearchDirection::Up),
+            ),
+            Err("direction-mismatch")
+        );
+    }
+
+    #[test]
+    fn perceptual_motion_returns_no_estimate_for_too_small_frames() {
+        let previous = textured_frame(160, PERCEPTUAL_MOTION_BAND_HEIGHT - 1);
+        let current = previous.clone();
+
+        assert!(estimate_vertical_perceptual_motion(&previous, &current).is_none());
+    }
+
+    #[test]
+    fn perceptual_motion_returns_no_estimate_when_all_deltas_have_no_overlap() {
+        let previous = textured_frame(16, 8);
+        let current = textured_frame(16, 8);
+        let config = PerceptualMotionConfig {
+            delta_range: 0,
+            band_height: 9,
+            band_step: 1,
+            bins: 4,
+        };
+
+        assert!(
+            estimate_vertical_perceptual_motion_with_config(&previous, &current, config).is_none()
+        );
+    }
+
+    #[test]
+    fn perceptual_motion_delta_score_returns_no_estimate_without_overlap() {
+        let previous = textured_frame(16, 8);
+        let current = textured_frame(16, 8);
+        let config = PerceptualMotionConfig {
+            delta_range: 150,
+            band_height: 8,
+            band_step: 4,
+            bins: 4,
+        };
+        let previous_frame = PerceptualFrame::from_source(&previous);
+        let current_frame = PerceptualFrame::from_source(&current);
+        let previous_signatures =
+            precompute_perceptual_band_signatures(&previous_frame, 16, config);
+        let current_signatures = precompute_perceptual_band_signatures(&current_frame, 16, config);
+        let mut distances = Vec::new();
+
+        assert!(score_perceptual_delta(
+            &previous_frame,
+            &current_frame,
+            &previous_signatures,
+            &current_signatures,
+            8,
+            config,
+            &mut distances,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn append_expands_bottom() {
+        let previous = frame(32, 24, 10);
+        let current = shifted_bottom(&previous, 2);
+        let mut stitcher = RawStitcher::new();
+        stitcher
+            .push_frame(previous, Some(LongDirection::Down))
+            .unwrap();
+        let result = stitcher
+            .push_frame(current, Some(LongDirection::Down))
+            .unwrap();
         assert!(matches!(result, PushResult::Accepted { .. }));
-
         let stitched = stitcher.finish().unwrap();
-        assert_eq!(stitched.height, 4);
+        assert_eq!(stitched.height, 26);
+        assert_eq!(stitched.current_origin_y, 2);
+        assert_eq!(stitched.anchor_origin_y, 0);
+    }
+
+    #[test]
+    fn append_expands_top() {
+        let previous = frame(32, 24, 10);
+        let current = shifted_top(&previous, 2);
+        let mut stitcher = RawStitcher::new();
+        stitcher
+            .push_frame(previous, Some(LongDirection::Up))
+            .unwrap();
+        let result = stitcher
+            .push_frame(current, Some(LongDirection::Up))
+            .unwrap();
+        assert!(matches!(result, PushResult::Accepted { .. }));
+        let stitched = stitcher.finish().unwrap();
+        assert_eq!(stitched.height, 26);
+        assert_eq!(stitched.current_origin_y, 0);
+        assert_eq!(stitched.anchor_origin_y, 2);
+    }
+
+    #[test]
+    fn append_expands_right() {
+        let previous = frame(32, 24, 10);
+        let current = shifted_right(&previous, 4);
+        let mut stitcher = RawStitcher::new();
+        stitcher
+            .push_frame(previous, Some(LongDirection::Right))
+            .unwrap();
+        let result = stitcher
+            .push_frame(current, Some(LongDirection::Right))
+            .unwrap();
+        assert!(matches!(result, PushResult::Accepted { .. }));
+        let stitched = stitcher.finish().unwrap();
+        assert_eq!(stitched.width, 36);
+        assert_eq!(stitched.current_origin_x, 4);
+        assert_eq!(stitched.anchor_origin_x, 0);
+    }
+
+    #[test]
+    fn append_expands_left() {
+        let previous = frame(32, 24, 10);
+        let current = shifted_left(&previous, 3);
+        let mut stitcher = RawStitcher::new();
+        stitcher
+            .push_frame(previous, Some(LongDirection::Left))
+            .unwrap();
+        let result = stitcher
+            .push_frame(current, Some(LongDirection::Left))
+            .unwrap();
+        assert!(matches!(result, PushResult::Accepted { .. }));
+        let stitched = stitcher.finish().unwrap();
+        assert_eq!(stitched.width, 35);
+        assert_eq!(stitched.current_origin_x, 0);
+        assert_eq!(stitched.anchor_origin_x, 3);
+    }
+
+    #[test]
+    fn canvas_placement_updates_viewport_for_contained_reverse_scroll() {
+        let world = textured_frame(32, 80);
+        let first = crop_frame(&world, 0, 20, 32, 24);
+        let bottom = crop_frame(&world, 0, 28, 32, 24);
+        let contained = crop_frame(&world, 0, 22, 32, 24);
+        let mut stitcher = RawStitcher::new();
+        stitcher
+            .push_frame(first, Some(LongDirection::Down))
+            .unwrap();
+        assert!(matches!(
+            stitcher
+                .push_frame(bottom, Some(LongDirection::Down))
+                .unwrap(),
+            PushResult::Accepted { .. }
+        ));
+        let before = stitcher.stitched.clone().unwrap();
+
+        let result = stitcher
+            .push_frame(contained, Some(LongDirection::Up))
+            .unwrap();
+
+        let PushResult::Accepted { match_info } = result else {
+            panic!("expected contained canvas placement, got {result:?}");
+        };
+        assert_eq!(match_info.delta_y, -6);
+        assert_eq!(stitcher.viewport_rect.unwrap().y, 2);
+        let after = stitcher.stitched.as_ref().unwrap();
+        assert_eq!(after.width, before.width);
+        assert_eq!(after.height, before.height);
+        assert_eq!(after.data, before.data);
+    }
+
+    #[test]
+    fn canvas_placement_appends_only_partial_top_extension() {
+        let world = textured_frame(32, 80);
+        let first = crop_frame(&world, 0, 20, 32, 24);
+        let bottom = crop_frame(&world, 0, 28, 32, 24);
+        let top = crop_frame(&world, 0, 12, 32, 24);
+        let mut stitcher = RawStitcher::new();
+        stitcher
+            .push_frame(first, Some(LongDirection::Down))
+            .unwrap();
+        stitcher
+            .push_frame(bottom, Some(LongDirection::Down))
+            .unwrap();
+        let bottom_pixel_before = stitched_pixel_rgb(stitcher.stitched.as_ref().unwrap(), 11, 31);
+
+        let result = stitcher.push_frame(top, Some(LongDirection::Up)).unwrap();
+
+        assert!(matches!(result, PushResult::Accepted { .. }));
+        let stitched = stitcher.stitched.as_ref().unwrap();
+        assert_eq!(stitched.height, 40);
+        assert_eq!(stitched.current_origin_y, 0);
+        assert_eq!(stitched_pixel_rgb(stitched, 11, 0), world.pixel_rgb(11, 12));
+        assert_eq!(stitched_pixel_rgb(stitched, 11, 39), bottom_pixel_before);
+        assert_eq!(
+            stitched_pixel_rgb(stitched, 11, 39),
+            world.pixel_rgb(11, 51)
+        );
+    }
+
+    #[test]
+    fn canvas_placement_updates_viewport_for_contained_horizontal_reverse_scroll() {
+        let world = textured_frame(80, 24);
+        let first = crop_frame(&world, 20, 0, 24, 24);
+        let right = crop_frame(&world, 28, 0, 24, 24);
+        let contained = crop_frame(&world, 22, 0, 24, 24);
+        let mut stitcher = RawStitcher::new();
+        stitcher
+            .push_frame(first, Some(LongDirection::Right))
+            .unwrap();
+        stitcher
+            .push_frame(right, Some(LongDirection::Right))
+            .unwrap();
+        let before = stitcher.stitched.clone().unwrap();
+
+        let result = stitcher
+            .push_frame(contained, Some(LongDirection::Left))
+            .unwrap();
+
+        let PushResult::Accepted { match_info } = result else {
+            panic!("expected contained canvas placement, got {result:?}");
+        };
+        assert_eq!(match_info.delta_x, -6);
+        assert_eq!(stitcher.viewport_rect.unwrap().x, 2);
+        let after = stitcher.stitched.as_ref().unwrap();
+        assert_eq!(after.width, before.width);
+        assert_eq!(after.height, before.height);
+        assert_eq!(after.data, before.data);
+    }
+
+    #[test]
+    fn canvas_placement_finds_far_vertical_match_via_coarse_refine_search() {
+        let world = textured_frame(32, 420);
+        let stitched = StitchedFrame::from_first_frame(&world);
+        let previous_rect = ViewportRect {
+            x: 0,
+            y: 0,
+            width: 32,
+            height: 64,
+        };
+        let target = crop_frame(&world, 0, 217, 32, 64);
+
+        let match_info = find_canvas_placement_match(
+            &stitched,
+            previous_rect,
+            &target,
+            SearchAxis::Vertical,
+            Some(SearchDirection::Down),
+        )
+        .expect("expected far canvas placement match");
+
+        assert_eq!(match_info.direction, AppendDirection::Bottom);
+        assert_eq!(match_info.delta_y, 217);
+        assert_eq!(match_info.overlap, 64);
+        assert!(match_info.score <= MATCH_PREFILTER_MAX_AVERAGE_DIFF);
+    }
+
+    #[test]
+    fn canvas_placement_rejects_opposite_vertical_direction() {
+        let world = textured_frame(32, 120);
+        let stitched = StitchedFrame::from_first_frame(&crop_frame(&world, 0, 24, 32, 48));
+        let previous_rect = ViewportRect {
+            x: 0,
+            y: 0,
+            width: 32,
+            height: 48,
+        };
+        let target_above = crop_frame(&world, 0, 16, 32, 48);
+        let target_below = crop_frame(&world, 0, 32, 32, 48);
+
+        let down = find_canvas_placement_match(
+            &stitched,
+            previous_rect,
+            &target_above,
+            SearchAxis::Vertical,
+            Some(SearchDirection::Down),
+        );
+        let up = find_canvas_placement_match(
+            &stitched,
+            previous_rect,
+            &target_below,
+            SearchAxis::Vertical,
+            Some(SearchDirection::Up),
+        );
+
+        assert!(down.is_none());
+        assert!(up.is_none());
+    }
+
+    #[test]
+    fn canvas_placement_rejects_opposite_horizontal_direction() {
+        let world = textured_frame(120, 32);
+        let stitched = StitchedFrame::from_first_frame(&crop_frame(&world, 24, 0, 48, 32));
+        let previous_rect = ViewportRect {
+            x: 0,
+            y: 0,
+            width: 48,
+            height: 32,
+        };
+        let target_left = crop_frame(&world, 16, 0, 48, 32);
+        let target_right = crop_frame(&world, 32, 0, 48, 32);
+
+        let right = find_canvas_placement_match(
+            &stitched,
+            previous_rect,
+            &target_left,
+            SearchAxis::Horizontal,
+            Some(SearchDirection::Right),
+        );
+        let left = find_canvas_placement_match(
+            &stitched,
+            previous_rect,
+            &target_right,
+            SearchAxis::Horizontal,
+            Some(SearchDirection::Left),
+        );
+
+        assert!(right.is_none());
+        assert!(left.is_none());
+    }
+
+    #[test]
+    fn placement_pipeline_canvas_accept_matches_canvas_search() {
+        let world = textured_frame(32, 420);
+        let stitched = StitchedFrame::from_first_frame(&world);
+        let previous_rect = ViewportRect {
+            x: 0,
+            y: 0,
+            width: 32,
+            height: 64,
+        };
+        let previous_region = extract_stitched_region(&stitched, previous_rect).unwrap();
+        let target = crop_frame(&world, 0, 217, 32, 64);
+        let expected = find_canvas_placement_match(
+            &stitched,
+            previous_rect,
+            &target,
+            SearchAxis::Vertical,
+            Some(SearchDirection::Down),
+        )
+        .unwrap();
+        let mut pipeline = DefaultPlacementPipeline;
+
+        let outcome = pipeline.place(PlacementInput {
+            stitched: &stitched,
+            previous_rect,
+            previous_region: &previous_region,
+            active_compose: &target,
+            analysis_frame: &target,
+            previous_perceptual_frame: None,
+            search_direction: Some(SearchDirection::Down),
+            profile_enabled: true,
+        });
+
+        assert_eq!(outcome.candidates.len(), 1);
+        assert_eq!(outcome.candidates[0].source, PlacementSource::Canvas);
+        assert_eq!(outcome.candidates[0].match_info, expected);
+        assert_eq!(
+            outcome.profile.path,
+            Some(StitchDecisionPath::CanvasAccepted)
+        );
+    }
+
+    #[test]
+    fn placement_pipeline_delays_perceptual_prepare_when_canvas_accepts() {
+        let world = textured_frame(32, 100);
+        let stitched = StitchedFrame::from_first_frame(&world);
+        let previous_rect = ViewportRect {
+            x: 0,
+            y: 0,
+            width: 32,
+            height: 40,
+        };
+        let previous_region = extract_stitched_region(&stitched, previous_rect).unwrap();
+        let target = crop_frame(&world, 0, 12, 32, 40);
+        let previous_perceptual = PerceptualFrame::from_source(&previous_region);
+        let mut pipeline = DefaultPlacementPipeline;
+
+        let outcome = pipeline.place(PlacementInput {
+            stitched: &stitched,
+            previous_rect,
+            previous_region: &previous_region,
+            active_compose: &target,
+            analysis_frame: &target,
+            previous_perceptual_frame: Some(&previous_perceptual),
+            search_direction: Some(SearchDirection::Down),
+            profile_enabled: true,
+        });
+
+        assert_eq!(outcome.candidates[0].source, PlacementSource::Canvas);
+        assert!(outcome.current_perceptual_frame.is_none());
+        assert_eq!(outcome.perceptual_estimate, None);
+        assert_eq!(outcome.profile.perceptual_prepare, Duration::default());
+    }
+
+    #[test]
+    fn placement_pipeline_returns_fallback_candidate_without_mutating_stitcher_state() {
+        let previous = textured_frame(64, 40);
+        let current = shifted_right(&previous, 6);
+        let stitched = StitchedFrame::from_first_frame(&frame(64, 40, 220));
+        let previous_rect = ViewportRect {
+            x: 0,
+            y: 0,
+            width: previous.width,
+            height: previous.height,
+        };
+        let before = stitched.clone();
+        let mut pipeline = DefaultPlacementPipeline;
+
+        let outcome = pipeline.place(PlacementInput {
+            stitched: &stitched,
+            previous_rect,
+            previous_region: &previous,
+            active_compose: &current,
+            analysis_frame: &current,
+            previous_perceptual_frame: None,
+            search_direction: Some(SearchDirection::Right),
+            profile_enabled: true,
+        });
+
+        assert!(outcome
+            .candidates
+            .iter()
+            .any(|candidate| candidate.source == PlacementSource::PreviousFrameFallback));
+        assert_eq!(stitched, before);
+    }
+
+    #[test]
+    fn append_preserves_old_pixels_in_overlap() {
+        let previous = frame(32, 24, 10);
+        let mut stitched = StitchedFrame::from_first_frame(&previous);
+        let mut current = shifted_bottom(&previous, 4);
+        for y in 0..20 {
+            for x in 0..32 {
+                let offset = pixel_offset(&current, x, y);
+                current.data[offset..offset + 3].copy_from_slice(&[250, 250, 250]);
+            }
+        }
+        let match_info = FrameMatch {
+            direction: AppendDirection::Bottom,
+            overlap: 20,
+            delta_x: 0,
+            delta_y: 4,
+            score: 0.0,
+        };
+        let new_rect = append_frame_at_position(
+            &mut stitched,
+            ViewportRect {
+                x: 0,
+                y: 0,
+                width: previous.width,
+                height: previous.height,
+            },
+            &current,
+            match_info,
+        )
+        .unwrap();
+        assert_eq!(new_rect.y, 4);
+        assert_eq!(stitched.height, 28);
+
+        let old_overlap = pixel_offset(&previous, 7, 9);
+        let stitched_overlap = pixel_offset(
+            &RgbFrame {
+                width: stitched.width,
+                height: stitched.height,
+                stride: stitched.stride,
+                data: stitched.data.clone(),
+            },
+            7,
+            9,
+        );
+        assert_eq!(
+            stitched.data[stitched_overlap..stitched_overlap + 3],
+            previous.data[old_overlap..old_overlap + 3]
+        );
+
+        let current_tail = pixel_offset(&current, 7, 23);
+        let stitched_tail = (27 * stitched.stride + 7 * 3) as usize;
+        assert_eq!(
+            stitched.data[stitched_tail..stitched_tail + 3],
+            current.data[current_tail..current_tail + 3]
+        );
+    }
+
+    #[test]
+    fn recovery_append_overwrites_only_proven_overlap_rows() {
+        let previous = frame(32, 24, 10);
+        let mut stitched = StitchedFrame::from_first_frame(&previous);
+        let mut current = shifted_bottom(&previous, 4);
+        for y in 0..20 {
+            for x in 0..32 {
+                let offset = pixel_offset(&current, x, y);
+                current.data[offset..offset + 3].copy_from_slice(&[250, 250, 250]);
+            }
+        }
+        let match_info = FrameMatch {
+            direction: AppendDirection::Bottom,
+            overlap: 20,
+            delta_x: 0,
+            delta_y: 4,
+            score: 0.0,
+        };
+
+        append_frame_at_position_overwriting_overlap_rows(
+            &mut stitched,
+            ViewportRect {
+                x: 0,
+                y: 0,
+                width: previous.width,
+                height: previous.height,
+            },
+            &current,
+            match_info,
+            8,
+            6,
+        )
+        .unwrap();
+
+        assert_eq!(stitched.height, 28);
+        assert_eq!(
+            stitched_pixel_rgb(&stitched, 7, 11),
+            previous.pixel_rgb(7, 11)
+        );
+        assert_eq!(
+            stitched_pixel_rgb(&stitched, 7, 12),
+            current.pixel_rgb(7, 8)
+        );
+        assert_eq!(
+            stitched_pixel_rgb(&stitched, 7, 17),
+            current.pixel_rgb(7, 13)
+        );
+        assert_eq!(
+            stitched_pixel_rgb(&stitched, 7, 18),
+            previous.pixel_rgb(7, 18)
+        );
+        assert_eq!(
+            stitched_pixel_rgb(&stitched, 7, 27),
+            current.pixel_rgb(7, 23)
+        );
+    }
+
+    #[test]
+    fn raw_overlap_recovery_detects_refresh_dirty_band() {
+        let previous = frame(834, 491, 0);
+        let mut current = shifted_bottom(&previous, 24);
+        paint_rows(&mut current, 396, 37, 215);
+        let match_info = FrameMatch {
+            direction: AppendDirection::Bottom,
+            overlap: 467,
+            delta_x: 0,
+            delta_y: 24,
+            score: 0.45,
+        };
+
+        let recovery = direct_bottom_raw_overlap_recovery(&previous, &current, match_info)
+            .expect("expected dirty overlap recovery");
+
+        assert_eq!(recovery.overwrite_frame_y, 396);
+        assert_eq!(recovery.overwrite_rows, 37);
+    }
+
+    #[test]
+    fn converts_stitched_to_xrgb_image() {
+        let previous = frame(2, 2, 10);
+        let stitched = StitchedFrame::from_first_frame(&previous);
+        let image = image_from_stitched_frame(&stitched).unwrap();
+        assert_eq!(image.format, Format::Xrgb8888);
+        assert_eq!(image.stride, 8);
+        assert_eq!(image.data[0], previous.data[2]);
+        assert_eq!(image.data[1], previous.data[1]);
+        assert_eq!(image.data[2], previous.data[0]);
+        assert_eq!(image.data[3], 255);
     }
 }
