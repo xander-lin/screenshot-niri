@@ -35,7 +35,7 @@ const KEY_ENTER: u32 = 28;
 const KEY_SPACE: u32 = 57;
 const KEY_DOWN: u32 = 108;
 const KEY_UP: u32 = 103;
-const OVERLAY_BUFFER_COUNT: usize = 2;
+const OVERLAY_BUFFER_COUNT: usize = 3;
 const SELECTION_BORDER_WIDTH: i32 = 3;
 const OVERLAY_OUTSIDE_MASK_BGRA: [u8; 4] = [0, 0, 0, 110];
 const OVERLAY_SELECTED_TRANSPARENT_BGRA: [u8; 4] = [0, 0, 0, 0];
@@ -389,7 +389,14 @@ impl SelectionSession {
         for overlay in &mut self.state.overlays {
             overlay.render_cache = None;
         }
-        render_overlays_full_dim(&mut self.state);
+        // Retry until at least one overlay is rendered (buffer available)
+        for _ in 0..50 {
+            self.event_queue.dispatch_pending(&mut self.state)?;
+            if render_overlays_full_dim(&mut self.state) > 0 {
+                break;
+            }
+            self.dispatch_poll(10)?;
+        }
         set_overlay_keyboard_exclusive(&mut self.state);
         set_overlay_pointer_passthrough(&mut self.state, &qh)?;
         self.event_queue.dispatch_pending(&mut self.state)?;
@@ -515,15 +522,16 @@ fn create_live_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Resul
     Ok(())
 }
 
-fn render_overlays_full_dim(state: &mut UiState) {
-    render_overlays_inner(state, true);
+fn render_overlays_full_dim(state: &mut UiState) -> usize {
+    render_overlays_inner(state, true)
 }
 
-fn render_overlays_capture_clean(state: &mut UiState) {
-    render_overlays_inner(state, false);
+fn render_overlays_capture_clean(state: &mut UiState) -> usize {
+    render_overlays_inner(state, false)
 }
 
-fn render_overlays_inner(state: &mut UiState, draw_border: bool) {
+fn render_overlays_inner(state: &mut UiState, draw_border: bool) -> usize {
+    let mut committed = 0;
     for overlay in &mut state.overlays {
         let Some(buffer) = overlay.buffers.iter_mut().find(|buffer| buffer.available) else {
             continue;
@@ -564,7 +572,9 @@ fn render_overlays_inner(state: &mut UiState, draw_border: bool) {
         overlay.surface.damage_buffer(0, 0, overlay.width, overlay.height);
         overlay.surface.commit();
         buffer.available = false;
+        committed += 1;
     }
+    committed
 }
 
 fn draw_selection_border(data: &mut [u8], _width: i32, _height: i32, x: i32, y: i32, w: i32, h: i32) {
