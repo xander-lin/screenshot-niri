@@ -370,6 +370,10 @@ impl SelectionSession {
     ) -> Result<(), Box<dyn Error>> {
         let qh = self.event_queue.handle();
         self.state.drag = DragState::Finished(viewport.rect);
+        self.state.long_requested = false;
+        self.state.long_finish_requested = false;
+        self.state.long_direction = None;
+        self.state.long_preview = None;
         render_overlays_full_dim(&mut self.state);
         set_overlay_keyboard_exclusive(&mut self.state);
         set_overlay_pointer_passthrough(&mut self.state, &qh)?;
