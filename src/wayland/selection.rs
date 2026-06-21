@@ -146,6 +146,7 @@ struct OverlaySurface {
     render_cache: Option<OverlayRenderCache>,
     width: i32,
     height: i32,
+    base_pixels: Option<Vec<u8>>,
 }
 
 struct OverlayRenderCache {
@@ -396,6 +397,7 @@ impl SelectionSession {
         self.state.long_preview = None;
         for overlay in &mut self.state.overlays {
             overlay.render_cache = None;
+            overlay.base_pixels = None;
         }
         // Retry until at least one overlay is rendered (buffer available)
         for _ in 0..50 {
@@ -523,6 +525,7 @@ fn create_live_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Resul
             layer_surface,
             buffers: Vec::new(),
             render_cache: None,
+            base_pixels: None,
             width: output.info.logical.width.max(1),
             height: output.info.logical.height.max(1),
         });
@@ -540,39 +543,49 @@ fn render_overlays_capture_clean(state: &mut UiState) -> usize {
 
 fn render_overlays_inner(state: &mut UiState, draw_border: bool) -> usize {
     let mut committed = 0;
-    for overlay in &mut state.overlays {
-        let Some(buffer) = overlay.buffers.iter_mut().find(|buffer| buffer.available) else {
-            continue;
+    for i in 0..state.overlays.len() {
+        let overlay = &mut state.overlays[i];
+        let buffer = match overlay.buffers.iter().position(|b| b.available) {
+            Some(pos) => &mut overlay.buffers[pos],
+            None => continue,
         };
         let data = unsafe { std::slice::from_raw_parts_mut(buffer.data, buffer.size) };
+        let buf_size = overlay.width as usize * overlay.height as usize * 4;
         let stride = overlay.width as usize * 4;
-        for y in 0..overlay.height as usize {
-            for x in 0..overlay.width as usize {
-                let offset = y * stride + x * 4;
-                data[offset..offset + 4].copy_from_slice(&OVERLAY_OUTSIDE_MASK_BGRA);
-            }
-        }
         let rect = state.drag.current_rect();
-        let mut output_logical = LogicalRect { x: 0, y: 0, width: overlay.width, height: overlay.height };
-        let mut selection_local: Option<LogicalRect> = None;
-        if let Some(rect) = rect {
-            if let Some(output) = state.outputs.iter().find(|o| o.info.global_name == overlay.output_name) {
-                output_logical = output.info.logical;
-                let local = selected_local_intersection_for_buffer(output.info.logical, rect, overlay.width, overlay.height);
-                if let Some(ref local) = local {
-                    for y in local.y..local.y + local.height {
-                        for x in local.x..local.x + local.width {
-                            let offset = y as usize * stride + x as usize * 4;
-                            data[offset + 3] = 0;
-                        }
-                    }
-                    if draw_border {
-                        draw_selection_border(data, overlay.width, overlay.height, local.x, local.y, local.width, local.height);
+        let output_logical = state.outputs.iter()
+            .find(|o| o.info.global_name == overlay.output_name)
+            .map(|o| o.info.logical)
+            .unwrap_or(LogicalRect { x: 0, y: 0, width: overlay.width, height: overlay.height });
+        let selection_local = rect.and_then(|r| {
+            selected_local_intersection_for_buffer(output_logical, r, overlay.width, overlay.height)
+        });
+
+        let rebuild = overlay.base_pixels.as_ref().map_or(true, |b| b.len() != buf_size);
+        if rebuild {
+            for y in 0..overlay.height as usize {
+                for x in 0..overlay.width as usize {
+                    let offset = y * stride + x * 4;
+                    data[offset..offset + 4].copy_from_slice(&OVERLAY_OUTSIDE_MASK_BGRA);
+                }
+            }
+            if let Some(ref local) = selection_local {
+                for y in local.y..local.y + local.height {
+                    for x in local.x..local.x + local.width {
+                        let offset = y as usize * stride + x as usize * 4;
+                        data[offset + 3] = 0;
                     }
                 }
-                selection_local = local;
+                if draw_border {
+                    draw_selection_border(data, overlay.width, overlay.height, local.x, local.y, local.width, local.height);
+                }
             }
+            let cache = data[..buf_size].to_vec();
+            overlay.base_pixels = Some(cache);
+        } else if let Some(ref base) = overlay.base_pixels {
+            data[..buf_size.min(base.len())].copy_from_slice(&base[..buf_size.min(base.len())]);
         }
+
         if let Some(ref preview) = state.long_preview {
             draw_preview_on_overlay(data, overlay.width, overlay.height, preview, output_logical, selection_local);
         }
@@ -678,6 +691,7 @@ fn create_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Result<(),
             layer_surface,
             buffers: Vec::new(),
             render_cache: None,
+            base_pixels: None,
             width: output.info.logical.width.max(1),
             height: output.info.logical.height.max(1),
         });
