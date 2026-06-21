@@ -940,39 +940,55 @@ fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, prev
     let origin_y = preview.current_origin_y;
     let buf_stride = overlay_w as usize * 4;
     let sel = selection_local.unwrap_or(LogicalRect { x: 0, y: 0, width: 0, height: 0 });
+    let img_data = &preview.image.data;
+    let img_stride = preview.image.stride as i32;
 
-    // Visible stitched y-range on this output
     let global_y0 = output_logical.y;
     let global_y1 = output_logical.y + overlay_h;
+    let global_x0 = output_logical.x;
+    let global_x1 = output_logical.x + overlay_w;
     let sy0 = (origin_y + (global_y0 - vp.y) * ch / vp_h).max(0).min(ph);
     let sy1 = (origin_y + (global_y1 - vp.y) * ch / vp_h + 1).max(0).min(ph);
+    // Precompute visible x-range in stitched coords
+    let sx_min = (origin_x + (global_x0 - vp.x) * cw / vp_w).max(0);
+    let sx_max = (origin_x + (global_x1 - vp.x) * cw / vp_w + 1).min(pw);
 
     for sy in sy0..sy1 {
         let global_y = vp.y + (sy - origin_y) * vp_h / ch;
-        if global_y < output_logical.y || global_y >= global_y1 {
+        if global_y < global_y0 || global_y >= global_y1 {
             continue;
         }
-        let oy = global_y - output_logical.y;
-        let skip_mid = oy >= sel.y && oy < sel.y + sel.height;
-        let src_row = sy as u32 * preview.image.stride;
+        let oy = global_y - global_y0;
+        let in_sel_y = oy >= sel.y && oy < sel.y + sel.height;
+        // For rows fully covered by selection, skip entire row
+        if in_sel_y {
+            let global_sx0 = vp.x + (sx_min - origin_x) * vp_w / cw;
+            let global_sx1 = vp.x + (sx_max - origin_x) * vp_w / cw;
+            let ox0 = global_sx0 - global_x0;
+            let ox1 = global_sx1 - global_x0;
+            if ox0 >= sel.x && ox1 <= sel.x + sel.width {
+                continue;
+            }
+        }
+        let src_row = (sy * img_stride) as usize;
 
-        for sx in 0..pw {
+        for sx in sx_min..sx_max {
             let global_x = vp.x + (sx - origin_x) * vp_w / cw;
-            if global_x < output_logical.x || global_x >= output_logical.x + overlay_w {
+            if global_x < global_x0 || global_x >= global_x1 {
                 continue;
             }
-            let ox = global_x - output_logical.x;
-            if skip_mid && ox >= sel.x && ox < sel.x + sel.width {
+            let ox = global_x - global_x0;
+            if in_sel_y && ox >= sel.x && ox < sel.x + sel.width {
                 continue;
             }
-            let src_off = (src_row + sx as u32 * 4) as usize;
-            if src_off + 3 >= preview.image.data.len() {
+            let src_off = src_row + (sx * 4) as usize;
+            if src_off + 3 >= img_data.len() {
                 continue;
             }
             let dst_off = (oy as usize) * buf_stride + (ox as usize) * 4;
-            data[dst_off] = preview.image.data[src_off];
-            data[dst_off + 1] = preview.image.data[src_off + 1];
-            data[dst_off + 2] = preview.image.data[src_off + 2];
+            data[dst_off] = img_data[src_off];
+            data[dst_off + 1] = img_data[src_off + 1];
+            data[dst_off + 2] = img_data[src_off + 2];
             data[dst_off + 3] = 255;
         }
     }
