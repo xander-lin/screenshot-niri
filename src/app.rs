@@ -1,14 +1,12 @@
 use std::error::Error;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, TryRecvError};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::mpsc::TryRecvError;
+use std::time::Duration;
 
 use crate::cli::{Command, Mode};
 use crate::stitch::{ImageRgbView, PushResult, RawStitcher, SearchDirection};
 
 const LONG_UI_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const LONG_CAPTURE_FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 120);
+const LONG_FRAMES_PER_UI_TICK: usize = 2;
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     match Command::parse()? {
@@ -45,45 +43,33 @@ fn run_normal(args: crate::cli::Args) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-enum WorkerMsg {
-    PrepareCapture,
-    Frame(crate::image::Image),
-}
-
 struct LongCaptureWorker {
-    stop: Arc<AtomicBool>,
-    receiver: mpsc::Receiver<WorkerMsg>,
-    ack_sender: mpsc::SyncSender<()>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    receiver: std::sync::mpsc::Receiver<crate::image::Image>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl LongCaptureWorker {
     fn start(region: crate::wayland::screencopy::CaptureOutputRegion) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let (msg_sender, receiver) = mpsc::sync_channel(2);
-        let (ack_sender, ack_receiver) = mpsc::sync_channel(0);
-        let thread_stop = Arc::clone(&stop);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+        let thread_sender = sender.clone();
+        let thread_stop = std::sync::Arc::clone(&stop);
         let thread = std::thread::spawn(move || {
-            let mut last: Option<Instant> = None;
-            while !thread_stop.load(Ordering::Relaxed) {
-                if msg_sender.send(WorkerMsg::PrepareCapture).is_err() {
-                    return;
-                }
-                if !wait_for_ack(&thread_stop, &ack_receiver) {
-                    return;
-                }
+            let mut last: Option<std::time::Instant> = None;
+            while !thread_stop.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Some(prev) = last {
-                    while prev.elapsed() < LONG_CAPTURE_FRAME_INTERVAL {
-                        if thread_stop.load(Ordering::Relaxed) {
+                    while prev.elapsed() < Duration::from_nanos(1_000_000_000 / 120) {
+                        if thread_stop.load(std::sync::atomic::Ordering::Relaxed) {
                             return;
                         }
                         std::thread::sleep(Duration::from_millis(2));
                     }
                 }
-                last = Some(Instant::now());
+                last = Some(std::time::Instant::now());
                 match crate::wayland::screencopy::capture_region(region, false) {
                     Ok(image) => {
-                        if msg_sender.send(WorkerMsg::Frame(image)).is_err() {
+                        if thread_sender.send(image).is_err() {
                             return;
                         }
                     }
@@ -91,19 +77,15 @@ impl LongCaptureWorker {
                 }
             }
         });
-        Self { stop, receiver, ack_sender, thread: Some(thread) }
+        Self { stop, receiver, thread: Some(thread) }
     }
 
-    fn try_recv(&self) -> Result<WorkerMsg, TryRecvError> {
+    fn try_recv(&self) -> Result<crate::image::Image, TryRecvError> {
         self.receiver.try_recv()
     }
 
-    fn ack(&self) -> bool {
-        self.ack_sender.try_send(()).is_ok()
-    }
-
     fn stop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -113,19 +95,6 @@ impl LongCaptureWorker {
 impl Drop for LongCaptureWorker {
     fn drop(&mut self) {
         self.stop();
-    }
-}
-
-fn wait_for_ack(stop: &AtomicBool, ack_receiver: &mpsc::Receiver<()>) -> bool {
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            return false;
-        }
-        match ack_receiver.recv_timeout(Duration::from_millis(10)) {
-            Ok(()) => return true,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return false,
-        }
     }
 }
 
@@ -145,8 +114,7 @@ fn run_long(args: crate::cli::Args) -> Result<(), Box<dyn Error>> {
 
 fn run_long_with_viewport(args: crate::cli::Args, viewport: crate::geometry::SelectedViewport) -> Result<(), Box<dyn Error>> {
     let mut selection_session = crate::wayland::selection::SelectionSession::new_long()?;
-    selection_session.dispatch_poll(100)?;
-    selection_session.dispatch_poll(0)?;
+    selection_session.wait_configured()?;
     run_long_capture(args, viewport, selection_session)
 }
 
@@ -159,55 +127,60 @@ fn run_long_capture(
         selection_session.close()?;
         return Err("long capture selection must be contained within a single output".into());
     }
-    selection_session.set_selected_viewport_passthrough(&viewport)?;
+    if let Err(err) = selection_session.set_selected_viewport_passthrough(&viewport) {
+        selection_session.close()?;
+        return Err(err);
+    }
 
     let regions = viewport.capture_regions();
     let mut worker = LongCaptureWorker::start(regions[0]);
     let mut stitcher = RawStitcher::new();
-    let capture_size = viewport.capture_size()?;
     let mut cancelled = false;
 
     loop {
-        match worker.try_recv() {
-            Ok(WorkerMsg::PrepareCapture) => {
-                selection_session.render_capture_clean(&viewport)?;
-                if !worker.ack() {
-                    break;
-                }
-            }
-            Ok(WorkerMsg::Frame(frame)) => {
-                let direction: Option<SearchDirection> = match selection_session.long_direction() {
-                    Some(crate::wayland::selection::SearchDirection::Down) => Some(SearchDirection::Down),
-                    Some(crate::wayland::selection::SearchDirection::Up) => Some(SearchDirection::Up),
-                    Some(crate::wayland::selection::SearchDirection::Vertical) => Some(SearchDirection::Down),
-                    None => None,
-                };
-                let compose = ImageRgbView::new(&frame);
-                let analysis = ImageRgbView::new(&frame);
-                if let (Ok(compose), Ok(analysis)) = (compose, analysis) {
-                    if let Ok(outcome) = stitcher.push_frame_views(compose, analysis, direction) {
-                        if matches!(outcome, PushResult::Initialized | PushResult::Accepted { .. }) {
-                            if let Some(s) = stitcher.stitched() {
-                                if let Ok(image) = crate::stitch::image_from_stitched_frame(s) {
-                                    let snapshot = crate::wayland::selection::LongPreviewSnapshot {
-                                        image,
-                                        current_origin_x: s.current_origin_x,
-                                        current_origin_y: s.current_origin_y,
-                                        viewport_rect: viewport.rect,
-                                        capture_width: capture_size.0,
-                                        capture_height: capture_size.1,
-                                    };
-                                    let _ = selection_session.update_long_capture_preview(snapshot);
-                                }
-                            }
-                        }
+        for _ in 0..LONG_FRAMES_PER_UI_TICK {
+            let frame = match worker.try_recv() {
+                Ok(frame) => frame,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            };
+            let direction: Option<SearchDirection> = match selection_session.long_direction() {
+                Some(crate::wayland::selection::SearchDirection::Down) => Some(SearchDirection::Down),
+                Some(crate::wayland::selection::SearchDirection::Up) => Some(SearchDirection::Up),
+                Some(crate::wayland::selection::SearchDirection::Vertical) => Some(SearchDirection::Down),
+                None => None,
+            };
+            let compose = match ImageRgbView::new(&frame) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let analysis = match ImageRgbView::new(&frame) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let outcome = match stitcher.push_frame_views(compose, analysis, direction) {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+            if matches!(outcome, PushResult::Initialized | PushResult::Accepted { .. }) {
+                if let Some(s) = stitcher.stitched() {
+                    if let Ok(image) = crate::stitch::image_from_stitched_frame(s) {
+                        let snapshot = crate::wayland::selection::LongPreviewSnapshot {
+                            image,
+                            current_origin_x: s.current_origin_x,
+                            current_origin_y: s.current_origin_y,
+                            viewport_rect: viewport.rect,
+                            capture_width: viewport.capture_size().map(|(w, _)| w).unwrap_or(1),
+                            capture_height: viewport.capture_size().map(|(_, h)| h).unwrap_or(1),
+                        };
+                        let _ = selection_session.update_long_capture_preview(snapshot);
                     }
                 }
             }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => break,
         }
-        selection_session.dispatch_poll(LONG_UI_POLL_INTERVAL.as_millis() as i32)?;
+        if let Err(_) = selection_session.dispatch_poll(LONG_UI_POLL_INTERVAL.as_millis() as i32) {
+            break;
+        }
         match selection_session.long_status() {
             crate::wayland::selection::LongSessionStatus::Running => {}
             crate::wayland::selection::LongSessionStatus::FinishRequested => break,
