@@ -111,7 +111,7 @@ impl LongCaptureWorker {
                         Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     }
                 }
-                match crate::wayland::screencopy::capture_region(region, false) {
+                match crate::wayland::screencopy::capture_region(region, false, index > 0) {
                     Ok(image) => {
                         if sender.send(CaptureMessage::Frame(image)).is_err() {
                             return;

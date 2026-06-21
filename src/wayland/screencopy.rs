@@ -74,6 +74,7 @@ struct State {
     done: bool,
     failed: bool,
     image: Option<Image>,
+    wait_for_damage: bool,
 }
 
 impl State {
@@ -90,6 +91,7 @@ impl State {
             done: false,
             failed: false,
             image: None,
+            wait_for_damage: false,
         }
     }
 }
@@ -147,11 +149,12 @@ fn capture_output(output_name: u32, overlay_cursor: bool) -> Result<Image, Box<d
     state.image.take().ok_or_else(|| "screencopy completed without image".into())
 }
 
-pub fn capture_region(region: CaptureOutputRegion, overlay_cursor: bool) -> Result<Image, Box<dyn Error>> {
+pub fn capture_region(region: CaptureOutputRegion, overlay_cursor: bool, wait_for_damage: bool) -> Result<Image, Box<dyn Error>> {
     let conn = Connection::connect_to_env()?;
     let mut event_queue = conn.new_event_queue::<State>();
     let qh = event_queue.handle();
     let mut state = State::new(Some(region.output_name));
+    state.wait_for_damage = wait_for_damage;
 
     conn.display().get_registry(&qh, ());
     event_queue.roundtrip(&mut state)?;
@@ -244,7 +247,11 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
             }
             zwlr_screencopy_frame_v1::Event::BufferDone => {
                 if let Some(image) = state.shm_image.as_ref() {
-                    frame.copy(&image.buffer);
+                    if state.wait_for_damage {
+                        frame.copy_with_damage(&image.buffer);
+                    } else {
+                        frame.copy(&image.buffer);
+                    }
                 } else {
                     state.failed = true;
                     state.done = true;
