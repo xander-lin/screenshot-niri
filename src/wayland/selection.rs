@@ -7,6 +7,7 @@ use wayland_client::protocol::{
     wl_keyboard::{self, WlKeyboard},
     wl_output::{self, WlOutput},
     wl_pointer::{self, WlPointer},
+    wl_region::WlRegion,
     wl_registry::{self, WlRegistry},
     wl_seat::{self, Capability, WlSeat},
     wl_shm::{Format, WlShm},
@@ -24,10 +25,15 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 };
 
 use crate::geometry::{LogicalRect, OutputInfo, SelectedViewport};
+use crate::image::Image;
 use crate::wayland::screencopy::CapturedOutput;
 
 const BTN_LEFT: u32 = 0x110;
 const KEY_ESC: u32 = 1;
+const KEY_ENTER: u32 = 28;
+const KEY_SPACE: u32 = 57;
+const KEY_DOWN: u32 = 108;
+const KEY_UP: u32 = 103;
 const OVERLAY_BUFFER_COUNT: usize = 2;
 const SELECTION_BORDER_WIDTH: i32 = 3;
 const OVERLAY_OUTSIDE_MASK_BGRA: [u8; 4] = [0, 0, 0, 110];
@@ -88,6 +94,10 @@ impl DragState {
 
     fn is_terminal(self) -> bool {
         matches!(self, Self::Finished(_) | Self::Cancelled)
+    }
+
+    fn is_finished(self) -> bool {
+        matches!(self, Self::Finished(_))
     }
 }
 
@@ -173,6 +183,9 @@ struct UiState {
     pointer_x: i32,
     pointer_y: i32,
     drag: DragState,
+    long_finish_requested: bool,
+    long_direction: Option<SearchDirection>,
+    long_preview: Option<LongPreviewSnapshot>,
 }
 
 impl UiState {
@@ -211,6 +224,9 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
         pointer_x: 0,
         pointer_y: 0,
         drag: DragState::Idle,
+        long_finish_requested: false,
+        long_direction: None,
+            long_preview: None,
     };
 
     conn.display().get_registry(&qh, ());
@@ -244,6 +260,310 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
     } else {
         Ok(SelectionOutcome::Selected(state.selected_viewport()?))
     }
+}
+
+// ── Long screenshot session ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchDirection {
+    Down,
+    Up,
+    Vertical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LongSessionStatus {
+    Running,
+    FinishRequested,
+    Cancelled,
+}
+
+#[derive(Debug, Clone)]
+pub struct LongPreviewSnapshot {
+    pub image: Image,
+    pub current_origin_x: i32,
+    pub current_origin_y: i32,
+    pub viewport_rect: LogicalRect,
+    pub capture_width: u32,
+    pub capture_height: u32,
+}
+
+pub struct SelectionSession {
+    conn: Connection,
+    event_queue: wayland_client::EventQueue<UiState>,
+    state: UiState,
+}
+
+impl SelectionSession {
+    pub fn new_long() -> Result<Self, Box<dyn Error>> {
+        let conn = Connection::connect_to_env()?;
+        let mut event_queue = conn.new_event_queue::<UiState>();
+        let qh = event_queue.handle();
+        let mut state = UiState {
+            compositor: None,
+            shm: None,
+            layer_shell: None,
+            xdg_output_manager: None,
+            seat: None,
+            pointer: None,
+            keyboard: None,
+            outputs: Vec::new(),
+            frozen_outputs: Vec::new(),
+            overlays: Vec::new(),
+            pointer_output_name: None,
+            pointer_x: 0,
+            pointer_y: 0,
+            drag: DragState::Idle,
+            long_finish_requested: false,
+            long_direction: None,
+            long_preview: None,
+        };
+
+        conn.display().get_registry(&qh, ());
+        event_queue.roundtrip(&mut state)?;
+        bind_xdg_outputs(&mut state, &qh);
+        event_queue.roundtrip(&mut state)?;
+        if state.compositor.is_none() {
+            return Err("compositor does not expose wl_compositor required by zwlr_layer_shell_v1".into());
+        }
+        if state.shm.is_none() {
+            return Err("compositor does not expose wl_shm required by zwlr_layer_shell_v1 overlay buffers".into());
+        }
+        if state.layer_shell.is_none() {
+            return Err("compositor does not expose zwlr_layer_shell_v1 required for selection overlay".into());
+        }
+        if state.outputs.is_empty() {
+            return Err("compositor did not advertise any wl_output".into());
+        }
+        if state.pointer.is_none() {
+            return Err("no wl_pointer from wl_seat is available for selection".into());
+        }
+        create_live_overlays(&mut state, &qh)?;
+        conn.flush()?;
+        Ok(Self { conn, event_queue, state })
+    }
+
+    pub fn run_selection(&mut self) -> Result<SelectionOutcome, Box<dyn Error>> {
+        while !self.state.drag.is_terminal() {
+            self.event_queue.blocking_dispatch(&mut self.state)?;
+        }
+        self.event_queue.dispatch_pending(&mut self.state)?;
+        if self.state.drag == DragState::Cancelled {
+            Ok(SelectionOutcome::Cancelled)
+        } else {
+            Ok(SelectionOutcome::Selected(self.state.selected_viewport()?))
+        }
+    }
+
+    pub fn set_selected_viewport_passthrough(
+        &mut self,
+        viewport: &SelectedViewport,
+    ) -> Result<(), Box<dyn Error>> {
+        let qh = self.event_queue.handle();
+        self.state.drag = DragState::Finished(viewport.rect);
+        render_overlays_full_dim(&mut self.state);
+        set_overlay_keyboard_exclusive(&mut self.state);
+        set_overlay_pointer_passthrough(&mut self.state, &qh)?;
+        self.event_queue.dispatch_pending(&mut self.state)?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    pub fn long_status(&self) -> LongSessionStatus {
+        if self.state.drag == DragState::Cancelled {
+            LongSessionStatus::Cancelled
+        } else if self.state.long_finish_requested {
+            LongSessionStatus::FinishRequested
+        } else {
+            LongSessionStatus::Running
+        }
+    }
+
+    pub fn long_direction(&self) -> Option<SearchDirection> {
+        self.state.long_direction
+    }
+
+    pub fn update_long_capture_preview(&mut self, snapshot: LongPreviewSnapshot) -> Result<(), Box<dyn Error>> {
+        self.state.long_preview = Some(snapshot);
+        render_overlays_full_dim(&mut self.state);
+        self.event_queue.dispatch_pending(&mut self.state)?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    pub fn dispatch_poll(&mut self, timeout_ms: i32) -> Result<(), Box<dyn Error>> {
+        if self.event_queue.dispatch_pending(&mut self.state)? > 0 {
+            return Ok(());
+        }
+        self.event_queue.flush()?;
+        let Some(guard) = self.event_queue.prepare_read() else {
+            return Ok(());
+        };
+        let fd = guard.connection_fd().as_raw_fd();
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLERR,
+            revents: 0,
+        };
+        loop {
+            let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+            if ready > 0 {
+                break;
+            }
+            if ready == 0 {
+                drop(guard);
+                return Ok(());
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                drop(guard);
+                return Err(err.into());
+            }
+        }
+        guard.read()?;
+        self.event_queue.dispatch_pending(&mut self.state)?;
+        Ok(())
+    }
+
+    pub fn close(self) -> Result<(), Box<dyn Error>> {
+        drop(self.state);
+        drop(self.event_queue);
+        let _ = self.conn.flush();
+        Ok(())
+    }
+}
+
+fn create_live_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Result<(), Box<dyn Error>> {
+    let compositor = state.compositor.as_ref().ok_or("compositor does not expose wl_compositor")?;
+    let layer_shell = state.layer_shell.as_ref().ok_or("compositor does not expose zwlr_layer_shell_v1")?;
+    for output in &state.outputs {
+        let surface = compositor.create_surface(qh, ());
+        let layer_surface = layer_shell.get_layer_surface(
+            &surface,
+            Some(&output.output),
+            Layer::Overlay,
+            "screenshot-selection".into(),
+            qh,
+            output.info.global_name,
+        );
+        layer_surface.set_anchor(Anchor::Top | Anchor::Right | Anchor::Bottom | Anchor::Left);
+        layer_surface.set_exclusive_zone(-1);
+        layer_surface.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        layer_surface.set_size(0, 0);
+        surface.commit();
+        state.overlays.push(OverlaySurface {
+            output_name: output.info.global_name,
+            surface,
+            layer_surface,
+            buffers: Vec::new(),
+            render_cache: None,
+            width: output.info.logical.width.max(1),
+            height: output.info.logical.height.max(1),
+        });
+    }
+    Ok(())
+}
+
+fn render_overlays_full_dim(state: &mut UiState) {
+    for overlay in &mut state.overlays {
+        let Some(buffer) = overlay.buffers.iter_mut().find(|buffer| buffer.available) else {
+            continue;
+        };
+        let data = unsafe { std::slice::from_raw_parts_mut(buffer.data, buffer.size) };
+        let stride = overlay.width as usize * 4;
+        for y in 0..overlay.height as usize {
+            for x in 0..overlay.width as usize {
+                let offset = y * stride + x * 4;
+                data[offset..offset + 4].copy_from_slice(&OVERLAY_OUTSIDE_MASK_BGRA);
+            }
+        }
+        let rect = state.drag.current_rect();
+        let mut output_logical = LogicalRect { x: 0, y: 0, width: overlay.width, height: overlay.height };
+        let mut selection_local: Option<LogicalRect> = None;
+        if let Some(rect) = rect {
+            if let Some(output) = state.outputs.iter().find(|o| o.info.global_name == overlay.output_name) {
+                output_logical = output.info.logical;
+                let local = selected_local_intersection_for_buffer(output.info.logical, rect, overlay.width, overlay.height);
+                if let Some(ref local) = local {
+                    for y in local.y..local.y + local.height {
+                        for x in local.x..local.x + local.width {
+                            let offset = y as usize * stride + x as usize * 4;
+                            data[offset + 3] = 0;
+                        }
+                    }
+                    draw_selection_border(data, overlay.width, overlay.height, local.x, local.y, local.width, local.height);
+                }
+                selection_local = local;
+            }
+        }
+        if let Some(ref preview) = state.long_preview {
+            draw_preview_on_overlay(data, overlay.width, overlay.height, preview, output_logical, selection_local);
+        }
+        overlay.surface.attach(Some(&buffer.buffer), 0, 0);
+        overlay.surface.damage_buffer(0, 0, overlay.width, overlay.height);
+        overlay.surface.commit();
+        buffer.available = false;
+    }
+}
+
+fn draw_selection_border(data: &mut [u8], _width: i32, _height: i32, x: i32, y: i32, w: i32, h: i32) {
+    let stride = _width as usize * 4;
+    let x = x.max(0) as usize;
+    let y = y.max(0) as usize;
+    let w = w as usize;
+    let h = h as usize;
+    let right = (x + w).min(_width as usize);
+    let bottom = (y + h).min(_height as usize);
+    let border = OVERLAY_BORDER_WHITE_BGRA;
+    if y > 0 && x < right {
+        let py = y - 1;
+        for px in x..right {
+            let offset = py * stride + px * 4;
+            data[offset..offset + 4].copy_from_slice(&border);
+        }
+    }
+    if bottom < _height as usize && x < right {
+        let py = bottom;
+        for px in x..right {
+            let offset = py * stride + px * 4;
+            data[offset..offset + 4].copy_from_slice(&border);
+        }
+    }
+    if x > 0 && y < bottom {
+        let px = x - 1;
+        for py in y..bottom {
+            let offset = py * stride + px * 4;
+            data[offset..offset + 4].copy_from_slice(&border);
+        }
+    }
+    if right < _width as usize && y < bottom {
+        let px = right;
+        for py in y..bottom {
+            let offset = py * stride + px * 4;
+            data[offset..offset + 4].copy_from_slice(&border);
+        }
+    }
+}
+
+fn set_overlay_keyboard_exclusive(state: &mut UiState) {
+    for overlay in &mut state.overlays {
+        overlay.layer_surface.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        overlay.surface.commit();
+    }
+}
+
+fn set_overlay_pointer_passthrough(
+    state: &mut UiState,
+    qh: &QueueHandle<UiState>,
+) -> Result<(), Box<dyn Error>> {
+    let compositor = state.compositor.as_ref().ok_or("compositor does not expose wl_compositor")?;
+    for overlay in &mut state.overlays {
+        let region = compositor.create_region(qh, ());
+        overlay.surface.set_input_region(Some(&region));
+        overlay.surface.commit();
+        region.destroy();
+    }
+    Ok(())
 }
 
 fn bind_xdg_outputs(state: &mut UiState, qh: &QueueHandle<UiState>) {
@@ -306,7 +626,12 @@ fn render_overlays(state: &mut UiState) {
             continue;
         };
         let Some(render_cache) = overlay.render_cache.as_ref() else {
-            state.drag = DragState::Cancelled;
+            draw_overlay_dim_with_selection(data, overlay.width, overlay.height, rect);
+            buffer.initialized = true;
+            overlay.surface.attach(Some(&buffer.buffer), 0, 0);
+            overlay.surface.damage_buffer(0, 0, overlay.width, overlay.height);
+            overlay.surface.commit();
+            buffer.available = false;
             continue;
         };
         if buffer.initialized {
@@ -467,6 +792,32 @@ fn overlay_pixel(global_x: i32, global_y: i32, selected: Option<LogicalRect>) ->
     selected_overlay_pixel(global_x, global_y, rect)
 }
 
+fn draw_overlay_dim_with_selection(data: &mut [u8], width: i32, height: i32, selected: Option<LogicalRect>) {
+    let stride = width.max(0) as usize * 4;
+    for y in 0..height.max(0) as usize {
+        for x in 0..width.max(0) as usize {
+            let offset = y * stride + x * 4;
+            data[offset..offset + 4].copy_from_slice(&OVERLAY_OUTSIDE_MASK_BGRA);
+        }
+    }
+    if let Some(sel) = selected {
+        let local = selected_local_intersection_for_buffer(
+            LogicalRect { x: 0, y: 0, width, height },
+            sel,
+            width, height,
+        );
+        if let Some(local) = local {
+            for y in local.y..local.y + local.height {
+                for x in local.x..local.x + local.width {
+                    let offset = (y as usize) * stride + (x as usize) * 4;
+                    data[offset..offset + 4].copy_from_slice(&OVERLAY_SELECTED_TRANSPARENT_BGRA);
+                }
+            }
+            draw_selection_border(data, width, height, local.x, local.y, local.width, local.height);
+        }
+    }
+}
+
 fn selected_local_intersection(output: LogicalRect, selected: LogicalRect) -> Option<LogicalRect> {
     selected.intersection(output).map(|intersection| LogicalRect {
         x: intersection.x - output.x,
@@ -479,6 +830,43 @@ fn selected_local_intersection(output: LogicalRect, selected: LogicalRect) -> Op
 fn selected_local_intersection_for_buffer(output: LogicalRect, selected: LogicalRect, width: i32, height: i32) -> Option<LogicalRect> {
     let buffer = LogicalRect { x: 0, y: 0, width, height };
     selected_local_intersection(output, selected).and_then(|local| local.intersection(buffer))
+}
+
+fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, preview: &LongPreviewSnapshot, output_logical: LogicalRect, selection_local: Option<LogicalRect>) {
+    let pw = preview.image.width;
+    let ph = preview.image.height;
+    if pw == 0 || ph == 0 || overlay_w <= 0 || overlay_h <= 0 {
+        return;
+    }
+    let vp = preview.viewport_rect;
+    let cw = preview.capture_width.max(1);
+    let ch = preview.capture_height.max(1);
+    let origin_x = preview.current_origin_x;
+    let origin_y = preview.current_origin_y;
+    let buf_stride = overlay_w as usize * 4;
+    for oy in 0..overlay_h {
+        let global_y = output_logical.y + oy;
+        for ox in 0..overlay_w {
+            let global_x = output_logical.x + ox;
+            if let Some(ref sel) = selection_local {
+                if ox >= sel.x && ox < sel.x + sel.width && oy >= sel.y && oy < sel.y + sel.height {
+                    continue;
+                }
+            }
+            let sx = origin_x + (global_x - vp.x) * cw as i32 / vp.width.max(1);
+            let sy = origin_y + (global_y - vp.y) * ch as i32 / vp.height.max(1);
+            if sx >= 0 && (sx as u32) < pw && sy >= 0 && (sy as u32) < ph {
+                let src_off = (sy as u32 * preview.image.stride + sx as u32 * 4) as usize;
+                if src_off + 3 < preview.image.data.len() {
+                    let dst_off = (oy as usize) * buf_stride + (ox as usize) * 4;
+                    data[dst_off] = preview.image.data[src_off];
+                    data[dst_off + 1] = preview.image.data[src_off + 1];
+                    data[dst_off + 2] = preview.image.data[src_off + 2];
+                    data[dst_off + 3] = 255;
+                }
+            }
+        }
+    }
 }
 
 fn dirty_selected_region(previous: Option<LogicalRect>, current: Option<LogicalRect>, width: i32, height: i32) -> Option<LogicalRect> {
@@ -647,6 +1035,21 @@ impl Dispatch<WlKeyboard, ()> for UiState {
         if let wl_keyboard::Event::Key { key, state: key_state, .. } = event {
             if key == KEY_ESC && matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed)) {
                 state.drag = DragState::Cancelled;
+            } else if state.drag.is_finished()
+                && matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed))
+            {
+                match key {
+                    KEY_ENTER | KEY_SPACE => {
+                        state.long_finish_requested = true;
+                    }
+                    KEY_DOWN => {
+                        state.long_direction = Some(SearchDirection::Down);
+                    }
+                    KEY_UP => {
+                        state.long_direction = Some(SearchDirection::Up);
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -669,21 +1072,17 @@ impl Dispatch<ZwlrLayerSurfaceV1, u32> for UiState {
             };
             let configured_width = width as i32;
             let configured_height = height as i32;
-            let Some(output) = state.outputs.iter().find(|output| output.info.global_name == *name) else {
-                state.drag = DragState::Cancelled;
-                return;
-            };
-            let Some(frozen) = state.frozen_outputs.iter().find(|frozen| frozen.info.global_name == *name) else {
-                state.drag = DragState::Cancelled;
-                return;
-            };
-            let render_cache = build_overlay_render_cache(configured_width, configured_height, output.info, frozen);
             let Some(overlay) = state.overlays.iter_mut().find(|overlay| overlay.output_name == *name) else {
                 return;
             };
             overlay.width = configured_width;
             overlay.height = configured_height;
-            overlay.render_cache = Some(render_cache);
+            if let (Some(output), Some(frozen)) = (
+                state.outputs.iter().find(|o| o.info.global_name == *name),
+                state.frozen_outputs.iter().find(|f| f.info.global_name == *name),
+            ) {
+                overlay.render_cache = Some(build_overlay_render_cache(configured_width, configured_height, output.info, frozen));
+            }
             match create_overlay_buffers(&shm, *name, overlay.width, overlay.height, qh) {
                 Ok(buffers) => overlay.buffers = buffers,
                 Err(_) => state.drag = DragState::Cancelled,
@@ -758,6 +1157,7 @@ impl Dispatch<ZxdgOutputManagerV1, ()> for UiState {
 }
 
 delegate_noop!(UiState: ignore WlSurface);
+delegate_noop!(UiState: ignore WlRegion);
 delegate_noop!(UiState: ignore WlShmPool);
 
 #[cfg(test)]

@@ -4,8 +4,9 @@ mod clipboard;
 mod geometry;
 mod image;
 mod runtime;
-#[cfg(test)]
 mod stitch;
+#[macro_use]
+mod trace;
 mod wayland;
 
 fn main() {

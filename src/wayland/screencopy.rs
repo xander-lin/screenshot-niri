@@ -147,6 +147,43 @@ fn capture_output(output_name: u32, overlay_cursor: bool) -> Result<Image, Box<d
     state.image.take().ok_or_else(|| "screencopy completed without image".into())
 }
 
+pub fn capture_region(region: CaptureOutputRegion, overlay_cursor: bool) -> Result<Image, Box<dyn Error>> {
+    let conn = Connection::connect_to_env()?;
+    let mut event_queue = conn.new_event_queue::<State>();
+    let qh = event_queue.handle();
+    let mut state = State::new(Some(region.output_name));
+
+    conn.display().get_registry(&qh, ());
+    event_queue.roundtrip(&mut state)?;
+    if state.shm.is_none() {
+        return Err("compositor does not expose wl_shm".into());
+    }
+    let screencopy = state.screencopy.as_ref().ok_or("compositor does not expose zwlr_screencopy_manager_v1")?;
+    let output = state.output.as_ref().ok_or("requested wl_output was not advertised by the compositor")?;
+    state.frame = Some(screencopy.capture_output_region(
+        i32::from(overlay_cursor),
+        output,
+        region.region.x,
+        region.region.y,
+        region.region.width,
+        region.region.height,
+        &qh,
+        (),
+    ));
+    conn.flush()?;
+
+    while !state.done && !state.failed {
+        event_queue.blocking_dispatch(&mut state)?;
+    }
+    if let Some(frame) = state.frame.take() {
+        frame.destroy();
+    }
+    if state.failed {
+        return Err("screencopy region capture failed".into());
+    }
+    state.image.take().ok_or_else(|| "screencopy region completed without image".into())
+}
+
 impl Dispatch<WlRegistry, ()> for State {
     fn event(
         state: &mut Self,
