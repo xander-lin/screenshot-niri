@@ -187,6 +187,79 @@ pub fn capture_region(region: CaptureOutputRegion, overlay_cursor: bool, wait_fo
     state.image.take().ok_or_else(|| "screencopy region completed without image".into())
 }
 
+// ── Persistent capture session ─────────────────────────────────────────
+
+pub struct CaptureSession {
+    conn: Connection,
+    event_queue: wayland_client::EventQueue<State>,
+    state: State,
+}
+
+impl CaptureSession {
+    pub fn new(output_name: u32) -> Result<Self, Box<dyn Error>> {
+        let conn = Connection::connect_to_env()?;
+        let mut event_queue = conn.new_event_queue::<State>();
+        let qh = event_queue.handle();
+        let mut state = State::new(Some(output_name));
+
+        conn.display().get_registry(&qh, ());
+        event_queue.roundtrip(&mut state)?;
+        if state.shm.is_none() {
+            return Err("compositor does not expose wl_shm".into());
+        }
+        if state.screencopy.is_none() {
+            return Err("compositor does not expose zwlr_screencopy_manager_v1".into());
+        }
+        if state.output.is_none() {
+            return Err("requested wl_output was not advertised".into());
+        }
+        Ok(Self { conn, event_queue, state })
+    }
+
+    pub fn capture_region_frame(&mut self, region: CaptureOutputRegion, overlay_cursor: bool, wait_for_damage: bool) -> Result<Image, Box<dyn Error>> {
+        self.state.image = None;
+        self.state.shm_image = None;
+        self.state.wait_for_damage = wait_for_damage;
+        self.state.done = false;
+        self.state.failed = false;
+        self.state.y_inverted = false;
+
+        let qh = self.event_queue.handle();
+        let screencopy = self.state.screencopy.as_ref().ok_or("missing screencopy")?;
+        let output = self.state.output.as_ref().ok_or("missing output")?;
+        self.state.frame = Some(screencopy.capture_output_region(
+            i32::from(overlay_cursor),
+            output,
+            region.region.x,
+            region.region.y,
+            region.region.width,
+            region.region.height,
+            &qh,
+            (),
+        ));
+        self.conn.flush()?;
+
+        while !self.state.done && !self.state.failed {
+            self.event_queue.blocking_dispatch(&mut self.state)?;
+        }
+        if let Some(frame) = self.state.frame.take() {
+            frame.destroy();
+        }
+        if self.state.failed {
+            return Err("screencopy region capture failed".into());
+        }
+        self.state.image.take().ok_or_else(|| "screencopy region completed without image".into())
+    }
+}
+
+impl Drop for CaptureSession {
+    fn drop(&mut self) {
+        let _ = self.conn.flush();
+    }
+}
+
+// ── Dispatch impls ─────────────────────────────────────────────────────
+
 impl Dispatch<WlRegistry, ()> for State {
     fn event(
         state: &mut Self,
@@ -200,16 +273,22 @@ impl Dispatch<WlRegistry, ()> for State {
             return;
         };
         match interface.as_str() {
-            "wl_shm" => state.shm = Some(registry.bind::<WlShm, _, _>(name, version.min(1), qh, ())),
+            "wl_shm" => {
+                state.shm = Some(registry.bind::<WlShm, _, _>(name, version.min(1), qh, ()))
+            }
             "wl_output" => {
                 let output = registry.bind::<WlOutput, _, _>(name, version.min(4), qh, ());
                 state.output_names.push(name);
-                if state.requested_output_name == Some(name) || (state.requested_output_name.is_none() && state.output.is_none()) {
+                if state.requested_output_name == Some(name)
+                    || (state.requested_output_name.is_none() && state.output.is_none())
+                {
                     state.output = Some(output);
                 }
             }
-            "zwlr_screencopy_manager_v1" if version >= 3 => {
-                state.screencopy = Some(registry.bind::<ZwlrScreencopyManagerV1, _, _>(name, 3, qh, ()))
+            "zwlr_screencopy_manager_v1" => {
+                if version >= 3 {
+                    state.screencopy = Some(registry.bind::<ZwlrScreencopyManagerV1, _, _>(name, 3, qh, ()));
+                }
             }
             _ => {}
         }
@@ -232,6 +311,11 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                     state.done = true;
                     return;
                 };
+                if format != Format::Argb8888 && format != Format::Xrgb8888 {
+                    state.failed = true;
+                    state.done = true;
+                    return;
+                }
                 let Some(shm) = state.shm.as_ref() else {
                     state.failed = true;
                     state.done = true;
@@ -257,6 +341,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                     state.done = true;
                 }
             }
+            zwlr_screencopy_frame_v1::Event::Damage { .. } => {}
             zwlr_screencopy_frame_v1::Event::Flags { flags } => {
                 if let WEnum::Value(flags) = flags {
                     state.y_inverted = flags.contains(zwlr_screencopy_frame_v1::Flags::YInvert);
@@ -287,6 +372,18 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
     }
 }
 
+fn flip_rows(bytes: &[u8], height: u32, stride: u32) -> Vec<u8> {
+    let stride = stride as usize;
+    let height = height as usize;
+    let mut flipped = vec![0; bytes.len()];
+    for y in 0..height {
+        let src = (height - 1 - y) * stride;
+        let dst = y * stride;
+        flipped[dst..dst + stride].copy_from_slice(&bytes[src..src + stride]);
+    }
+    flipped
+}
+
 fn create_shm_image(
     shm: &WlShm,
     width: u32,
@@ -295,14 +392,11 @@ fn create_shm_image(
     format: Format,
     qh: &QueueHandle<State>,
 ) -> Result<ShmImage, Box<dyn Error>> {
-    if format != Format::Argb8888 && format != Format::Xrgb8888 {
-        return Err(format!("unsupported screencopy shm format: {format:?}").into());
-    }
     if width == 0 || height == 0 || stride < width.saturating_mul(4) {
         return Err(format!("invalid screencopy buffer geometry {width}x{height} stride {stride}").into());
     }
     let size = (stride as usize).checked_mul(height as usize).ok_or("screencopy buffer size overflow")?;
-    if size > i32::MAX as usize || width > i32::MAX as u32 || height > i32::MAX as u32 || stride > i32::MAX as u32 {
+    if size > i32::MAX as usize {
         return Err("screencopy buffer is too large for wl_shm".into());
     }
     let file = tempfile::tempfile()?;
@@ -326,30 +420,12 @@ fn create_shm_image(
     Ok(ShmImage { width, height, stride, format, size, data: data.cast(), _fd: fd, pool, buffer })
 }
 
-fn flip_rows(bytes: &[u8], height: u32, stride: u32) -> Vec<u8> {
-    let mut flipped = vec![0; bytes.len()];
-    for y in 0..height as usize {
-        let src = (height as usize - 1 - y) * stride as usize;
-        let dst = y * stride as usize;
-        flipped[dst..dst + stride as usize].copy_from_slice(&bytes[src..src + stride as usize]);
-    }
-    flipped
-}
-
 impl Dispatch<WlShm, ()> for State {
     fn event(_: &mut Self, _: &WlShm, _: <WlShm as wayland_client::Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }
 
 impl Dispatch<ZwlrScreencopyManagerV1, ()> for State {
-    fn event(
-        _: &mut Self,
-        _: &ZwlrScreencopyManagerV1,
-        _: <ZwlrScreencopyManagerV1 as wayland_client::Proxy>::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
+    fn event(_: &mut Self, _: &ZwlrScreencopyManagerV1, _: <ZwlrScreencopyManagerV1 as wayland_client::Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }
 
 delegate_noop!(State: ignore WlOutput);

@@ -82,6 +82,13 @@ impl LongCaptureWorker {
         let (sender, receiver) = mpsc::sync_channel::<CaptureMessage>(4);
         let thread_stop = std::sync::Arc::clone(&stop);
         let thread = std::thread::spawn(move || {
+            let mut session = match crate::wayland::screencopy::CaptureSession::new(region.output_name) {
+                Ok(s) => s,
+                Err(err) => {
+                    let _ = sender.send(CaptureMessage::Error(err.to_string()));
+                    return;
+                }
+            };
             let mut last: Option<std::time::Instant> = None;
             let mut index: usize = 0;
             while !thread_stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -100,7 +107,6 @@ impl LongCaptureWorker {
                 if sender.send(CaptureMessage::PrepareCapture { index, ack: ack_tx }).is_err() {
                     return;
                 }
-                // Wait for main thread to render clean overlay
                 loop {
                     if thread_stop.load(std::sync::atomic::Ordering::Relaxed) {
                         return;
@@ -111,7 +117,7 @@ impl LongCaptureWorker {
                         Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     }
                 }
-                match crate::wayland::screencopy::capture_region(region, false, index > 0) {
+                match session.capture_region_frame(region, false, index > 0) {
                     Ok(image) => {
                         if sender.send(CaptureMessage::Frame(image)).is_err() {
                             return;
