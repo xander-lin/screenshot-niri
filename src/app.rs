@@ -114,8 +114,8 @@ fn run_long(args: crate::cli::Args) -> Result<(), Box<dyn Error>> {
 
 fn run_long_with_viewport(args: crate::cli::Args, viewport: crate::geometry::SelectedViewport) -> Result<(), Box<dyn Error>> {
     let mut selection_session = crate::wayland::selection::SelectionSession::new_long()?;
-    selection_session.dispatch_blocking()?;
-    selection_session.dispatch_pending()?;
+    selection_session.dispatch_poll(100)?;
+    selection_session.dispatch_poll(0)?;
     run_long_capture(args, viewport, selection_session)
 }
 
