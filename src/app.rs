@@ -173,6 +173,7 @@ fn run_long_capture(
     let mut cancelled = false;
     let mut capture_finished = false;
     let mut capture_error: Option<String> = None;
+    let mut prev_raw: Option<crate::image::Image> = None;
 
     loop {
         let mut processed = false;
@@ -184,17 +185,25 @@ fn run_long_capture(
                     processed = true;
                 }
                 Ok(CaptureMessage::Frame(frame)) => {
+                    // Cheap raw-frame dedup before expensive stitch pipeline
+                    if let Some(ref prev) = prev_raw {
+                        if raw_frame_nearly_identical(prev, &frame) {
+                            processed = true;
+                            continue;
+                        }
+                    }
+                    let current_frame = prev_raw.insert(frame);
                     let direction: Option<SearchDirection> = match selection_session.long_direction() {
                         Some(crate::wayland::selection::SearchDirection::Down) => Some(SearchDirection::Down),
                         Some(crate::wayland::selection::SearchDirection::Up) => Some(SearchDirection::Up),
                         Some(crate::wayland::selection::SearchDirection::Vertical) => Some(SearchDirection::Down),
                         None => None,
                     };
-                    let compose = match ImageRgbView::new(&frame) {
+                    let compose = match ImageRgbView::new(current_frame) {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                    let analysis = match ImageRgbView::new(&frame) {
+                    let analysis = match ImageRgbView::new(current_frame) {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
@@ -261,4 +270,35 @@ fn run_long_capture(
     crate::clipboard::serve_path_detached(&args.output_path, args.clipboard_mode)?;
     println!("saved {}", args.output_path.display());
     Ok(())
+}
+
+/// Fast raw-frame similarity check. Samples every 8th pixel, 4px per row.
+/// Returns true if the frames are so similar they can be treated as duplicate.
+fn raw_frame_nearly_identical(a: &crate::image::Image, b: &crate::image::Image) -> bool {
+    if a.width != b.width || a.height != b.height || a.stride != b.stride {
+        return false;
+    }
+    let w = a.width as usize;
+    let h = a.height as usize;
+    let stride = a.stride as usize;
+    let required = stride * h;
+    if a.data.len() < required || b.data.len() < required {
+        return false;
+    }
+    let step = 8usize;
+    let mut total_diff: u64 = 0;
+    let mut samples: u64 = 0;
+    for y in (0..h).step_by(step) {
+        let row = y * stride;
+        for x in (0..w).step_by(step) {
+            let off = row + x * 4;
+            for c in 0..3 {
+                total_diff += a.data[off + c].abs_diff(b.data[off + c]) as u64;
+            }
+            samples += 1;
+        }
+    }
+    if samples == 0 { return false; }
+    // Average channel difference < 0.5 means nearly identical
+    (total_diff as f64 / samples as f64 / 3.0) < 0.5
 }
