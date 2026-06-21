@@ -477,7 +477,7 @@ impl SelectionSession {
     }
 
     pub fn prepare_capture_clean(&mut self) -> Result<(), Box<dyn Error>> {
-        render_overlays_capture_clean(&mut self.state);
+        render_overlays_full_dim(&mut self.state);
         self.event_queue.dispatch_pending(&mut self.state)?;
         self.conn.flush()?;
         Ok(())
