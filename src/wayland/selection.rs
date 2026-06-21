@@ -400,6 +400,27 @@ impl SelectionSession {
         Ok(())
     }
 
+    pub fn render_capture_clean(&mut self, viewport: &crate::geometry::SelectedViewport) -> Result<(), Box<dyn Error>> {
+        self.state.long_preview = None;
+        self.state.drag = DragState::Finished(viewport.rect);
+        let mut committed = render_overlays_capture_clean(&mut self.state);
+        if committed == 0 {
+            for _ in 0..50 {
+                self.dispatch_poll(10)?;
+                committed = render_overlays_capture_clean(&mut self.state);
+                if committed > 0 {
+                    break;
+                }
+            }
+        }
+        if committed == 0 {
+            return Err("no overlay buffer available for capture-clean render".into());
+        }
+        self.event_queue.dispatch_pending(&mut self.state)?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
     pub fn dispatch_poll(&mut self, timeout_ms: i32) -> Result<(), Box<dyn Error>> {
         if self.event_queue.dispatch_pending(&mut self.state)? > 0 {
             return Ok(());
@@ -481,6 +502,44 @@ fn create_live_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Resul
         });
     }
     Ok(())
+}
+
+fn render_overlays_capture_clean(state: &mut UiState) -> usize {
+    let rect = state.drag.current_rect();
+    let mut committed = 0;
+    for overlay in &mut state.overlays {
+        let Some(buffer) = overlay.buffers.iter_mut().find(|buffer| buffer.available) else {
+            continue;
+        };
+        let data = unsafe { std::slice::from_raw_parts_mut(buffer.data, buffer.size) };
+        let stride = overlay.width as usize * 4;
+        for y in 0..overlay.height as usize {
+            for x in 0..overlay.width as usize {
+                let offset = y * stride + x * 4;
+                data[offset..offset + 4].copy_from_slice(&OVERLAY_OUTSIDE_MASK_BGRA);
+            }
+        }
+        if let Some(rect) = rect {
+            let Some(output) = state.outputs.iter().find(|o| o.info.global_name == overlay.output_name) else {
+                continue;
+            };
+            let local = selected_local_intersection_for_buffer(output.info.logical, rect, overlay.width, overlay.height);
+            if let Some(local) = local {
+                for y in local.y..local.y + local.height {
+                    for x in local.x..local.x + local.width {
+                        let offset = y as usize * stride + x as usize * 4;
+                        data[offset + 3] = 0;
+                    }
+                }
+            }
+        }
+        overlay.surface.attach(Some(&buffer.buffer), 0, 0);
+        overlay.surface.damage_buffer(0, 0, overlay.width, overlay.height);
+        overlay.surface.commit();
+        buffer.available = false;
+        committed += 1;
+    }
+    committed
 }
 
 fn render_overlays_full_dim(state: &mut UiState) {
