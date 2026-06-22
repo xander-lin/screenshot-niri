@@ -4,8 +4,6 @@ mod clipboard;
 mod geometry;
 mod image;
 mod runtime;
-#[macro_use]
-mod trace;
 mod wayland;
 
 fn main() {
