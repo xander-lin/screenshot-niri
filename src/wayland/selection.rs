@@ -25,16 +25,10 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 };
 
 use crate::geometry::{LogicalRect, OutputInfo, SelectedViewport};
-use crate::image::Image;
 use crate::wayland::screencopy::CapturedOutput;
 
 const BTN_LEFT: u32 = 0x110;
 const KEY_ESC: u32 = 1;
-const KEY_L: u32 = 38;
-const KEY_ENTER: u32 = 28;
-const KEY_SPACE: u32 = 57;
-const KEY_DOWN: u32 = 108;
-const KEY_UP: u32 = 103;
 const OVERLAY_BUFFER_COUNT: usize = 3;
 const SELECTION_BORDER_WIDTH: i32 = 3;
 const OVERLAY_OUTSIDE_MASK_BGRA: [u8; 4] = [0, 0, 0, 110];
@@ -45,7 +39,6 @@ const OVERLAY_BORDER_DARK_BGRA: [u8; 4] = [0, 0, 0, 220];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectionOutcome {
     Selected(SelectedViewport),
-    LongModeRequested(SelectedViewport),
     Cancelled,
 }
 
@@ -98,9 +91,6 @@ impl DragState {
         matches!(self, Self::Finished(_) | Self::Cancelled)
     }
 
-    fn is_finished(self) -> bool {
-        matches!(self, Self::Finished(_))
-    }
 }
 
 struct OverlayBuffer {
@@ -146,7 +136,6 @@ struct OverlaySurface {
     render_cache: Option<OverlayRenderCache>,
     width: i32,
     height: i32,
-    base_pixels: Option<Vec<u8>>,
 }
 
 struct OverlayRenderCache {
@@ -186,10 +175,6 @@ struct UiState {
     pointer_x: i32,
     pointer_y: i32,
     drag: DragState,
-    long_requested: bool,
-    long_finish_requested: bool,
-    long_direction: Option<SearchDirection>,
-    long_preview: Option<LongPreviewSnapshot>,
 }
 
 impl UiState {
@@ -209,6 +194,7 @@ impl UiState {
     }
 }
 
+#[allow(dead_code)]
 pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOutcome, Box<dyn Error>> {
     let conn = Connection::connect_to_env()?;
     let mut event_queue = conn.new_event_queue::<UiState>();
@@ -228,10 +214,6 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
         pointer_x: 0,
         pointer_y: 0,
         drag: DragState::Idle,
-            long_requested: false,
-        long_finish_requested: false,
-        long_direction: None,
-            long_preview: None,
     };
 
     conn.display().get_registry(&qh, ());
@@ -262,45 +244,9 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
     }
     if state.drag == DragState::Cancelled {
         Ok(SelectionOutcome::Cancelled)
-    } else if state.long_requested {
-        Ok(SelectionOutcome::LongModeRequested(state.selected_viewport()?))
     } else {
         Ok(SelectionOutcome::Selected(state.selected_viewport()?))
     }
-}
-
-// ── Long screenshot session ──────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SearchDirection {
-    Down,
-    Up,
-    Vertical,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LongDirection {
-    Down,
-    Up,
-    Right,
-    Left,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LongSessionStatus {
-    Running,
-    FinishRequested,
-    Cancelled,
-}
-
-#[derive(Debug, Clone)]
-pub struct LongPreviewSnapshot {
-    pub image: Image,
-    pub current_origin_x: i32,
-    pub current_origin_y: i32,
-    pub viewport_rect: LogicalRect,
-    pub capture_width: u32,
-    pub capture_height: u32,
 }
 
 pub struct SelectionSession {
@@ -310,10 +256,6 @@ pub struct SelectionSession {
 }
 
 impl SelectionSession {
-    pub fn new_long() -> Result<Self, Box<dyn Error>> {
-        Self::new_internal(None)
-    }
-
     pub fn with_frozen(frozen_outputs: &[CapturedOutput]) -> Result<Self, Box<dyn Error>> {
         Self::new_internal(Some(frozen_outputs))
     }
@@ -341,10 +283,6 @@ impl SelectionSession {
             pointer_x: 0,
             pointer_y: 0,
             drag: DragState::Idle,
-            long_requested: false,
-            long_finish_requested: false,
-            long_direction: None,
-            long_preview: None,
         };
 
         conn.display().get_registry(&qh, ());
@@ -378,118 +316,27 @@ impl SelectionSession {
         self.event_queue.dispatch_pending(&mut self.state)?;
         if self.state.drag == DragState::Cancelled {
             Ok(SelectionOutcome::Cancelled)
-        } else if self.state.long_requested {
-            Ok(SelectionOutcome::LongModeRequested(self.state.selected_viewport()?))
         } else {
             Ok(SelectionOutcome::Selected(self.state.selected_viewport()?))
         }
     }
 
-    pub fn set_selected_viewport_passthrough(
-        &mut self,
-        viewport: &SelectedViewport,
-    ) -> Result<(), Box<dyn Error>> {
-        let qh = self.event_queue.handle();
-        self.state.drag = DragState::Finished(viewport.rect);
-        self.state.long_requested = false;
-        self.state.long_finish_requested = false;
-        self.state.long_direction = None;
-        self.state.long_preview = None;
-        for overlay in &mut self.state.overlays {
-            overlay.render_cache = None;
-            overlay.base_pixels = None;
-        }
-        // Retry until at least one overlay is rendered (buffer available)
-        for _ in 0..50 {
-            self.event_queue.dispatch_pending(&mut self.state)?;
-            if render_overlays_full_dim(&mut self.state) > 0 {
-                break;
-            }
-            self.dispatch_poll(10)?;
-        }
-        set_overlay_keyboard_exclusive(&mut self.state);
-        set_overlay_pointer_passthrough(&mut self.state, &qh)?;
-        self.event_queue.dispatch_pending(&mut self.state)?;
-        self.conn.flush()?;
-        Ok(())
-    }
-
-    pub fn long_status(&self) -> LongSessionStatus {
-        if self.state.drag == DragState::Cancelled {
-            LongSessionStatus::Cancelled
-        } else if self.state.long_finish_requested {
-            LongSessionStatus::FinishRequested
-        } else {
-            LongSessionStatus::Running
-        }
-    }
-
-    pub fn long_direction(&self) -> Option<SearchDirection> {
-        self.state.long_direction
-    }
-
-    pub fn update_long_capture_preview(&mut self, snapshot: LongPreviewSnapshot) -> Result<(), Box<dyn Error>> {
-        self.state.long_preview = Some(snapshot);
-        render_overlays_full_dim(&mut self.state);
-        self.event_queue.dispatch_pending(&mut self.state)?;
-        self.conn.flush()?;
-        Ok(())
-    }
-
-    pub fn dispatch_poll(&mut self, timeout_ms: i32) -> Result<(), Box<dyn Error>> {
-        if self.event_queue.dispatch_pending(&mut self.state)? > 0 {
-            return Ok(());
-        }
-        self.event_queue.flush()?;
-        let Some(guard) = self.event_queue.prepare_read() else {
-            return Ok(());
-        };
-        let fd = guard.connection_fd().as_raw_fd();
-        let mut poll_fd = libc::pollfd {
-            fd,
-            events: libc::POLLIN | libc::POLLERR,
-            revents: 0,
-        };
-        loop {
-            let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
-            if ready > 0 {
-                break;
-            }
-            if ready == 0 {
-                drop(guard);
-                return Ok(());
-            }
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::EINTR) {
-                drop(guard);
-                return Err(err.into());
-            }
-        }
-        guard.read()?;
-        self.event_queue.dispatch_pending(&mut self.state)?;
-        Ok(())
-    }
-
+    #[allow(dead_code)]
     pub fn dispatch_blocking(&mut self) -> Result<(), Box<dyn Error>> {
         self.event_queue.blocking_dispatch(&mut self.state)?;
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn dispatch_pending(&mut self) -> Result<(), Box<dyn Error>> {
         self.event_queue.dispatch_pending(&mut self.state)?;
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn wait_configured(&mut self) -> Result<(), Box<dyn Error>> {
         self.event_queue.blocking_dispatch(&mut self.state)?;
         self.event_queue.dispatch_pending(&mut self.state)?;
-        Ok(())
-    }
-
-    pub fn prepare_capture_clean(&mut self) -> Result<(), Box<dyn Error>> {
-        render_overlays_full_dim(&mut self.state);
-        self.event_queue.dispatch_pending(&mut self.state)?;
-        self.conn.flush()?;
         Ok(())
     }
 
@@ -525,77 +372,11 @@ fn create_live_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Resul
             layer_surface,
             buffers: Vec::new(),
             render_cache: None,
-            base_pixels: None,
             width: output.info.logical.width.max(1),
             height: output.info.logical.height.max(1),
         });
     }
     Ok(())
-}
-
-fn render_overlays_full_dim(state: &mut UiState) -> usize {
-    render_overlays_inner(state, true)
-}
-
-fn render_overlays_capture_clean(state: &mut UiState) -> usize {
-    render_overlays_inner(state, false)
-}
-
-fn render_overlays_inner(state: &mut UiState, draw_border: bool) -> usize {
-    let mut committed = 0;
-    for i in 0..state.overlays.len() {
-        let overlay = &mut state.overlays[i];
-        let buffer = match overlay.buffers.iter().position(|b| b.available) {
-            Some(pos) => &mut overlay.buffers[pos],
-            None => continue,
-        };
-        let data = unsafe { std::slice::from_raw_parts_mut(buffer.data, buffer.size) };
-        let buf_size = overlay.width as usize * overlay.height as usize * 4;
-        let stride = overlay.width as usize * 4;
-        let rect = state.drag.current_rect();
-        let output_logical = state.outputs.iter()
-            .find(|o| o.info.global_name == overlay.output_name)
-            .map(|o| o.info.logical)
-            .unwrap_or(LogicalRect { x: 0, y: 0, width: overlay.width, height: overlay.height });
-        let selection_local = rect.and_then(|r| {
-            selected_local_intersection_for_buffer(output_logical, r, overlay.width, overlay.height)
-        });
-
-        let rebuild = overlay.base_pixels.as_ref().map_or(true, |b| b.len() != buf_size);
-        if rebuild {
-            for y in 0..overlay.height as usize {
-                for x in 0..overlay.width as usize {
-                    let offset = y * stride + x * 4;
-                    data[offset..offset + 4].copy_from_slice(&OVERLAY_OUTSIDE_MASK_BGRA);
-                }
-            }
-            if let Some(ref local) = selection_local {
-                for y in local.y..local.y + local.height {
-                    for x in local.x..local.x + local.width {
-                        let offset = y as usize * stride + x as usize * 4;
-                        data[offset + 3] = 0;
-                    }
-                }
-                if draw_border {
-                    draw_selection_border(data, overlay.width, overlay.height, local.x, local.y, local.width, local.height);
-                }
-            }
-            let cache = data[..buf_size].to_vec();
-            overlay.base_pixels = Some(cache);
-        } else if let Some(ref base) = overlay.base_pixels {
-            data[..buf_size.min(base.len())].copy_from_slice(&base[..buf_size.min(base.len())]);
-        }
-
-        if let Some(ref preview) = state.long_preview {
-            draw_preview_on_overlay(data, overlay.width, overlay.height, preview, output_logical, selection_local);
-        }
-        overlay.surface.attach(Some(&buffer.buffer), 0, 0);
-        overlay.surface.damage_buffer(0, 0, overlay.width, overlay.height);
-        overlay.surface.commit();
-        buffer.available = false;
-        committed += 1;
-    }
-    committed
 }
 
 fn draw_selection_border(data: &mut [u8], _width: i32, _height: i32, x: i32, y: i32, w: i32, h: i32) {
@@ -637,27 +418,6 @@ fn draw_selection_border(data: &mut [u8], _width: i32, _height: i32, x: i32, y: 
     }
 }
 
-fn set_overlay_keyboard_exclusive(state: &mut UiState) {
-    for overlay in &mut state.overlays {
-        overlay.layer_surface.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-        overlay.surface.commit();
-    }
-}
-
-fn set_overlay_pointer_passthrough(
-    state: &mut UiState,
-    qh: &QueueHandle<UiState>,
-) -> Result<(), Box<dyn Error>> {
-    let compositor = state.compositor.as_ref().ok_or("compositor does not expose wl_compositor")?;
-    for overlay in &mut state.overlays {
-        let region = compositor.create_region(qh, ());
-        overlay.surface.set_input_region(Some(&region));
-        overlay.surface.commit();
-        region.destroy();
-    }
-    Ok(())
-}
-
 fn bind_xdg_outputs(state: &mut UiState, qh: &QueueHandle<UiState>) {
     let Some(manager) = state.xdg_output_manager.as_ref() else {
         return;
@@ -667,6 +427,7 @@ fn bind_xdg_outputs(state: &mut UiState, qh: &QueueHandle<UiState>) {
     }
 }
 
+#[allow(dead_code)]
 fn create_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Result<(), Box<dyn Error>> {
     let compositor = state.compositor.as_ref().ok_or("compositor does not expose wl_compositor")?;
     let layer_shell = state.layer_shell.as_ref().ok_or("compositor does not expose zwlr_layer_shell_v1")?;
@@ -691,7 +452,6 @@ fn create_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Result<(),
             layer_surface,
             buffers: Vec::new(),
             render_cache: None,
-            base_pixels: None,
             width: output.info.logical.width.max(1),
             height: output.info.logical.height.max(1),
         });
@@ -777,6 +537,7 @@ fn frozen_outputs_from_captures(captures: &[CapturedOutput]) -> Result<Vec<Froze
     Ok(frozen_outputs)
 }
 
+#[allow(dead_code)]
 fn validate_frozen_outputs(outputs: &[OutputRuntime], frozen_outputs: &[FrozenOutput]) -> Result<(), Box<dyn Error>> {
     for output in outputs {
         if !frozen_outputs.iter().any(|frozen| frozen.info.global_name == output.info.global_name) {
@@ -923,75 +684,6 @@ fn selected_local_intersection(output: LogicalRect, selected: LogicalRect) -> Op
 fn selected_local_intersection_for_buffer(output: LogicalRect, selected: LogicalRect, width: i32, height: i32) -> Option<LogicalRect> {
     let buffer = LogicalRect { x: 0, y: 0, width, height };
     selected_local_intersection(output, selected).and_then(|local| local.intersection(buffer))
-}
-
-fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, preview: &LongPreviewSnapshot, output_logical: LogicalRect, selection_local: Option<LogicalRect>) {
-    let pw = preview.image.width as i32;
-    let ph = preview.image.height as i32;
-    if pw == 0 || ph == 0 || overlay_w <= 0 || overlay_h <= 0 {
-        return;
-    }
-    let vp = preview.viewport_rect;
-    let vp_w = vp.width.max(1);
-    let vp_h = vp.height.max(1);
-    let cw = preview.capture_width.max(1) as i32;
-    let ch = preview.capture_height.max(1) as i32;
-    let origin_x = preview.current_origin_x;
-    let origin_y = preview.current_origin_y;
-    let buf_stride = overlay_w as usize * 4;
-    let sel = selection_local.unwrap_or(LogicalRect { x: 0, y: 0, width: 0, height: 0 });
-    let img_data = &preview.image.data;
-    let img_stride = preview.image.stride as i32;
-
-    let global_y0 = output_logical.y;
-    let global_y1 = output_logical.y + overlay_h;
-    let global_x0 = output_logical.x;
-    let global_x1 = output_logical.x + overlay_w;
-    let sy0 = (origin_y + (global_y0 - vp.y) * ch / vp_h).max(0).min(ph);
-    let sy1 = (origin_y + (global_y1 - vp.y) * ch / vp_h + 1).max(0).min(ph);
-    // Precompute visible x-range in stitched coords
-    let sx_min = (origin_x + (global_x0 - vp.x) * cw / vp_w).max(0);
-    let sx_max = (origin_x + (global_x1 - vp.x) * cw / vp_w + 1).min(pw);
-
-    for sy in sy0..sy1 {
-        let global_y = vp.y + (sy - origin_y) * vp_h / ch;
-        if global_y < global_y0 || global_y >= global_y1 {
-            continue;
-        }
-        let oy = global_y - global_y0;
-        let in_sel_y = oy >= sel.y && oy < sel.y + sel.height;
-        // For rows fully covered by selection, skip entire row
-        if in_sel_y {
-            let global_sx0 = vp.x + (sx_min - origin_x) * vp_w / cw;
-            let global_sx1 = vp.x + (sx_max - origin_x) * vp_w / cw;
-            let ox0 = global_sx0 - global_x0;
-            let ox1 = global_sx1 - global_x0;
-            if ox0 >= sel.x && ox1 <= sel.x + sel.width {
-                continue;
-            }
-        }
-        let src_row = (sy * img_stride) as usize;
-
-        for sx in sx_min..sx_max {
-            let global_x = vp.x + (sx - origin_x) * vp_w / cw;
-            if global_x < global_x0 || global_x >= global_x1 {
-                continue;
-            }
-            let ox = global_x - global_x0;
-            if in_sel_y && ox >= sel.x && ox < sel.x + sel.width {
-                continue;
-            }
-            let src_off = src_row + (sx * 4) as usize;
-            if src_off + 3 >= img_data.len() {
-                continue;
-            }
-            let dst_off = (oy as usize) * buf_stride + (ox as usize) * 4;
-            data[dst_off] = img_data[src_off];
-            data[dst_off + 1] = img_data[src_off + 1];
-            data[dst_off + 2] = img_data[src_off + 2];
-            data[dst_off + 3] = 255;
-        }
-    }
 }
 
 fn dirty_selected_region(previous: Option<LogicalRect>, current: Option<LogicalRect>, width: i32, height: i32) -> Option<LogicalRect> {
@@ -1160,28 +852,6 @@ impl Dispatch<WlKeyboard, ()> for UiState {
         if let wl_keyboard::Event::Key { key, state: key_state, .. } = event {
             if key == KEY_ESC && matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed)) {
                 state.drag = DragState::Cancelled;
-            } else if key == KEY_L
-                && matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed))
-            {
-                state.long_requested = true;
-                if state.drag.is_finished() {
-                    state.drag.finish(state.pointer_x, state.pointer_y);
-                }
-            } else if state.drag.is_finished()
-                && matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed))
-            {
-                match key {
-                    KEY_ENTER | KEY_SPACE => {
-                        state.long_finish_requested = true;
-                    }
-                    KEY_DOWN => {
-                        state.long_direction = Some(SearchDirection::Down);
-                    }
-                    KEY_UP => {
-                        state.long_direction = Some(SearchDirection::Up);
-                    }
-                    _ => {}
-                }
             }
         }
     }

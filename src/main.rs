@@ -4,7 +4,6 @@ mod clipboard;
 mod geometry;
 mod image;
 mod runtime;
-mod stitch;
 #[macro_use]
 mod trace;
 mod wayland;

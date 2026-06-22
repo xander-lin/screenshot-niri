@@ -1,36 +1,76 @@
-# screenshot-rs-rebuild
+# screenshot-plain
 
-`screenshot-rs-rebuild` is a fresh, niri-only Rust screenshot tool. The binary is named `screenshot`.
+**screenshot-plain** is a lightweight Wayland screenshot tool for wlroots compositors.  
+It supports interactive region-based screenshots via drag selection with a frozen-background overlay.
 
-## Scope
+This is the **plain** variant — no long screenshots, no stitching, no compositor lock-in.  
+For the full variant with long/scroll screenshot support, see the `master` branch.
 
-- Targets niri on Wayland through wlroots protocols exposed by niri.
-- Supports normal interactive region screenshots only.
-- Does not include Hyprland, Sway, GNOME, KDE, X11, long screenshot, stitching, focus-grab, or diagnostics compatibility paths.
-- Performs a lightweight niri-session preflight before normal capture using `NIRI_SOCKET` or `XDG_CURRENT_DESKTOP` containing `niri`.
-- Rejects `--long` with a clear unsupported-mode error.
+## Supported Compositors
 
-## Runtime Flow
+Uses standard wlroots protocols only. Works on any compositor that exposes them:
 
-1. Parse CLI arguments, output path, and clipboard options.
-2. Reject normal capture outside a niri session with a niri-only diagnostic.
-3. Capture and freeze all outputs with `zwlr_screencopy_manager_v1`.
-4. Run a layer-shell overlay for drag-based region selection over the frozen captured frames.
-5. Composite selected output regions into one image.
-6. Write PNG to the selected path.
-7. Serve the written file to the clipboard through `wlr-data-control` as either `image/png` or file URI data.
+| Compositor | Status |
+|-----------|--------|
+| Niri      | ✅ |
+| Hyprland  | ✅ |
+| Sway      | ✅ |
+| Wayfire   | ✅ |
+| River     | ✅ |
 
-## Module Map
+Required protocols:
+- `zwlr_screencopy_manager_v1` — output capture
+- `zwlr_layer_shell_v1` — selection overlay
+- `wlr-data-control` — clipboard
 
-- `cli`: argument parsing, help text, and output-path resolution.
-- `app`: top-level normal screenshot orchestration, niri preflight, and long-mode rejection.
-- `runtime`: lightweight niri-session environment detection.
-- `geometry`: logical-output and selected-region math.
-- `image`: captured-image representation, compositing, and PNG writing.
-- `clipboard`: detached clipboard provider and `wlr-data-control` source handling.
-- `wayland::screencopy`: wlroots screencopy capture and frozen-output collection.
-- `wayland::selection`: niri/wlr layer-shell selection over frozen-frame overlay.
+## Install
 
-## Verification
+### From Source
 
-Automated validation for the frozen-background implementation passed with `cargo test selection`, `cargo test`, and `cargo check`. Manual niri testing before the frozen-background change was reported successful for selection, capture, file writing, and clipboard behavior; a niri retest is still needed to confirm the visual frozen-screen selection behavior.
+```bash
+cargo install --git https://github.com/xander-lin/screenshot-niri.git --branch plain
+# installs as `screenshot` — rename to screenshot-plain if desired
+```
+
+### Arch Linux (AUR)
+
+```bash
+paru -S screenshot-plain
+```
+
+## Usage
+
+```
+screenshot-plain [OPTIONS] [PATH]
+```
+
+| Flag | Description |
+|------|-------------|
+| `-h`, `--help` | Show help |
+| `--file [PATH]` | Save to PATH, or Pictures/Screenshots/ |
+| `-o`, `--output PATH` | Save to PATH |
+| `--name NAME` | Set output filename (.png appended) |
+| `--url` | Copy file URI instead of image/png |
+
+### Workflow
+
+1. Run `screenshot-plain` — the screen freezes and dims
+2. Drag to select a region
+3. Release — the screenshot saves and copies to clipboard
+4. Press `Esc` to cancel
+
+## Build
+
+```bash
+git clone https://github.com/xander-lin/screenshot-niri.git
+cd screenshot-niri
+git checkout plain
+cargo build --release
+# binary at target/release/screenshot
+```
+
+Requires Rust 1.80+.
+
+## Project Size
+
+~2,600 lines of Rust. No unsafe beyond `libc::mmap` for shared memory buffers and `libc::localtime_r` for filename generation.

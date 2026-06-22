@@ -9,7 +9,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
-    Long,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +37,7 @@ pub struct ClipboardProviderArgs {
     pub mode: ClipboardMode,
 }
 
-pub const HELP: &str = "Usage: screenshot [OPTIONS] [PATH]\n\nOptions:\n  -h, --help           Show this help text\n      --file [PATH]    Save to PATH, or to the Pictures/Screenshots directory when omitted\n  -o, --output PATH    Save to PATH instead of the default temporary path\n      --name NAME      Use NAME as the output filename, appending .png when needed\n      --url            Put a file URI on the clipboard instead of image/png\n      --long           Interactive long/scroll screenshot mode\n";
+pub const HELP: &str = "Usage: screenshot [OPTIONS] [PATH]\n\nOptions:\n  -h, --help           Show this help text\n      --file [PATH]    Save to PATH, or to the Pictures/Screenshots directory when omitted\n  -o, --output PATH    Save to PATH instead of the default temporary path\n      --name NAME      Use NAME as the output filename, appending .png when needed\n      --url            Put a file URI on the clipboard instead of image/png\n";
 
 impl Command {
     pub fn parse() -> Result<Self, Box<dyn Error>> {
@@ -57,7 +56,6 @@ impl Command {
 impl Args {
     fn parse_from(raw: Vec<OsString>) -> Result<Self, Box<dyn Error>> {
         let mut help = false;
-        let mut long = false;
         let mut clipboard_mode = ClipboardMode::ImagePng;
         let mut output_path = None;
         let mut file_requested = false;
@@ -69,9 +67,6 @@ impl Args {
             let arg = &raw[index];
             if arg == "-h" || arg == "--help" {
                 help = true;
-                index += 1;
-            } else if arg == "--long" {
-                long = true;
                 index += 1;
             } else if arg == "--url" {
                 clipboard_mode = ClipboardMode::FileUri;
@@ -131,7 +126,7 @@ impl Args {
 
         Ok(Self {
             help,
-            mode: if long { Mode::Long } else { Mode::Normal },
+            mode: Mode::Normal,
             clipboard_mode,
             output_path,
         })
@@ -304,9 +299,5 @@ mod tests {
         assert!(err.to_string().contains("cannot be used together"));
     }
 
-    #[test]
-    fn long_is_parsed_as_long_mode() {
-        let args = Args::parse_from(vec![OsString::from("--long")]).unwrap();
-        assert_eq!(args.mode, Mode::Long);
-    }
+
 }

@@ -1,18 +1,7 @@
-use std::error::Error;
+// Runtime detection utilities — no longer restricted to niri-only.
+// The functions are kept for optional diagnostics.
 
-const NIRI_ONLY_ERROR: &str = "this rebuild currently supports niri only; run it inside a niri session";
-
-pub fn ensure_niri_session() -> Result<(), Box<dyn Error>> {
-    if is_niri_session(
-        std::env::var_os("NIRI_SOCKET").as_deref(),
-        std::env::var_os("XDG_CURRENT_DESKTOP").as_deref(),
-    ) {
-        Ok(())
-    } else {
-        Err(NIRI_ONLY_ERROR.into())
-    }
-}
-
+#[allow(dead_code)]
 fn is_niri_session(niri_socket: Option<&std::ffi::OsStr>, xdg_current_desktop: Option<&std::ffi::OsStr>) -> bool {
     niri_socket.is_some_and(|value| !value.is_empty()) || xdg_current_desktop.is_some_and(os_str_contains_niri)
 }

@@ -149,6 +149,7 @@ fn capture_output(output_name: u32, overlay_cursor: bool) -> Result<Image, Box<d
     state.image.take().ok_or_else(|| "screencopy completed without image".into())
 }
 
+#[allow(dead_code)]
 pub fn capture_region(region: CaptureOutputRegion, overlay_cursor: bool, wait_for_damage: bool) -> Result<Image, Box<dyn Error>> {
     let conn = Connection::connect_to_env()?;
     let mut event_queue = conn.new_event_queue::<State>();

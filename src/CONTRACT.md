@@ -14,27 +14,27 @@
 
 ## `app`
 
-- Responsibilities: orchestrate normal screenshot flow, run niri-only preflight for normal capture, pass frozen output frames into selection, and reject unsupported long screenshots.
+- Responsibilities: orchestrate normal screenshot flow, pass frozen output frames into selection, composite selected regions, write output, and start clipboard provider.
 - Non-responsibilities: low-level protocol dispatch and PNG encoding internals.
 - Inputs: parsed `Args`.
 - Outputs: saved PNG path and clipboard provider startup.
-- Dependencies: `cli`, `runtime`, `wayland::screencopy`, `wayland::selection`, `image`, and `clipboard`.
-- Forbidden dependencies: long-capture modules, compositor adaptation branches, and diagnostics bins.
-- Failure modes: unsupported `--long`, non-niri runtime environment, cancelled selection, capture failure, write failure, and clipboard setup failure.
+- Dependencies: `cli`, `wayland::screencopy`, `wayland::selection`, `image`, and `clipboard`.
+- Forbidden dependencies: compositor-specific adaptation branches.
+- Failure modes: cancelled selection, capture failure, write failure, and clipboard setup failure.
 - Verification method: integration/manual test under niri and `cargo check`.
 - Replacement contract: keep the same high-level sequence: preflight, freeze, select, composite, write, clipboard.
 
 ## `runtime`
 
-- Responsibilities: detect whether normal screenshot capture appears to be running inside niri.
-- Non-responsibilities: Wayland registry probing, compositor fallback selection, and clipboard-provider gating.
+- Responsibilities: provide optional compositor detection utilities for diagnostics.
+- Non-responsibilities: gating capture — the plain branch supports all wlroots compositors.
 - Inputs: `NIRI_SOCKET` and `XDG_CURRENT_DESKTOP`.
-- Outputs: success for niri-like sessions or a clear niri-only diagnostic.
+- Outputs: boolean detection results (dead code, kept for optional diagnostics).
 - Dependencies: standard library environment access.
-- Forbidden dependencies: Wayland protocol clients and non-niri compositor branches.
-- Failure modes: missing or empty niri session hints.
+- Forbidden dependencies: Wayland protocol clients and compositor branching in normal flow.
+- Failure modes: none — functions are optional and informational only.
 - Verification method: pure unit tests for injected environment values, plus `cargo check`.
-- Replacement contract: keep normal screenshot preflight lightweight and side-effect-free apart from reading process env.
+- Replacement contract: keep detection functions side-effect-free and purely informational.
 
 ## `geometry`
 
@@ -60,18 +60,6 @@
 - Verification method: unit tests for pure blit/format behavior and `cargo check`.
 - Replacement contract: accept XRGB/ARGB8888 buffers and produce valid RGBA PNG output.
 
-## `stitch`
-
-- Responsibilities: provide pure vertical image overlap detection with a small average RGB difference threshold, exact in-canvas placement detection, append/prepend operations, and a minimal test-only `RawStitcher` state foundation with current viewport, viewport-relative Top/Bottom match metadata, near-duplicate average RGB difference detection before placement, and explicit direction filtering for future long-screenshot assembly.
-- Non-responsibilities: CLI flag handling, Wayland capture, scrolling, output selection, PNG writing, and enabling `--long` runtime behavior.
-- Inputs: existing `image::Image` buffers using the project BGRA/XRGB/ARGB8888 convention, overlap search bounds, explicit append overlap, test-only ordered raw frames, and optional test-only search direction filters.
-- Outputs: largest vertical overlap length whose paired rows are within the average RGB match threshold, first top-to-bottom exact in-canvas vertical placement, a newly stitched `Image` preserving the source format and row stride, average RGB frame difference for same-geometry images, or test-only push state results for initialized, duplicate, accepted, and no-match frames with accepted-frame viewport-relative Top/Bottom match metadata and finish-time stitched image plus current viewport.
-- Dependencies: `image::Image`, standard error handling, and `wayland-client` SHM format names.
-- Forbidden dependencies: Wayland protocol flow, runtime environment checks, filesystem access, clipboard state, and CLI modules.
-- Failure modes: unsupported formats, zero dimensions, short stride/data, width, stride, or format mismatch, invalid overlap ranges, no overlap within the RGB threshold, and arithmetic overflow.
-- Verification method: unit tests for exact and thresholded overlap detection, largest-overlap preference, first-match exact canvas placement, mismatch rejection, append/prepend bytes, invalid overlap, `RawStitcher` initialization, near-duplicate handling, exact in-canvas and viewport-relative Top/Bottom thresholded overlap placement with viewport/match metadata, alpha-ignored overlap matching, direction-filtered no-match preservation, empty finish, plus `cargo check`.
-- Replacement contract: keep stitching deterministic, side-effect-free, and test-only until longshot orchestration exists; rebuild placement first checks near-duplicates against the previous frame by average RGB difference for same geometry, then checks exact vertical in-canvas placement at x=0, then falls back to average-RGB-thresholded vertical Top/Bottom append/prepend relative to the current viewport with explicit `Vertical`/`Down`/`Up` direction filtering and does not include the original multi-direction, multi-stage, or perceptual matcher.
-
 ## `clipboard`
 
 - Responsibilities: serve saved screenshots through `wlr-data-control` in image or URI mode.
@@ -81,7 +69,7 @@
 - Dependencies: `wayland-client` and `wayland-protocols-wlr` data-control protocol.
 - Forbidden dependencies: external clipboard commands and compositor-specific fallbacks.
 - Failure modes: missing data-control manager, missing seat, provider startup failure, or send I/O failure.
-- Verification method: manual paste tests under niri and `cargo check`.
+- Verification method: manual paste tests under a wlroots compositor and `cargo check`.
 - Replacement contract: keep `image/png` and file URI clipboard modes available from a saved path.
 
 ## `wayland::screencopy`
@@ -93,7 +81,7 @@
 - Dependencies: `wayland-client`, `wayland-protocols-wlr`, `tempfile`, and `libc`.
 - Forbidden dependencies: non-wlr capture APIs and compositor adaptation branches.
 - Failure modes: missing globals, unsupported buffer format, failed SHM allocation, screencopy failure, and protocol cancellation.
-- Verification method: manual niri capture plus `cargo check`.
+- Verification method: manual capture under a wlroots compositor plus `cargo check`.
 - Replacement contract: provide frozen output frames suitable for selection-time compositing.
 
 ## `wayland::selection`
@@ -103,7 +91,7 @@
 - Inputs: frozen captured output frames, Wayland pointer/keyboard events, and output logical geometry.
 - Outputs: selected viewport or cancellation.
 - Dependencies: `wayland-client`, `wayland-protocols`, `wayland-protocols-wlr`, `tempfile`, and `libc`.
-- Forbidden dependencies: focus-grab extensions and non-niri compositor branches.
+- Forbidden dependencies: focus-grab extensions and compositor-specific branches.
 - Failure modes: missing layer-shell/compositor/shm/seat/output globals, missing frozen output frame, unsupported frozen frame format, no pointer, cancellation, or empty selection.
-- Verification method: unit tests for overlay pixels/dirty regions, manual niri drag-selection test, and `cargo check`.
+- Verification method: unit tests for overlay pixels/dirty regions, manual drag-selection test under a wlroots compositor, and `cargo check`.
 - Replacement contract: return geometry-only selection data usable by screencopy compositing.
