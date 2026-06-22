@@ -7,6 +7,9 @@ edition = "2021"
 name = "screenshot"
 path = "src/main.rs"
 
+[features]
+trace-logs = []
+
 [dependencies]
 libc = "0.2"
 png = "0.17"
