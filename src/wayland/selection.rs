@@ -209,6 +209,7 @@ impl UiState {
     }
 }
 
+#[allow(dead_code)]
 pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOutcome, Box<dyn Error>> {
     let conn = Connection::connect_to_env()?;
     let mut event_queue = conn.new_event_queue::<UiState>();
@@ -275,6 +276,7 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
 pub enum SearchDirection {
     Down,
     Up,
+    #[allow(dead_code)]
     Vertical,
 }
 
@@ -282,7 +284,9 @@ pub enum SearchDirection {
 pub enum LongDirection {
     Down,
     Up,
+    #[allow(dead_code)]
     Right,
+    #[allow(dead_code)]
     Left,
 }
 
@@ -470,16 +474,19 @@ impl SelectionSession {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn dispatch_blocking(&mut self) -> Result<(), Box<dyn Error>> {
         self.event_queue.blocking_dispatch(&mut self.state)?;
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn dispatch_pending(&mut self) -> Result<(), Box<dyn Error>> {
         self.event_queue.dispatch_pending(&mut self.state)?;
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn wait_configured(&mut self) -> Result<(), Box<dyn Error>> {
         self.event_queue.blocking_dispatch(&mut self.state)?;
         self.event_queue.dispatch_pending(&mut self.state)?;
@@ -537,6 +544,7 @@ fn render_overlays_full_dim(state: &mut UiState) -> usize {
     render_overlays_inner(state, true)
 }
 
+#[allow(dead_code)]
 fn render_overlays_capture_clean(state: &mut UiState) -> usize {
     render_overlays_inner(state, false)
 }
@@ -667,6 +675,7 @@ fn bind_xdg_outputs(state: &mut UiState, qh: &QueueHandle<UiState>) {
     }
 }
 
+#[allow(dead_code)]
 fn create_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Result<(), Box<dyn Error>> {
     let compositor = state.compositor.as_ref().ok_or("compositor does not expose wl_compositor")?;
     let layer_shell = state.layer_shell.as_ref().ok_or("compositor does not expose zwlr_layer_shell_v1")?;
@@ -777,6 +786,7 @@ fn frozen_outputs_from_captures(captures: &[CapturedOutput]) -> Result<Vec<Froze
     Ok(frozen_outputs)
 }
 
+#[allow(dead_code)]
 fn validate_frozen_outputs(outputs: &[OutputRuntime], frozen_outputs: &[FrozenOutput]) -> Result<(), Box<dyn Error>> {
     for output in outputs {
         if !frozen_outputs.iter().any(|frozen| frozen.info.global_name == output.info.global_name) {

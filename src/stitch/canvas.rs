@@ -8,6 +8,7 @@ use super::rgb::{validate_rgb_frame, RgbSource};
 use super::{ComposeCrop, FixedBands, FrameMatch, RgbFrame, StitchedFrame, ViewportRect};
 
 impl StitchedFrame {
+    #[allow(dead_code)]
     pub fn from_first_frame(frame: &RgbFrame) -> Self {
         let fixed_bands = FixedBands::default();
         let active_crop = fixed_bands

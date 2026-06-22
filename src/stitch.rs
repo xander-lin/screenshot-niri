@@ -63,7 +63,7 @@ pub use rgb::{average_difference_same, rgb_frame_from_image, ImageRgbView};
 pub use types::{
     AppendDirection, ComposeCrop, DuplicateAnalysisMotion, FastMotionAgreement,
     FastMotionCandidate, FastMotionTrace, FastMotionVerifyPass, FixedBands, FrameMatch,
-    MotionEstimate, PushResult, PushStreakKind, RgbFrame, SearchDirection, StitchDecisionPath,
+    MotionEstimate, PushResult, RgbFrame, SearchDirection, StitchDecisionPath,
     StitchProfileBreakdown, StitchedFrame, ViewportRect,
 };
 
@@ -385,6 +385,7 @@ impl RawStitcher {
         }
     }
 
+    #[allow(dead_code)]
     pub fn push_frame(
         &mut self,
         frame: RgbFrame,
@@ -393,6 +394,7 @@ impl RawStitcher {
         self.push_frame_with_analysis(frame.clone(), frame, direction)
     }
 
+    #[allow(dead_code)]
     pub fn push_frame_with_analysis(
         &mut self,
         compose_frame: RgbFrame,
@@ -828,22 +830,27 @@ impl RawStitcher {
         self.stitched.as_ref()
     }
 
+    #[allow(dead_code)]
     pub fn last_duplicate_difference(&self) -> Option<f64> {
         self.last_duplicate_difference
     }
 
+    #[allow(dead_code)]
     pub fn last_duplicate_analysis_difference(&self) -> Option<f64> {
         self.last_duplicate_analysis_difference
     }
 
+    #[allow(dead_code)]
     pub fn last_duplicate_analysis_motion(&self) -> Option<DuplicateAnalysisMotion> {
         self.last_duplicate_analysis_motion
     }
 
+    #[allow(dead_code)]
     pub fn last_fast_motion_trace(&self) -> Option<FastMotionTrace> {
         self.last_fast_motion_trace
     }
 
+    #[allow(dead_code)]
     pub fn last_profile_breakdown(&self) -> StitchProfileBreakdown {
         self.last_profile_breakdown
     }
@@ -914,6 +921,7 @@ fn duplicate_analysis_motion(
     })
 }
 
+#[allow(dead_code)]
 pub fn find_frame_shift_match(
     previous: &RgbFrame,
     current: &RgbFrame,

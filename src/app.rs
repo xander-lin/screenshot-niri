@@ -65,9 +65,9 @@ fn run_long(args: crate::cli::Args) -> Result<(), Box<dyn Error>> {
 }
 
 enum CaptureMessage {
-    PrepareCapture { index: usize, ack: mpsc::SyncSender<()> },
+    PrepareCapture { #[allow(dead_code)] index: usize, ack: mpsc::SyncSender<()> },
     Frame(crate::image::Image),
-    Error(String),
+    Error(#[allow(dead_code)] String),
     Finished,
 }
 
@@ -173,7 +173,6 @@ fn run_long_capture(
     let mut stitcher = RawStitcher::new();
     let mut cancelled = false;
     let mut capture_finished = false;
-    let mut capture_error: Option<String> = None;
     let mut prev_raw: Option<crate::image::Image> = None;
 
     while !capture_finished {
@@ -223,8 +222,7 @@ fn run_long_capture(
                     }
                 }
             }
-            Ok(CaptureMessage::Error(err)) => {
-                capture_error = Some(err);
+            Ok(CaptureMessage::Error(_)) => {
                 capture_finished = true;
             }
             Ok(CaptureMessage::Finished) => {

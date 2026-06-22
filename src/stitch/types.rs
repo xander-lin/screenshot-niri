@@ -64,6 +64,7 @@ pub struct FrameMatch {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum PushStreakKind {
     Duplicate,
     NoMatch,
@@ -111,6 +112,7 @@ pub enum FastMotionAgreement {
 pub enum FastMotionVerifyPass {
     Top20,
     Top50,
+    #[allow(dead_code)]
     Full,
 }
 

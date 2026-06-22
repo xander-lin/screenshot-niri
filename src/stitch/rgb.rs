@@ -111,6 +111,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 pub fn rgb_frame_from_image(image: &Image) -> Result<RgbFrame, Box<dyn Error>> {
     if image.format != Format::Argb8888 && image.format != Format::Xrgb8888 {
         return Err(format!("unsupported shm format for stitching: {:?}", image.format).into());
