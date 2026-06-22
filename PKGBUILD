@@ -3,7 +3,7 @@
 
 pkgname=screenshot-plain
 pkgver=0.1.0
-pkgrel=2
+pkgrel=3
 pkgdesc="Lightweight wlroots Wayland screenshot tool — plain variant (normal screenshots, supports Niri/Hyprland/Sway/Wayfire/River)"
 arch=('x86_64')
 url="https://github.com/xander-lin/screenshot-niri"
@@ -26,7 +26,7 @@ check() {
 
 package() {
     cd "$srcdir/screenshot-plain"
-    install -Dm755 target/release/screenshot "$pkgdir/usr/bin/screenshot-plain"
+    install -Dm755 target/release/screenshot "$pkgdir/usr/bin/screenshot"
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/" 2>/dev/null || true
 }
