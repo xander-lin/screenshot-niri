@@ -8,6 +8,7 @@ pkgbase = screenshot-plain
 	makedepends = cargo
 	makedepends = git
 	depends = 
+	conflicts = screenshot-niri
 	source = git+https://github.com/xander-lin/screenshot-niri.git#branch=plain
 	sha256sums = SKIP
 

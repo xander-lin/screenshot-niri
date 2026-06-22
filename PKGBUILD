@@ -10,6 +10,7 @@ url="https://github.com/xander-lin/screenshot-niri"
 license=('MIT')
 depends=()
 makedepends=('cargo' 'git')
+conflicts=('screenshot-niri')
 source=("git+${url}.git#branch=plain")
 sha256sums=('SKIP')
 
