@@ -89,7 +89,8 @@ screenshot /home/me/shots/out.png      # → /home/me/shots/out.png
 2. **Drag** with the left mouse button to select a region.
 3. **Release** — the screenshot saves and is copied to clipboard.
 4. Press **Esc** at any time to cancel.
-5. Press **H** to switch the frozen preview and saved screenshot between the frames captured with and without the cursor. The live selection cursor stays visible.
+5. The frozen preview and the saved screenshot use the cursor-free frame by default. Press **H** to show the cursor (toggle between the captured with-cursor and without-cursor frames). The live selection cursor stays visible.
+6. Press **1**–**9** to skip selection entirely and capture a full screen; screens are numbered left to right by their position.
 
 ### Long/Scroll Screenshot (`--long`)
 
