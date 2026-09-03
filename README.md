@@ -101,6 +101,7 @@ screenshot /home/me/shots/out.png      # → /home/me/shots/out.png
 2. **Drag** with the left mouse button to select a region.
 3. **Release** — the screenshot saves and is copied to clipboard.
 4. Press **Esc** at any time to cancel.
+5. Press **1**–**9** to skip selection entirely and capture a full screen; screens are numbered left to right by their position.
 
 ### Examples
 

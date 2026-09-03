@@ -29,6 +29,8 @@ use crate::wayland::screencopy::CapturedOutput;
 
 const BTN_LEFT: u32 = 0x110;
 const KEY_ESC: u32 = 1;
+const KEY_DIGIT_FIRST: u32 = 2;
+const KEY_DIGIT_LAST: u32 = 10;
 const OVERLAY_BUFFER_COUNT: usize = 3;
 const SELECTION_BORDER_WIDTH: i32 = 3;
 const OVERLAY_OUTSIDE_MASK_BGRA: [u8; 4] = [0, 0, 0, 110];
@@ -847,11 +849,31 @@ impl Dispatch<WlPointer, ()> for UiState {
     }
 }
 
+fn digit_key_index(key: u32) -> Option<usize> {
+    if (KEY_DIGIT_FIRST..=KEY_DIGIT_LAST).contains(&key) {
+        Some((key - KEY_DIGIT_FIRST) as usize)
+    } else {
+        None
+    }
+}
+
+fn full_output_rect_by_index(output_infos: &[OutputInfo], index: usize) -> Option<LogicalRect> {
+    let mut ordered: Vec<&OutputInfo> = output_infos.iter().collect();
+    ordered.sort_by_key(|info| (info.logical.x, info.logical.y));
+    Some(ordered.get(index)?.logical)
+}
+
 impl Dispatch<WlKeyboard, ()> for UiState {
     fn event(state: &mut Self, _: &WlKeyboard, event: wl_keyboard::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         if let wl_keyboard::Event::Key { key, state: key_state, .. } = event {
             if key == KEY_ESC && matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed)) {
                 state.drag = DragState::Cancelled;
+            } else if state.drag == DragState::Idle
+                && matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed))
+            {
+                if let Some(rect) = digit_key_index(key).and_then(|index| full_output_rect_by_index(&state.output_infos(), index)) {
+                    state.drag = DragState::Finished(rect);
+                }
             }
         }
     }
@@ -967,6 +989,25 @@ mod tests {
     use super::*;
 
     const SELECTED: LogicalRect = LogicalRect { x: 10, y: 20, width: 30, height: 40 };
+
+    #[test]
+    fn digit_key_maps_to_zero_based_index() {
+        assert_eq!(digit_key_index(KEY_DIGIT_FIRST), Some(0));
+        assert_eq!(digit_key_index(KEY_DIGIT_LAST), Some(8));
+        assert_eq!(digit_key_index(KEY_DIGIT_LAST + 1), None);
+        assert_eq!(digit_key_index(KEY_ESC), None);
+    }
+
+    #[test]
+    fn full_output_rect_orders_outputs_left_to_right() {
+        let right = OutputInfo { global_name: 2, logical: LogicalRect { x: 300, y: 0, width: 100, height: 80 }, scale: 1 };
+        let left = OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 20, width: 100, height: 80 }, scale: 1 };
+        let infos = [right, left];
+
+        assert_eq!(full_output_rect_by_index(&infos, 0), Some(left.logical));
+        assert_eq!(full_output_rect_by_index(&infos, 1), Some(right.logical));
+        assert_eq!(full_output_rect_by_index(&infos, 2), None);
+    }
 
     #[test]
     fn overlay_pixel_dims_outside_selection() {
