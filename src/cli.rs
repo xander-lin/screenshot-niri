@@ -38,7 +38,7 @@ pub struct ClipboardProviderArgs {
     pub mode: ClipboardMode,
 }
 
-pub const HELP: &str = "Usage: screenshot [OPTIONS] [PATH]\n\nOptions:\n  -h, --help           Show this help text\n      --file [PATH]    Save to PATH, or to the Pictures/Screenshots directory when omitted\n  -o, --output PATH    Save to PATH instead of the default temporary path\n      --name NAME      Use NAME as the output filename, appending .png when needed\n      --url            Put a file URI on the clipboard instead of image/png\n      --long           Interactive long/scroll screenshot mode\n";
+pub const HELP: &str = "screenshot — Wayland screenshot tool: region, full-screen, and long/scroll capture\n\nUsage: screenshot [OPTIONS] [PATH]\n\nOptions:\n  -h, --help           Show this help text\n  -V, --version        Show version information\n      --long           Interactive long/scroll screenshot mode\n      --file [PATH]    Save to PATH, or to the Pictures/Screenshots directory when omitted\n  -o, --output PATH    Save to PATH instead of a temporary file\n      --name NAME      Output filename; adds .png when missing, timestamped when omitted\n      --url            Put a file URI on the clipboard instead of the image\n\nInteraction:\n  Drag                 Select a region; release saves and copies to the clipboard\n  1-9                  Capture a full screen; screens are numbered left to right\n  H                    Toggle the cursor in the output (cursor hidden by default)\n  L                    Switch the selected region to long/scroll capture\n  Scroll               Scroll the content inside the region during long capture\n  Up / Down            Hint the scroll direction for better stitching\n  Enter or Space       Finish long capture and stitch\n  Esc                  Cancel at any time\n\nWithout --file or --output, the PNG is written under $XDG_RUNTIME_DIR (or\n/tmp/screenshot-rust-<uid>) and the clipboard receives the image itself,\nor a file URI with --url.\n";
 
 impl Command {
     pub fn parse() -> Result<Self, Box<dyn Error>> {
@@ -70,6 +70,9 @@ impl Args {
             if arg == "-h" || arg == "--help" {
                 help = true;
                 index += 1;
+            } else if arg == "-V" || arg == "--version" {
+                println!("screenshot {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
             } else if arg == "--long" {
                 long = true;
                 index += 1;
