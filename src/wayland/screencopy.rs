@@ -96,7 +96,15 @@ impl State {
     }
 }
 
-pub fn capture_outputs(overlay_cursor: bool) -> Result<Vec<CapturedOutput>, Box<dyn Error>> {
+pub fn capture_outputs_with_cursor() -> Result<Vec<CapturedOutput>, Box<dyn Error>> {
+    capture_outputs(true)
+}
+
+pub fn capture_outputs_without_cursor() -> Result<Vec<CapturedOutput>, Box<dyn Error>> {
+    capture_outputs(false)
+}
+
+fn capture_outputs(overlay_cursor: bool) -> Result<Vec<CapturedOutput>, Box<dyn Error>> {
     let output_names = list_output_names()?;
     if output_names.is_empty() {
         return Err("compositor did not advertise any wl_output".into());
@@ -217,7 +225,11 @@ impl CaptureSession {
         Ok(Self { conn, event_queue, state })
     }
 
-    pub fn capture_region_frame(&mut self, region: CaptureOutputRegion, overlay_cursor: bool, wait_for_damage: bool) -> Result<Image, Box<dyn Error>> {
+    pub fn capture_region_frame_without_cursor(
+        &mut self,
+        region: CaptureOutputRegion,
+        wait_for_damage: bool,
+    ) -> Result<Image, Box<dyn Error>> {
         self.state.image = None;
         self.state.shm_image = None;
         self.state.wait_for_damage = wait_for_damage;
@@ -229,7 +241,7 @@ impl CaptureSession {
         let screencopy = self.state.screencopy.as_ref().ok_or("missing screencopy")?;
         let output = self.state.output.as_ref().ok_or("missing output")?;
         self.state.frame = Some(screencopy.capture_output_region(
-            i32::from(overlay_cursor),
+            0,
             output,
             region.region.x,
             region.region.y,

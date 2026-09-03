@@ -31,6 +31,7 @@ use crate::wayland::screencopy::CapturedOutput;
 const BTN_LEFT: u32 = 0x110;
 const KEY_ESC: u32 = 1;
 const KEY_L: u32 = 38;
+const KEY_H: u32 = 35;
 const KEY_ENTER: u32 = 28;
 const KEY_SPACE: u32 = 57;
 const KEY_DOWN: u32 = 108;
@@ -181,8 +182,11 @@ struct UiState {
     keyboard: Option<WlKeyboard>,
     outputs: Vec<OutputRuntime>,
     frozen_outputs: Vec<FrozenOutput>,
+    frozen_outputs_without_cursor: Vec<FrozenOutput>,
     overlays: Vec<OverlaySurface>,
     pointer_output_name: Option<u32>,
+    long_mode: bool,
+    screenshot_cursor_hidden: bool,
     pointer_x: i32,
     pointer_y: i32,
     drag: DragState,
@@ -190,6 +194,7 @@ struct UiState {
     long_finish_requested: bool,
     long_direction: Option<SearchDirection>,
     long_preview: Option<LongPreviewSnapshot>,
+    pending_render: Option<bool>,
 }
 
 impl UiState {
@@ -224,8 +229,11 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
         keyboard: None,
         outputs: Vec::new(),
         frozen_outputs: frozen_outputs_from_captures(frozen_outputs)?,
+        frozen_outputs_without_cursor: Vec::new(),
         overlays: Vec::new(),
         pointer_output_name: None,
+        long_mode: false,
+        screenshot_cursor_hidden: false,
         pointer_x: 0,
         pointer_y: 0,
         drag: DragState::Idle,
@@ -233,6 +241,7 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
         long_finish_requested: false,
         long_direction: None,
             long_preview: None,
+            pending_render: None,
     };
 
     conn.display().get_registry(&qh, ());
@@ -315,18 +324,29 @@ pub struct SelectionSession {
 
 impl SelectionSession {
     pub fn new_long() -> Result<Self, Box<dyn Error>> {
-        Self::new_internal(None)
+        Self::new_internal(None, None, true)
     }
 
-    pub fn with_frozen(frozen_outputs: &[CapturedOutput]) -> Result<Self, Box<dyn Error>> {
-        Self::new_internal(Some(frozen_outputs))
+    pub fn with_frozen_pair(
+        frozen_outputs: &[CapturedOutput],
+        frozen_outputs_without_cursor: &[CapturedOutput],
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::new_internal(Some(frozen_outputs), Some(frozen_outputs_without_cursor), false)
     }
 
-    fn new_internal(frozen_outputs: Option<&[CapturedOutput]>) -> Result<Self, Box<dyn Error>> {
+    fn new_internal(
+        frozen_outputs: Option<&[CapturedOutput]>,
+        frozen_outputs_without_cursor: Option<&[CapturedOutput]>,
+        long_mode: bool,
+    ) -> Result<Self, Box<dyn Error>> {
         let conn = Connection::connect_to_env()?;
         let mut event_queue = conn.new_event_queue::<UiState>();
         let qh = event_queue.handle();
         let frozen_outputs = match frozen_outputs {
+            Some(captures) => frozen_outputs_from_captures(captures)?,
+            None => Vec::new(),
+        };
+        let frozen_outputs_without_cursor = match frozen_outputs_without_cursor {
             Some(captures) => frozen_outputs_from_captures(captures)?,
             None => Vec::new(),
         };
@@ -340,8 +360,11 @@ impl SelectionSession {
             keyboard: None,
             outputs: Vec::new(),
             frozen_outputs,
+            frozen_outputs_without_cursor,
             overlays: Vec::new(),
             pointer_output_name: None,
+            long_mode,
+            screenshot_cursor_hidden: false,
             pointer_x: 0,
             pointer_y: 0,
             drag: DragState::Idle,
@@ -349,6 +372,7 @@ impl SelectionSession {
             long_finish_requested: false,
             long_direction: None,
             long_preview: None,
+            pending_render: None,
         };
 
         conn.display().get_registry(&qh, ());
@@ -369,6 +393,12 @@ impl SelectionSession {
         }
         if state.pointer.is_none() {
             return Err("no wl_pointer from wl_seat is available for selection".into());
+        }
+        if !state.frozen_outputs.is_empty() {
+            validate_frozen_outputs(&state.outputs, &state.frozen_outputs)?;
+        }
+        if !state.frozen_outputs_without_cursor.is_empty() {
+            validate_frozen_outputs(&state.outputs, &state.frozen_outputs_without_cursor)?;
         }
         create_live_overlays(&mut state, &qh)?;
         conn.flush()?;
@@ -432,9 +462,13 @@ impl SelectionSession {
         self.state.long_direction
     }
 
+    pub fn screenshot_cursor_hidden(&self) -> bool {
+        self.state.screenshot_cursor_hidden
+    }
+
     pub fn update_long_capture_preview(&mut self, snapshot: LongPreviewSnapshot) -> Result<(), Box<dyn Error>> {
         self.state.long_preview = Some(snapshot);
-        render_overlays_full_dim(&mut self.state);
+        queue_render(&mut self.state, true);
         self.event_queue.dispatch_pending(&mut self.state)?;
         self.conn.flush()?;
         Ok(())
@@ -666,6 +700,54 @@ fn set_overlay_pointer_passthrough(
     Ok(())
 }
 
+fn toggle_frozen_frame(state: &mut UiState) {
+    state.screenshot_cursor_hidden = !state.screenshot_cursor_hidden;
+    for index in 0..state.overlays.len() {
+        let output_name = state.overlays[index].output_name;
+        let width = state.overlays[index].width;
+        let height = state.overlays[index].height;
+        let Some(output) = state.outputs.iter().find(|output| output.info.global_name == output_name) else {
+            continue;
+        };
+        let captures = if state.screenshot_cursor_hidden {
+            &state.frozen_outputs_without_cursor
+        } else {
+            &state.frozen_outputs
+        };
+        let Some(frozen) = captures.iter().find(|frozen| frozen.info.global_name == output_name) else {
+            continue;
+        };
+        let overlay = &mut state.overlays[index];
+        overlay.render_cache = Some(build_overlay_render_cache(width, height, output.info, frozen));
+        for buffer in &mut overlay.buffers {
+            buffer.initialized = false;
+            buffer.last_selected = None;
+        }
+    }
+    queue_render(state, false);
+}
+
+fn queue_render(state: &mut UiState, full: bool) {
+    let committed = if full {
+        render_overlays_full_dim(state)
+    } else {
+        render_overlays(state)
+    };
+    state.pending_render = if committed < state.overlays.len() { Some(full) } else { None };
+}
+
+fn flush_pending_render(state: &mut UiState) {
+    let Some(full) = state.pending_render else { return; };
+    let committed = if full {
+        render_overlays_full_dim(state)
+    } else {
+        render_overlays(state)
+    };
+    if committed >= state.overlays.len() {
+        state.pending_render = None;
+    }
+}
+
 fn bind_xdg_outputs(state: &mut UiState, qh: &QueueHandle<UiState>) {
     let Some(manager) = state.xdg_output_manager.as_ref() else {
         return;
@@ -708,7 +790,8 @@ fn create_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Result<(),
     Ok(())
 }
 
-fn render_overlays(state: &mut UiState) {
+fn render_overlays(state: &mut UiState) -> usize {
+    let mut committed = 0;
     let rect = state.drag.current_rect();
     for overlay in &mut state.overlays {
         let Some(buffer) = overlay.buffers.iter_mut().find(|buffer| buffer.available) else {
@@ -734,6 +817,7 @@ fn render_overlays(state: &mut UiState) {
             overlay.surface.damage_buffer(0, 0, overlay.width, overlay.height);
             overlay.surface.commit();
             buffer.available = false;
+            committed += 1;
             continue;
         };
         if buffer.initialized {
@@ -747,7 +831,9 @@ fn render_overlays(state: &mut UiState) {
         overlay.surface.damage_buffer(damage.x, damage.y, damage.width, damage.height);
         overlay.surface.commit();
         buffer.available = false;
+        committed += 1;
     }
+    committed
 }
 
 fn frozen_outputs_from_captures(captures: &[CapturedOutput]) -> Result<Vec<FrozenOutput>, Box<dyn Error>> {
@@ -1174,9 +1260,15 @@ impl Dispatch<WlKeyboard, ()> for UiState {
                 && matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed))
             {
                 state.long_requested = true;
+                state.long_mode = true;
                 if state.drag.is_finished() {
                     state.drag.finish(state.pointer_x, state.pointer_y);
                 }
+            } else if key == KEY_H
+                && !state.long_mode
+                && matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed))
+            {
+                toggle_frozen_frame(state);
             } else if state.drag.is_finished()
                 && matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed))
             {
@@ -1221,7 +1313,13 @@ impl Dispatch<ZwlrLayerSurfaceV1, u32> for UiState {
             overlay.height = configured_height;
             if let (Some(output), Some(frozen)) = (
                 state.outputs.iter().find(|o| o.info.global_name == *name),
-                state.frozen_outputs.iter().find(|f| f.info.global_name == *name),
+                (if state.screenshot_cursor_hidden {
+                    &state.frozen_outputs_without_cursor
+                } else {
+                    &state.frozen_outputs
+                })
+                .iter()
+                .find(|f| f.info.global_name == *name),
             ) {
                 overlay.render_cache = Some(build_overlay_render_cache(configured_width, configured_height, output.info, frozen));
             }
@@ -1244,6 +1342,7 @@ impl Dispatch<WlBuffer, BufferId> for UiState {
         {
             buffer.available = true;
         }
+        flush_pending_render(state);
     }
 }
 
@@ -1307,6 +1406,61 @@ mod tests {
     use super::*;
 
     const SELECTED: LogicalRect = LogicalRect { x: 10, y: 20, width: 30, height: 40 };
+
+    fn solid_image(width: u32, height: u32, rows: &[(u32, u32, [u8; 4])]) -> Image {
+        let stride = width * 4;
+        let mut data = vec![0u8; (stride * height) as usize];
+        for &(row_begin, row_end, pixel) in rows {
+            for y in row_begin..row_end {
+                for x in 0..width {
+                    let offset = ((y * stride) + x * 4) as usize;
+                    data[offset..offset + 4].copy_from_slice(&pixel);
+                }
+            }
+        }
+        Image {
+            width,
+            height,
+            stride,
+            format: Format::Xrgb8888,
+            data,
+        }
+    }
+
+    #[test]
+    fn preview_draws_grown_stitch_above_selection_and_keeps_hole_clear() {
+        // Output occupies global (0,0) 100x100; selection hole at local (10,20) 40x40.
+        // Stitch grew upward: current frame (40x40) sits at stitched rows 40..80,
+        // history rows 0..40 are white, current rows are black.
+        let preview = LongPreviewSnapshot {
+            image: solid_image(
+                40,
+                80,
+                &[(0, 40, [255, 255, 255, 255]), (40, 80, [0, 0, 0, 255])],
+            ),
+            current_origin_x: 0,
+            current_origin_y: 40,
+            viewport_rect: LogicalRect { x: 10, y: 20, width: 40, height: 40 },
+            capture_width: 40,
+            capture_height: 40,
+        };
+        let output_logical = LogicalRect { x: 0, y: 0, width: 100, height: 100 };
+        let selection_local = Some(LogicalRect { x: 10, y: 20, width: 40, height: 40 });
+
+        let mut data = vec![7u8; 100 * 100 * 4];
+        draw_preview_on_overlay(&mut data, 100, 100, &preview, output_logical, selection_local);
+
+        let pixel = |x: usize, y: usize| -> [u8; 4] {
+            let offset = (y * 100 + x) * 4;
+            [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]
+        };
+        // History rows above the hole are drawn opaque white.
+        assert_eq!(pixel(30, 10), [255, 255, 255, 255]);
+        // Inside the selection hole nothing is drawn (live content stays visible).
+        assert_eq!(pixel(30, 40), [7, 7, 7, 7]);
+        // Outside the stitched width nothing is drawn.
+        assert_eq!(pixel(5, 10), [7, 7, 7, 7]);
+    }
 
     #[test]
     fn overlay_pixel_dims_outside_selection() {

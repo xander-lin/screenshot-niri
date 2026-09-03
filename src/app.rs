@@ -24,30 +24,40 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
 fn run_normal(args: crate::cli::Args) -> Result<(), Box<dyn Error>> {
     crate::runtime::ensure_niri_session()?;
-    let frozen_outputs = crate::wayland::screencopy::capture_outputs(true)?;
-    let mut session = crate::wayland::selection::SelectionSession::with_frozen(&frozen_outputs)?;
-    let viewport = match session.run_selection()? {
-        crate::wayland::selection::SelectionOutcome::Selected(viewport) => viewport,
+    let frozen_outputs = crate::wayland::screencopy::capture_outputs_with_cursor()?;
+    let frozen_outputs_without_cursor = crate::wayland::screencopy::capture_outputs_without_cursor()?;
+    let mut session = crate::wayland::selection::SelectionSession::with_frozen_pair(
+        &frozen_outputs,
+        &frozen_outputs_without_cursor,
+    )?;
+    match session.run_selection()? {
+        crate::wayland::selection::SelectionOutcome::Selected(viewport) => {
+            let captures = if session.screenshot_cursor_hidden() {
+                &frozen_outputs_without_cursor
+            } else {
+                &frozen_outputs
+            };
+            session.close()?;
+            let (width, height) = viewport.capture_size()?;
+            let frame = crate::image::composite_captured_region(
+                &viewport.capture_regions(),
+                width,
+                height,
+                captures,
+            )?;
+            crate::image::write_png(&args.output_path, &frame)?;
+            crate::clipboard::serve_path_detached(&args.output_path, args.clipboard_mode)?;
+            println!("saved {}", args.output_path.display());
+            Ok(())
+        }
         crate::wayland::selection::SelectionOutcome::LongModeRequested(viewport) => {
-            return run_long_capture(args, viewport, session);
+            run_long_capture(args, viewport, session)
         }
         crate::wayland::selection::SelectionOutcome::Cancelled => {
             session.close()?;
-            return Err("selection cancelled".into());
+            Err("selection cancelled".into())
         }
-    };
-    session.close()?;
-    let (width, height) = viewport.capture_size()?;
-    let frame = crate::image::composite_captured_region(
-        &viewport.capture_regions(),
-        width,
-        height,
-        &frozen_outputs,
-    )?;
-    crate::image::write_png(&args.output_path, &frame)?;
-    crate::clipboard::serve_path_detached(&args.output_path, args.clipboard_mode)?;
-    println!("saved {}", args.output_path.display());
-    Ok(())
+    }
 }
 
 fn run_long(args: crate::cli::Args) -> Result<(), Box<dyn Error>> {
@@ -118,7 +128,7 @@ impl LongCaptureWorker {
                         Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     }
                 }
-                match session.capture_region_frame(region, false, index > 0) {
+                match session.capture_region_frame_without_cursor(region, index > 0) {
                     Ok(image) => {
                         if sender.send(CaptureMessage::Frame(image)).is_err() {
                             return;

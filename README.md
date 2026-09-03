@@ -89,6 +89,7 @@ screenshot /home/me/shots/out.png      # → /home/me/shots/out.png
 2. **Drag** with the left mouse button to select a region.
 3. **Release** — the screenshot saves and is copied to clipboard.
 4. Press **Esc** at any time to cancel.
+5. Press **H** to switch the frozen preview and saved screenshot between the frames captured with and without the cursor. The live selection cursor stays visible.
 
 ### Long/Scroll Screenshot (`--long`)
 
@@ -99,6 +100,7 @@ screenshot /home/me/shots/out.png      # → /home/me/shots/out.png
 5. Press **↑** / **↓** to hint the scroll direction for better stitching.
 6. Press **Enter** or **Space** to finish — the tool stitches all frames and saves.
 7. Press **Esc** to cancel.
+8. Long screenshots always use cursor-free capture frames; **H** applies only to normal screenshots.
 
 > **Tip**: Scroll slowly for best results. The stitcher tracks frame overlap automatically; direction hints improve accuracy with fast or jumpy scrolling.
 
