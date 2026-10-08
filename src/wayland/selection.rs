@@ -229,6 +229,11 @@ struct UiState {
     /// border), so an in-flight capture based on the pre-drag rectangle
     /// always lands on transparent pixels no matter how the box moves.
     edit_union: Option<LogicalRect>,
+    /// Global point where the selection drag started. A spanning selection
+    /// is clamped to the output containing this point — the box belongs to
+    /// the screen it was clicked on, not to whichever screen covers more of
+    /// its area.
+    selection_anchor: Option<(i32, i32)>,
     /// Visible selection-border thickness in logical pixels (configurable).
     border_width: i32,
 }
@@ -281,6 +286,7 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
         editing: false,
         edit_drag: None,
         edit_union: None,
+        selection_anchor: None,
         border_width: crate::config::DEFAULT_BORDER_WIDTH,
     };
 
@@ -582,6 +588,7 @@ impl SelectionSession {
             editing: false,
             edit_drag: None,
             edit_union: None,
+            selection_anchor: None,
             border_width: border_width.clamp(crate::config::BORDER_WIDTH_MIN, crate::config::BORDER_WIDTH_MAX),
         };
 
@@ -1070,6 +1077,25 @@ fn apply_key_action(state: &mut UiState, action: KeyAction) -> Option<OverlayInp
             state.long_mode = true;
             if state.drag.is_finished() {
                 state.drag.finish(state.pointer_x, state.pointer_y);
+            }
+            // Same anchor rule as release: a promoted spanning selection
+            // belongs to the output the drag started on.
+            if let Some(rect) = state.drag.selected_rect() {
+                if selection_spans_outputs(state, rect) {
+                    let clamped = state
+                        .selection_anchor
+                        .map(|(ax, ay)| crate::geometry::clamp_rect_to_output_at_point(
+                            rect,
+                            &state.output_infos(),
+                            ax,
+                            ay,
+                        ))
+                        .unwrap_or_else(|| crate::geometry::clamp_rect_to_largest_output(
+                            rect,
+                            &state.output_infos(),
+                        ));
+                    state.drag = DragState::Finished(clamped);
+                }
             }
             None
         }
@@ -1738,11 +1764,11 @@ impl Dispatch<WlPointer, ()> for UiState {
                                 None => updated,
                             });
                             invalidate_overlay_bases(state);
-                            render_overlays(state);
+                            queue_render(state, false);
                         }
                     }
                 } else if state.drag.update(x, y) {
-                    render_overlays(state);
+                    queue_render(state, false);
                 }
             }
             wl_pointer::Event::Button { button, state: button_state, .. } if button == BTN_LEFT => {
@@ -1770,6 +1796,7 @@ impl Dispatch<WlPointer, ()> for UiState {
                             state.edit_union = state.drag.selected_rect();
                         } else if !state.editing {
                             state.drag.begin(x, y);
+                            state.selection_anchor = Some((x, y));
                         }
                     }
                     wl_pointer::ButtonState::Released => {
@@ -1782,16 +1809,25 @@ impl Dispatch<WlPointer, ()> for UiState {
                         } else if !state.editing {
                             state.drag.finish(x, y);
                             // Long mode cannot capture a selection spanning
-                            // outputs: clamp it to the largest single-output
-                            // piece and drop into edit mode for the user to
-                            // keep adjusting the placement.
+                            // outputs: clamp it to the output where the drag
+                            // started (the screen the user clicked on) and
+                            // drop into edit mode for the user to keep
+                            // adjusting the placement.
                             if state.long_mode && state.drag.is_finished() {
                                 if let Some(rect) = state.drag.selected_rect() {
                                     if selection_spans_outputs(state, rect) {
-                                        let clamped = crate::geometry::clamp_rect_to_largest_output(
-                                            rect,
-                                            &state.output_infos(),
-                                        );
+                                        let clamped = state
+                                            .selection_anchor
+                                            .map(|(ax, ay)| crate::geometry::clamp_rect_to_output_at_point(
+                                                rect,
+                                                &state.output_infos(),
+                                                ax,
+                                                ay,
+                                            ))
+                                            .unwrap_or_else(|| crate::geometry::clamp_rect_to_largest_output(
+                                                rect,
+                                                &state.output_infos(),
+                                            ));
                                         state.drag = DragState::Finished(clamped);
                                         state.editing = true;
                                         invalidate_overlay_bases(state);
@@ -1802,7 +1838,12 @@ impl Dispatch<WlPointer, ()> for UiState {
                     }
                     _ => {}
                 }
-                render_overlays(state);
+                // Queue (rather than render directly): when one output's
+                // buffers are all busy a direct render leaves that output
+                // showing stale content — one screen red, the other white
+                // during a spanning drag. queue_render re-renders on buffer
+                // release.
+                queue_render(state, false);
             }
             // Axis (wheel) events are intentionally ignored: edit mode keeps
             // pointer input on the overlay so scrolling stops here and the
@@ -2301,6 +2342,7 @@ mod tests {
             editing: false,
             edit_drag: None,
             edit_union: None,
+            selection_anchor: None,
             border_width: crate::config::DEFAULT_BORDER_WIDTH,
         }
     }

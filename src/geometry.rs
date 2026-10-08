@@ -85,6 +85,25 @@ pub fn clamp_rect_to_largest_output(rect: LogicalRect, outputs: &[OutputInfo]) -
         .unwrap_or(rect)
 }
 
+/// Clamps a spanning selection to the output that contains the point where
+/// the drag started: the box belongs to the screen you clicked on, no matter
+/// how much of it ends up on another screen. Falls back to the largest
+/// piece when the point lies on no output.
+pub fn clamp_rect_to_output_at_point(
+    rect: LogicalRect,
+    outputs: &[OutputInfo],
+    x: i32,
+    y: i32,
+) -> LogicalRect {
+    let anchor_output = outputs.iter().find(|output| {
+        x >= output.logical.x && x < output.logical.right() && y >= output.logical.y && y < output.logical.bottom()
+    });
+    match anchor_output {
+        Some(output) => rect.intersection(output.logical).unwrap_or(rect),
+        None => clamp_rect_to_largest_output(rect, outputs),
+    }
+}
+
 impl SelectedViewport {
     pub fn from_outputs(rect: LogicalRect, outputs: &[OutputInfo]) -> Result<Self, String> {
         if rect.is_empty() {
@@ -241,5 +260,30 @@ mod tests {
         // No overlap: returned unchanged (callers treat it as an error case).
         let outside = LogicalRect { x: 500, y: 500, width: 10, height: 10 };
         assert_eq!(clamp_rect_to_largest_output(outside, &outputs), outside);
+    }
+
+    #[test]
+    fn clamp_to_output_at_point_follows_the_click_anchor() {
+        let outputs = [
+            OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 0, width: 100, height: 80 }, scale: 1 },
+            OutputInfo { global_name: 2, logical: LogicalRect { x: 100, y: 0, width: 100, height: 80 }, scale: 1 },
+        ];
+        // Mostly on the right output, but the drag started on the left one:
+        // the box belongs to the screen the user clicked on.
+        let mostly_right = LogicalRect { x: 80, y: 10, width: 40, height: 30 };
+        assert_eq!(
+            clamp_rect_to_output_at_point(mostly_right, &outputs, 85, 50),
+            LogicalRect { x: 80, y: 10, width: 20, height: 30 }
+        );
+        // Started on the right screen: keep the right piece instead.
+        assert_eq!(
+            clamp_rect_to_output_at_point(mostly_right, &outputs, 130, 50),
+            LogicalRect { x: 100, y: 10, width: 20, height: 30 }
+        );
+        // Anchor on no output falls back to the largest piece.
+        assert_eq!(
+            clamp_rect_to_output_at_point(mostly_right, &outputs, 500, 500),
+            clamp_rect_to_largest_output(mostly_right, &outputs)
+        );
     }
 }

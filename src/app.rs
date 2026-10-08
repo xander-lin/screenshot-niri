@@ -36,6 +36,27 @@ fn inset_capture_region(
     }
 }
 
+/// Logical screen rectangle a capture region actually covers: the inset
+/// region in output-local buffer coordinates mapped back through the
+/// output's logical origin and scale. The preview must map stitched
+/// content through this rectangle — using the un-inset selection box
+/// would offset the preview by the inset, and after an E-extend the new
+/// capture region would re-capture those shifted preview pixels into the
+/// stitch as misaligned seams.
+fn capture_region_logical_rect(
+    region: CaptureOutputRegion,
+    outputs: &[crate::geometry::OutputInfo],
+) -> Option<crate::geometry::LogicalRect> {
+    let output = outputs.iter().find(|o| o.global_name == region.output_name)?;
+    let scale = output.scale.max(1);
+    Some(crate::geometry::LogicalRect {
+        x: output.logical.x + region.region.x.div_euclid(scale),
+        y: output.logical.y + region.region.y.div_euclid(scale),
+        width: region.region.width.div_euclid(scale),
+        height: region.region.height.div_euclid(scale),
+    })
+}
+
 pub fn run() -> Result<(), Box<dyn Error>> {
     let config = crate::config::Config::load();
     match Command::parse()? {
@@ -338,15 +359,26 @@ fn run_long_capture(
                 if matches!(outcome, PushResult::Initialized | PushResult::Accepted { .. }) {
                     if let Some(s) = stitcher.stitched() {
                         if let Ok(image) = crate::stitch::image_from_stitched_frame(s) {
+                            // Map the preview through the frame's own capture
+                            // region (the inset rectangle the stitched content
+                            // actually came from), not the un-inset selection
+                            // box: they differ by the one-pixel inset, and a
+                            // preview offset from the real screen content
+                            // gets re-captured after selection-box edits.
+                            let preview_viewport = capture_region_logical_rect(
+                                region,
+                                &selection_session.output_infos(),
+                            )
+                            .unwrap_or(live_rect);
                             let (capture_width, capture_height) = (
-                                u32::try_from(live_region.region.width.max(0)).unwrap_or(1),
-                                u32::try_from(live_region.region.height.max(0)).unwrap_or(1),
+                                u32::try_from(region.region.width.max(1)).unwrap_or(1),
+                                u32::try_from(region.region.height.max(1)).unwrap_or(1),
                             );
                             let snapshot = crate::wayland::selection::LongPreviewSnapshot {
                                 image,
                                 current_origin_x: s.current_origin_x,
                                 current_origin_y: s.current_origin_y,
-                                viewport_rect: live_rect,
+                                viewport_rect: preview_viewport,
                                 capture_width: capture_width.max(1),
                                 capture_height: capture_height.max(1),
                             };
@@ -563,6 +595,25 @@ mod tests {
         // A selection off every output is equally unmappable.
         let outside = crate::geometry::LogicalRect { x: -500, y: -500, width: 10, height: 10 };
         assert!(prepare_capture_region(outside, &outputs).is_none());
+    }
+
+    #[test]
+    fn capture_region_logical_rect_maps_inset_region_back_to_screen() {
+        // The preview must map stitched content through the region frames
+        // actually came from: output at (1920,0), inset buffer rect
+        // (101,201) 298x398 must land at logical (2021,201) 298x398.
+        let outputs = vec![crate::geometry::OutputInfo {
+            global_name: 1,
+            logical: crate::geometry::LogicalRect { x: 1920, y: 0, width: 1920, height: 1080 },
+            scale: 1,
+        }];
+        let region = region_at(101, 201, 298, 398);
+        assert_eq!(
+            capture_region_logical_rect(region, &outputs),
+            Some(crate::geometry::LogicalRect { x: 2021, y: 201, width: 298, height: 398 })
+        );
+        // Unknown output: unmappable.
+        assert!(capture_region_logical_rect(region, &[]).is_none());
     }
 
     #[test]

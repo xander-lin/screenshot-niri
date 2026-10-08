@@ -50,7 +50,7 @@
 
 ## `geometry`
 
-- Responsibilities: convert logical selected rectangles into per-output capture regions.
+- Responsibilities: convert logical selected rectangles into per-output capture regions; clamp spanning selections to the output containing the drag's start point (`clamp_rect_to_output_at_point`, falling back to the largest piece only when the anchor lies on no output).
 - Non-responsibilities: pointer input, Wayland registry handling, and pixel copying.
 - Inputs: selected logical rect and logical output metadata.
 - Outputs: selected viewport and scaled capture regions.
