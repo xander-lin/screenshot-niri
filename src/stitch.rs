@@ -3760,6 +3760,48 @@ mod tests {
     }
 
     #[test]
+    fn geometry_offset_accounts_for_fixed_top_band_anchor() {
+        let mut stitcher = RawStitcher::new();
+        // Rows carry their frame-local index so placements are distinguishable.
+        let first = frame(4, 4, 90);
+        assert!(matches!(
+            stitcher.push_frame_with_offset(&first, &first, None, FrameScreenOffset { x: 0, y: 0 }),
+            Ok(PushResult::Initialized)
+        ));
+
+        // Simulate a detected fixed top band: the active crop's top row sits
+        // two screen rows below the region top (crop.y == 2).
+        let crop = FixedBands { top: 2, bottom: 0 }.active_crop(4, 4).unwrap();
+        stitcher.active_crop = Some(crop);
+
+        // The selection box extends upward, so the new region's top row is two
+        // rows above the previous offset: same crop-anchored screen content.
+        let mut taller = frame(4, 6, 90);
+        for y in 0..6 {
+            for x in 0..4 {
+                let offset = (y * taller.stride + x * 3) as usize;
+                taller.data[offset..offset + 3].copy_from_slice(&[40 + y as u8; 3]);
+            }
+        }
+        let taller_analysis = taller.clone();
+        let result = stitcher
+            .push_frame_with_offset(&taller, &taller_analysis, None, FrameScreenOffset { x: 0, y: -2 })
+            .unwrap();
+        assert!(matches!(result, PushResult::Accepted { .. }));
+
+        // delta_y = new_offset.y - (last_offset.y + crop.y) = -2 - 2 = -4, so
+        // the 6-row frame tops out 4 canvas rows above the old viewport and
+        // the canvas grows upward: old rows shift to 4..8, frame rows 0..6.
+        let stitched = stitcher.stitched().unwrap();
+        assert_eq!(stitched.height, 8);
+        assert_eq!(stitched.current_origin_y, 0);
+        // Canvas row 0 shows the frame's top row; the old content moved down
+        // by exactly the anchor-corrected delta.
+        assert_eq!(taller.data[0], stitched.data[0]);
+        assert_eq!(first.data[0], stitched.data[(4 * stitched.stride) as usize]);
+    }
+
+    #[test]
     fn converts_uncovered_stitched_corners_to_transparent() {
         let previous = frame(4, 2, 10);
         let mut stitched = StitchedFrame::from_first_frame(&previous);

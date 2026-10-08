@@ -217,13 +217,8 @@ fn run_long_capture(
                 let _ = ack.send(());
             }
             Ok(CaptureMessage::Frame { image, region }) => {
-                // Near-duplicate frames are skipped only while the selection
-                // geometry is unchanged: an edit-mode resize produces frames
-                // that are mostly identical yet carry brand-new strips.
-                if let Some((prev_region, ref prev)) = prev_raw {
-                    if prev_region == region && raw_frame_nearly_identical(prev, &image) {
-                        continue;
-                    }
+                if should_skip_duplicate_frame(prev_raw.as_ref().map(|(r, i)| (*r, i)), region, &image) {
+                    continue;
                 }
                 prev_raw = Some((region, image));
                 let direction: Option<LongDirection> = match selection_session.long_direction() {
@@ -362,4 +357,90 @@ fn raw_frame_nearly_identical(a: &crate::image::Image, b: &crate::image::Image) 
     if samples == 0 { return false; }
     // Average channel difference < 0.5 means nearly identical
     (total_diff as f64 / samples as f64 / 3.0) < 0.5
+}
+
+/// Near-duplicate frames are skipped only while the capture region is
+/// unchanged: an edit-mode resize produces frames that are mostly identical
+/// yet carry brand-new strips that must reach the stitcher.
+fn should_skip_duplicate_frame(
+    previous: Option<(CaptureOutputRegion, &crate::image::Image)>,
+    region: CaptureOutputRegion,
+    current: &crate::image::Image,
+) -> bool {
+    match previous {
+        Some((previous_region, previous)) => {
+            previous_region == region && raw_frame_nearly_identical(previous, current)
+        }
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::image::Image;
+    use crate::wayland::screencopy::Region;
+    use wayland_client::protocol::wl_shm::Format;
+
+    fn region_at(x: i32, y: i32, w: i32, h: i32) -> CaptureOutputRegion {
+        CaptureOutputRegion { output_name: 1, region: Region { x, y, width: w, height: h }, dst_x: 0, dst_y: 0 }
+    }
+
+    fn solid(width: u32, height: u32, value: u8) -> Image {
+        let stride = width * 4;
+        Image {
+            width,
+            height,
+            stride,
+            format: Format::Xrgb8888,
+            data: vec![value; (stride * height) as usize],
+        }
+    }
+
+    #[test]
+    fn frame_interval_matches_configured_rate() {
+        assert_eq!(long_frame_interval(60), Duration::from_nanos(1_000_000_000 / 60));
+        assert_eq!(long_frame_interval(1), Duration::from_secs(1));
+        assert_eq!(long_frame_interval(240), Duration::from_nanos(1_000_000_000 / 240));
+        // Degenerate zero falls back to a 1 fps crawl instead of dividing by zero.
+        assert_eq!(long_frame_interval(0), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn identical_frames_with_same_region_are_skipped() {
+        let previous = solid(8, 8, 100);
+        assert!(should_skip_duplicate_frame(
+            Some((region_at(10, 10, 8, 8), &previous)),
+            region_at(10, 10, 8, 8),
+            &solid(8, 8, 100),
+        ));
+    }
+
+    #[test]
+    fn identical_frames_with_changed_region_are_not_skipped() {
+        // The static-footer workflow: after extending the selection box the
+        // frame content is nearly identical, but the new strip must be kept.
+        let previous = solid(8, 8, 100);
+        assert!(!should_skip_duplicate_frame(
+            Some((region_at(10, 10, 8, 8), &previous)),
+            region_at(10, 10, 8, 12),
+            &solid(8, 8, 100),
+        ));
+        assert!(!should_skip_duplicate_frame(
+            Some((region_at(10, 10, 8, 8), &previous)),
+            region_at(12, 10, 8, 8),
+            &solid(8, 8, 100),
+        ));
+    }
+
+    #[test]
+    fn differing_frames_and_first_frame_are_not_skipped() {
+        let previous = solid(8, 8, 100);
+        assert!(!should_skip_duplicate_frame(
+            Some((region_at(10, 10, 8, 8), &previous)),
+            region_at(10, 10, 8, 8),
+            &solid(8, 8, 220),
+        ));
+        assert!(!should_skip_duplicate_frame(None, region_at(10, 10, 8, 8), &solid(8, 8, 100)));
+    }
 }

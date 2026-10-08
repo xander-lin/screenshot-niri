@@ -866,20 +866,121 @@ fn digit_key_index(key: u32) -> Option<usize> {
     }
 }
 
+/// Decisions the keyboard can make over pure selection state. The Wayland
+/// dispatch impl turns these into side effects; keeping the decision pure
+/// makes the modal transitions unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyAction {
+    Cancel,
+    ToggleEdit,
+    PromoteLong,
+    ToggleCursorFrame,
+    /// Enter/Space: leave edit mode (confirming the adjusted rectangle) and
+    /// finish a running long capture.
+    ConfirmSelection,
+    HintDirection(SearchDirection),
+    CaptureOutputByIndex(usize),
+    Ignore,
+}
+
+fn resolve_key_action(state: &UiState, key: u32) -> KeyAction {
+    if key == KEY_ESC {
+        KeyAction::Cancel
+    } else if key == KEY_E {
+        if state.drag.current_rect().is_some() {
+            KeyAction::ToggleEdit
+        } else {
+            KeyAction::Ignore
+        }
+    } else if key == KEY_L {
+        KeyAction::PromoteLong
+    } else if key == KEY_H && !state.long_mode {
+        KeyAction::ToggleCursorFrame
+    } else if (key == KEY_ENTER || key == KEY_SPACE)
+        && (state.editing || (state.long_mode && state.drag.is_finished()))
+    {
+        KeyAction::ConfirmSelection
+    } else if state.long_mode && state.drag.is_finished() {
+        match key {
+            KEY_DOWN => KeyAction::HintDirection(SearchDirection::Down),
+            KEY_UP => KeyAction::HintDirection(SearchDirection::Up),
+            KEY_LEFT => KeyAction::HintDirection(SearchDirection::Left),
+            KEY_RIGHT => KeyAction::HintDirection(SearchDirection::Right),
+            _ => KeyAction::Ignore,
+        }
+    } else if !state.long_mode && state.drag == DragState::Idle {
+        digit_key_index(key).map_or(KeyAction::Ignore, KeyAction::CaptureOutputByIndex)
+    } else {
+        KeyAction::Ignore
+    }
+}
+
+/// Overlay pointer-input change requested by an applied key action; the
+/// dispatcher performs the actual Wayland input-region update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayInputMode {
+    Interactive,
+    Passthrough,
+}
+
+fn apply_key_action(state: &mut UiState, action: KeyAction) -> Option<OverlayInputMode> {
+    match action {
+        KeyAction::Cancel => {
+            state.editing = false;
+            state.edge_drag = None;
+            state.drag = DragState::Cancelled;
+            None
+        }
+        KeyAction::ToggleEdit => toggle_edit_mode(state),
+        KeyAction::PromoteLong => {
+            state.editing = false;
+            state.edge_drag = None;
+            state.long_requested = true;
+            state.long_mode = true;
+            if state.drag.is_finished() {
+                state.drag.finish(state.pointer_x, state.pointer_y);
+            }
+            None
+        }
+        KeyAction::ToggleCursorFrame => {
+            toggle_frozen_frame(state);
+            None
+        }
+        KeyAction::ConfirmSelection => {
+            state.editing = false;
+            state.edge_drag = None;
+            if state.long_mode && state.drag.is_finished() {
+                state.long_finish_requested = true;
+            }
+            None
+        }
+        KeyAction::HintDirection(direction) => {
+            state.long_direction = Some(direction);
+            None
+        }
+        KeyAction::CaptureOutputByIndex(index) => {
+            if let Some(rect) = full_output_rect_by_index(&state.output_infos(), index) {
+                state.drag = DragState::Finished(rect);
+            }
+            None
+        }
+        KeyAction::Ignore => None,
+    }
+}
+
 /// Toggles selection-box edit mode (E key). Entering edit mode finalizes an
-/// in-progress drag into an adjustable rectangle; in long mode it also grabs
-/// pointer input (blocking wheel scroll). Leaving edit mode restores long
-/// mode pointer passthrough.
-fn handle_edit_toggle(state: &mut UiState, qh: &QueueHandle<UiState>) {
+/// in-progress drag into an adjustable rectangle; in long mode the overlay
+/// must grab (or release) pointer input, which also blocks wheel scroll.
+/// Returns the required overlay input mode in long mode, `None` otherwise.
+fn toggle_edit_mode(state: &mut UiState) -> Option<OverlayInputMode> {
     if state.editing {
         state.editing = false;
         state.edge_drag = None;
-        if state.long_mode {
-            let _ = set_overlay_pointer_passthrough(state, qh);
-        }
+        let mode = state.long_mode.then_some(OverlayInputMode::Passthrough);
         invalidate_overlay_bases(state);
         render_overlays(state);
-    } else if state.drag.current_rect().is_some() {
+        mode
+    } else {
         if let DragState::Dragging { .. } = state.drag {
             let (x, y) = state
                 .pointer_global_position()
@@ -888,11 +989,10 @@ fn handle_edit_toggle(state: &mut UiState, qh: &QueueHandle<UiState>) {
         }
         state.editing = true;
         state.edge_drag = None;
-        if state.long_mode {
-            set_overlay_pointer_input_interactive(state);
-        }
+        let mode = state.long_mode.then_some(OverlayInputMode::Interactive);
         invalidate_overlay_bases(state);
         render_overlays(state);
+        mode
     }
 }
 
@@ -1523,50 +1623,16 @@ impl Dispatch<WlKeyboard, ()> for UiState {
             if !matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed)) {
                 return;
             }
-            if key == KEY_ESC {
-                state.editing = false;
-                state.edge_drag = None;
-                state.drag = DragState::Cancelled;
-            } else if key == KEY_E {
-                handle_edit_toggle(state, qh);
-            } else if key == KEY_L {
-                state.editing = false;
-                state.edge_drag = None;
-                state.long_requested = true;
-                state.long_mode = true;
-                if state.drag.is_finished() {
-                    state.drag.finish(state.pointer_x, state.pointer_y);
-                }
-            } else if key == KEY_H && !state.long_mode {
-                toggle_frozen_frame(state);
-            } else if key == KEY_ENTER || key == KEY_SPACE {
-                // Confirm the edited rectangle: leaving edit mode lets the
-                // selection loop return the adjusted rect (and finishes a
-                // running long capture).
-                state.editing = false;
-                state.edge_drag = None;
-                if state.long_mode && state.drag.is_finished() {
-                    state.long_finish_requested = true;
-                }
-            } else if state.long_mode && state.drag.is_finished() {
-                match key {
-                    KEY_DOWN => {
-                        state.long_direction = Some(SearchDirection::Down);
+            let action = resolve_key_action(state, key);
+            if matches!(action, KeyAction::Ignore) {
+                return;
+            }
+            if let Some(mode) = apply_key_action(state, action) {
+                match mode {
+                    OverlayInputMode::Interactive => set_overlay_pointer_input_interactive(state),
+                    OverlayInputMode::Passthrough => {
+                        let _ = set_overlay_pointer_passthrough(state, qh);
                     }
-                    KEY_UP => {
-                        state.long_direction = Some(SearchDirection::Up);
-                    }
-                    KEY_LEFT => {
-                        state.long_direction = Some(SearchDirection::Left);
-                    }
-                    KEY_RIGHT => {
-                        state.long_direction = Some(SearchDirection::Right);
-                    }
-                    _ => {}
-                }
-            } else if !state.long_mode && state.drag == DragState::Idle {
-                if let Some(rect) = digit_key_index(key).and_then(|index| full_output_rect_by_index(&state.output_infos(), index)) {
-                    state.drag = DragState::Finished(rect);
                 }
             }
         }
@@ -1747,6 +1813,38 @@ mod tests {
     }
 
     #[test]
+    fn preview_skips_transparent_stitched_pixels() {
+        // A ragged stitched canvas marks never-captured corners transparent;
+        // the preview must leave the dimmed overlay visible beneath them
+        // instead of painting them black.
+        let preview = LongPreviewSnapshot {
+            image: solid_image(
+                2,
+                2,
+                &[(0, 1, [255, 255, 255, 255]), (1, 2, [255, 255, 255, 0])],
+            ),
+            current_origin_x: 0,
+            current_origin_y: 0,
+            viewport_rect: LogicalRect { x: 0, y: 0, width: 2, height: 2 },
+            capture_width: 2,
+            capture_height: 2,
+        };
+        let output_logical = LogicalRect { x: 0, y: 0, width: 2, height: 2 };
+
+        let mut data = vec![7u8; 2 * 2 * 4];
+        draw_preview_on_overlay(&mut data, 2, 2, &preview, output_logical, None);
+
+        let pixel = |x: usize, y: usize| -> [u8; 4] {
+            let offset = (y * 2 + x) * 4;
+            [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]
+        };
+        // Covered row is drawn opaque.
+        assert_eq!(pixel(0, 0), [255, 255, 255, 255]);
+        // Transparent row leaves the underlying overlay pixel untouched.
+        assert_eq!(pixel(0, 1), [7, 7, 7, 7]);
+    }
+
+    #[test]
     fn digit_key_maps_to_zero_based_index() {
         assert_eq!(digit_key_index(KEY_DIGIT_FIRST), Some(0));
         assert_eq!(digit_key_index(KEY_DIGIT_LAST), Some(8));
@@ -1812,6 +1910,139 @@ mod tests {
         assert_eq!(apply_edge_drag(rect, SelectionEdge::Right, 0, 115, bounds).width, MIN_SELECTION_SIZE);
         assert_eq!(apply_edge_drag(rect, SelectionEdge::Top, 115, 0, bounds).y, 90);
         assert_eq!(apply_edge_drag(rect, SelectionEdge::Bottom, 115, 500, bounds).height, 50);
+    }
+
+    fn ui_state() -> UiState {
+        UiState {
+            compositor: None,
+            shm: None,
+            layer_shell: None,
+            xdg_output_manager: None,
+            seat: None,
+            pointer: None,
+            keyboard: None,
+            outputs: Vec::new(),
+            frozen_outputs: Vec::new(),
+            frozen_outputs_without_cursor: Vec::new(),
+            overlays: Vec::new(),
+            pointer_output_name: None,
+            long_mode: false,
+            screenshot_cursor_hidden: true,
+            pointer_x: 0,
+            pointer_y: 0,
+            drag: DragState::Idle,
+            long_requested: false,
+            long_finish_requested: false,
+            long_direction: None,
+            long_preview: None,
+            pending_render: None,
+            editing: false,
+            edge_drag: None,
+        }
+    }
+
+    #[test]
+    fn enter_key_resolves_to_confirm_while_editing_normal_selection() {
+        let mut state = ui_state();
+        state.drag = DragState::Finished(SELECTED);
+        state.editing = true;
+        assert_eq!(resolve_key_action(&state, KEY_ENTER), KeyAction::ConfirmSelection);
+        assert_eq!(resolve_key_action(&state, KEY_SPACE), KeyAction::ConfirmSelection);
+        // Confirming leaves edit mode so the selection loop returns the rect.
+        apply_key_action(&mut state, KeyAction::ConfirmSelection);
+        assert!(!state.editing);
+        assert_eq!(state.drag, DragState::Finished(SELECTED));
+    }
+
+    #[test]
+    fn enter_key_finishes_long_capture_from_edit_mode() {
+        let mut state = ui_state();
+        state.long_mode = true;
+        state.drag = DragState::Finished(SELECTED);
+        state.editing = true;
+        let action = resolve_key_action(&state, KEY_ENTER);
+        apply_key_action(&mut state, action);
+        assert!(!state.editing);
+        assert!(state.long_finish_requested);
+    }
+
+    #[test]
+    fn e_key_finalizes_drag_into_editable_rectangle() {
+        let mut state = ui_state();
+        state.pointer_x = 50;
+        state.pointer_y = 40;
+        state.drag = DragState::Dragging { origin_x: 10, origin_y: 10, current_x: 50, current_y: 40 };
+        assert_eq!(resolve_key_action(&state, KEY_E), KeyAction::ToggleEdit);
+        let mode = apply_key_action(&mut state, KeyAction::ToggleEdit);
+        // Normal mode never changes overlay input mode.
+        assert_eq!(mode, None);
+        assert!(state.editing);
+        assert_eq!(state.drag, DragState::Finished(LogicalRect::from_points(10, 10, 50, 40)));
+    }
+
+    #[test]
+    fn e_key_toggle_requests_pointer_input_modes_only_in_long_mode() {
+        let mut state = ui_state();
+        state.long_mode = true;
+        state.drag = DragState::Finished(SELECTED);
+        assert_eq!(
+            apply_key_action(&mut state, KeyAction::ToggleEdit),
+            Some(OverlayInputMode::Interactive)
+        );
+        assert!(state.editing);
+        assert_eq!(
+            apply_key_action(&mut state, KeyAction::ToggleEdit),
+            Some(OverlayInputMode::Passthrough)
+        );
+        assert!(!state.editing);
+    }
+
+    #[test]
+    fn e_key_is_ignored_without_a_selection() {
+        let mut state = ui_state();
+        assert_eq!(resolve_key_action(&state, KEY_E), KeyAction::Ignore);
+        apply_key_action(&mut state, KeyAction::Ignore);
+        assert!(!state.editing);
+        assert_eq!(state.drag, DragState::Idle);
+    }
+
+    #[test]
+    fn escape_cancels_and_leaves_edit_mode() {
+        let mut state = ui_state();
+        state.drag = DragState::Finished(SELECTED);
+        state.editing = true;
+        state.edge_drag = Some(SelectionEdge::Left);
+        assert_eq!(resolve_key_action(&state, KEY_ESC), KeyAction::Cancel);
+        apply_key_action(&mut state, KeyAction::Cancel);
+        assert!(!state.editing);
+        assert_eq!(state.edge_drag, None);
+        assert_eq!(state.drag, DragState::Cancelled);
+    }
+
+    #[test]
+    fn arrow_keys_hint_directions_during_long_capture_only() {
+        let mut state = ui_state();
+        state.long_mode = true;
+        state.drag = DragState::Finished(SELECTED);
+        assert_eq!(resolve_key_action(&state, KEY_LEFT), KeyAction::HintDirection(SearchDirection::Left));
+        assert_eq!(resolve_key_action(&state, KEY_RIGHT), KeyAction::HintDirection(SearchDirection::Right));
+        apply_key_action(&mut state, KeyAction::HintDirection(SearchDirection::Right));
+        assert_eq!(state.long_direction, Some(SearchDirection::Right));
+
+        // Outside a finished long capture the arrows do nothing.
+        let plain = ui_state();
+        assert_eq!(resolve_key_action(&plain, KEY_LEFT), KeyAction::Ignore);
+    }
+
+    #[test]
+    fn promote_long_resets_edit_mode() {
+        let mut state = ui_state();
+        state.drag = DragState::Finished(SELECTED);
+        state.editing = true;
+        apply_key_action(&mut state, KeyAction::PromoteLong);
+        assert!(!state.editing);
+        assert!(state.long_mode);
+        assert!(state.long_requested);
     }
 
     #[test]
