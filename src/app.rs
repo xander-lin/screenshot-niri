@@ -88,6 +88,7 @@ enum CaptureMessage {
 
 struct LongCaptureWorker {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
     region: std::sync::Arc<std::sync::Mutex<CaptureOutputRegion>>,
     receiver: mpsc::Receiver<CaptureMessage>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -96,9 +97,11 @@ struct LongCaptureWorker {
 impl LongCaptureWorker {
     fn start(region: CaptureOutputRegion, max_frame_rate: u32) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let region = std::sync::Arc::new(std::sync::Mutex::new(region));
         let (sender, receiver) = mpsc::sync_channel::<CaptureMessage>(4);
         let thread_stop = std::sync::Arc::clone(&stop);
+        let thread_paused = std::sync::Arc::clone(&paused);
         let thread_region = std::sync::Arc::clone(&region);
         let frame_interval = long_frame_interval(max_frame_rate);
         let thread = std::thread::spawn(move || {
@@ -113,6 +116,12 @@ impl LongCaptureWorker {
             let mut last: Option<std::time::Instant> = None;
             let mut index: usize = 0;
             while !thread_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // While an edit-mode edge drag is in progress the box geometry
+                // is in flux; idle instead of capturing intermediate sizes.
+                if thread_paused.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
                 if index > 0 {
                     if let Some(prev) = last {
                         while prev.elapsed() < frame_interval {
@@ -157,7 +166,7 @@ impl LongCaptureWorker {
             }
             let _ = sender.send(CaptureMessage::Finished);
         });
-        Self { stop, region, receiver, thread: Some(thread) }
+        Self { stop, paused, region, receiver, thread: Some(thread) }
     }
 
     /// Updates the capture region used for subsequent frames. Selection-box
@@ -166,6 +175,13 @@ impl LongCaptureWorker {
         if let Ok(mut current) = self.region.lock() {
             *current = region;
         }
+    }
+
+    /// Pauses or resumes frame capture. Paused while an edit-mode edge drag
+    /// reshapes the selection box; resumed on release so the next frame uses
+    /// the settled geometry.
+    fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn recv_timeout(&self, dur: Duration) -> Result<CaptureMessage, RecvTimeoutError> {
@@ -286,6 +302,9 @@ fn run_long_capture(
             break;
         }
         let _ = selection_session.dispatch_poll(0);
+        // Pause capture while an edit-mode edge drag is reshaping the box;
+        // resume on release so the next frame captures the settled geometry.
+        worker.set_paused(selection_session.edge_drag_active());
         // Follow selection-box edits made in edit mode: the worker region and
         // the preview mapping track the adjusted rectangle, and each frame is
         // tagged with the region it was captured from so the stitcher can

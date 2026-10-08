@@ -41,7 +41,10 @@ const KEY_LEFT: u32 = 105;
 const KEY_RIGHT: u32 = 106;
 const KEY_DIGIT_FIRST: u32 = 2;
 const KEY_DIGIT_LAST: u32 = 10;
-const OVERLAY_BUFFER_COUNT: usize = 3;
+/// Two full-resolution buffers per overlay suffice for the 30 fps preview
+/// cadence; each extra buffer costs one full-screen RGBA allocation per
+/// output for the whole session.
+const OVERLAY_BUFFER_COUNT: usize = 2;
 const SELECTION_BORDER_WIDTH: i32 = 3;
 /// Logical-pixel snap range around each selection edge in edit mode.
 const EDGE_SNAP_RANGE: i32 = 8;
@@ -542,6 +545,13 @@ impl SelectionSession {
     /// selection-box edits made during capture.
     pub fn selection_rect(&self) -> Option<LogicalRect> {
         self.state.drag.selected_rect()
+    }
+
+    /// Whether an edit-mode edge drag is currently in progress. The capture
+    /// loop pauses frame requests while this is true: intermediate box sizes
+    /// must not be captured, only the settled rectangle after release.
+    pub fn edge_drag_active(&self) -> bool {
+        self.state.edge_drag.is_some()
     }
 
     /// Advertised output geometry, for recomputing viewports after the
@@ -1139,7 +1149,7 @@ fn render_overlays(state: &mut UiState) -> usize {
             continue;
         };
         let Some(render_cache) = overlay.render_cache.as_ref() else {
-            draw_overlay_dim_with_selection(data, overlay.width, overlay.height, rect);
+            draw_overlay_dim_with_selection(data, overlay.width, overlay.height, output.info, rect);
             buffer.initialized = true;
             overlay.surface.attach(Some(&buffer.buffer), 0, 0);
             overlay.surface.damage_buffer(0, 0, overlay.width, overlay.height);
@@ -1309,7 +1319,30 @@ fn overlay_pixel(global_x: i32, global_y: i32, selected: Option<LogicalRect>) ->
     selected_overlay_pixel(global_x, global_y, rect)
 }
 
-fn draw_overlay_dim_with_selection(data: &mut [u8], width: i32, height: i32, selected: Option<LogicalRect>) {
+/// Maps a selection rectangle into this overlay's buffer pixels: intersect
+/// with the output's real logical geometry (the selection lives in global
+/// logical coordinates), then scale logical to buffer pixels. A pseudo
+/// `(0,0,buffer)` rect would misplace or hide the box on outputs that are
+/// not at the logical origin or have a scale factor.
+fn selected_buffer_rect(output: OutputInfo, selected: LogicalRect, buffer_width: i32, buffer_height: i32) -> Option<LogicalRect> {
+    let local = selected_local_intersection(output.logical, selected)?;
+    let scale = output.scale.max(1);
+    LogicalRect {
+        x: local.x.saturating_mul(scale),
+        y: local.y.saturating_mul(scale),
+        width: local.width.saturating_mul(scale),
+        height: local.height.saturating_mul(scale),
+    }
+    .intersection(LogicalRect { x: 0, y: 0, width: buffer_width, height: buffer_height })
+}
+
+fn draw_overlay_dim_with_selection(
+    data: &mut [u8],
+    width: i32,
+    height: i32,
+    output: OutputInfo,
+    selected: Option<LogicalRect>,
+) {
     let stride = width.max(0) as usize * 4;
     for y in 0..height.max(0) as usize {
         for x in 0..width.max(0) as usize {
@@ -1318,12 +1351,7 @@ fn draw_overlay_dim_with_selection(data: &mut [u8], width: i32, height: i32, sel
         }
     }
     if let Some(sel) = selected {
-        let local = selected_local_intersection_for_buffer(
-            LogicalRect { x: 0, y: 0, width, height },
-            sel,
-            width, height,
-        );
-        if let Some(local) = local {
+        if let Some(local) = selected_buffer_rect(output, sel, width, height) {
             for y in local.y..local.y + local.height {
                 for x in local.x..local.x + local.width {
                     let offset = (y as usize) * stride + (x as usize) * 4;
@@ -1842,6 +1870,75 @@ mod tests {
         assert_eq!(pixel(0, 0), [255, 255, 255, 255]);
         // Transparent row leaves the underlying overlay pixel untouched.
         assert_eq!(pixel(0, 1), [7, 7, 7, 7]);
+    }
+
+    #[test]
+    fn dim_selection_draws_box_for_offset_outputs() {
+        // Second output at global logical x=1920: the selection box must be
+        // drawn on that output's buffer (regression: a pseudo (0,0) output
+        // rect pushed the box off-buffer and nothing was visible).
+        let output = OutputInfo {
+            global_name: 2,
+            logical: LogicalRect { x: 1920, y: 0, width: 100, height: 100 },
+            scale: 1,
+        };
+        let mut data = vec![0u8; 100 * 100 * 4];
+        draw_overlay_dim_with_selection(
+            &mut data,
+            100,
+            100,
+            output,
+            Some(LogicalRect { x: 1920 + 20, y: 10, width: 30, height: 40 }),
+        );
+
+        let pixel = |x: usize, y: usize| -> [u8; 4] {
+            let offset = (y * 100 + x) * 4;
+            [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]
+        };
+        // Border row just above the box top edge (local x 20, y 9) is white.
+        assert_eq!(pixel(20, 9), OVERLAY_BORDER_WHITE_BGRA);
+        // Inside the box is transparent; outside stays dimmed.
+        assert_eq!(pixel(35, 30), OVERLAY_SELECTED_TRANSPARENT_BGRA);
+        assert_eq!(pixel(5, 5), OVERLAY_OUTSIDE_MASK_BGRA);
+    }
+
+    #[test]
+    fn dim_selection_scales_logical_to_buffer_pixels() {
+        // Fractional-free scale 2: a logical 30x40 box at (20,10) must land
+        // at buffer (40,20) with size 60x80 on a 200x200 buffer.
+        let output = OutputInfo {
+            global_name: 1,
+            logical: LogicalRect { x: 0, y: 0, width: 100, height: 100 },
+            scale: 2,
+        };
+        let mut data = vec![0u8; 200 * 200 * 4];
+        draw_overlay_dim_with_selection(
+            &mut data,
+            200,
+            200,
+            output,
+            Some(LogicalRect { x: 20, y: 10, width: 30, height: 40 }),
+        );
+
+        let pixel = |x: usize, y: usize| -> [u8; 4] {
+            let offset = (y * 200 + x) * 4;
+            [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]
+        };
+        // Border above the scaled box top (buffer y 19, x 40) is white.
+        assert_eq!(pixel(40, 19), OVERLAY_BORDER_WHITE_BGRA);
+        // Interior of the scaled box is transparent.
+        assert_eq!(pixel(70, 60), OVERLAY_SELECTED_TRANSPARENT_BGRA);
+        // A point inside the unscaled logical box but outside the scaled one
+        // stays dimmed, proving the box was scaled rather than left logical.
+        assert_eq!(pixel(25, 15), OVERLAY_OUTSIDE_MASK_BGRA);
+    }
+
+    #[test]
+    fn edge_drag_active_reflects_edit_state() {
+        let mut state = ui_state();
+        assert!(!state.edge_drag.is_some());
+        state.edge_drag = Some(SelectionEdge::Left);
+        assert!(state.edge_drag.is_some());
     }
 
     #[test]
