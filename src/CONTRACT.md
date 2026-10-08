@@ -1,5 +1,17 @@
 # Module Contracts
 
+## `config`
+
+- Responsibilities: load optional user settings (`max_fps`, `border_width`) from `$XDG_CONFIG_HOME/screenshot/config` (default `~/.config/screenshot/config`), parse simple `key = value` lines with `#` comments, and clamp values to valid ranges.
+- Non-responsibilities: CLI parsing, Wayland interaction, and applying settings (consumers apply them).
+- Inputs: config file text (missing file means defaults).
+- Outputs: `Config { max_fps, border_width }` plus the shared default/range constants.
+- Dependencies: standard library only (no TOML dependency by design).
+- Forbidden dependencies: Wayland clients and CLI modules.
+- Failure modes: unreadable or malformed files degrade to defaults (never fatal).
+- Verification method: unit tests for parsing, comments, padding, unknown keys, and out-of-range values.
+- Replacement contract: keep the file optional, non-fatal, and dependency-free.
+
 ## `cli`
 
 - Responsibilities: parse supported flags, reject invalid combinations, resolve output paths, and render help text.

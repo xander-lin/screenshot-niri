@@ -9,9 +9,12 @@
 ## Functional Goals And Scope
 
 - **Normal mode** (default): freeze all outputs (with-cursor and cursor-free frame pair), dimmed drag-region selection overlay, save PNG, copy to clipboard. `1`–`9` full-screen capture, `H` toggles cursor in output, `L` promotes selection to long mode, `Esc` cancels.
-- **Long/scroll mode** (`--long`): select a region on a single output, scroll content, continuous capture (configurable fps cap via `--fps`, default 60) with live stitched preview, direction hints (`Up`/`Down`/`Left`/`Right`), selection-box edit mode (`E`) with per-edge snap targets and wheel blocking for T/L-shaped captures and static-footer completion, finish on `Enter`/`Space`, stitch into one PNG (+ transparent corners for ragged shapes).
+- **Long/scroll mode** (`--long`): select a region on a single output, scroll content, continuous capture (configurable fps cap via `--fps`, default 30) with live stitched preview, direction hints (`Up`/`Down`/`Left`/`Right`), selection-box edit mode (`E`) with per-edge snap targets and wheel blocking for T/L-shaped captures and static-footer completion, finish on `Enter`/`Space`, stitch into one PNG (+ transparent corners for ragged shapes).
 - **Clipboard**: `wlr-data-control` serving `image/png` (default) or `file://` URI (`--url`), as a detached provider process.
 - **Output path policy**: temp dir default → `--file [PATH]` (Pictures/Screenshots) → `-o/--output PATH` → `--name NAME` → positional PATH (same as `--file PATH`).
+- **Config file** (`~/.config/screenshot/config`): `max_fps` (default frame-rate cap when `--fps` absent) and `border_width` (visible selection-border thickness); optional, non-fatal, dependency-free parsing.
+- Long-mode selections spanning outputs show a **red warning border**; releasing clamps to the largest single-output piece and enters edit mode.
+- Edit mode supports edge resize and whole-box move (interior drag); captures are inset 1 logical pixel inside the box so the overlay border is never captured.
 - Out of scope: non-niri compositors, X11, focus-grab extensions, diagnostics compatibility bins.
 
 ## Product Philosophy
@@ -27,8 +30,10 @@
 - `FINDINGS.md` is the durable project memory; code is authoritative over docs — verify against code before relying on doc claims.
 - Keep docs (`CONTRACT.md`, `FINDINGS.md`, `README.md`) in sync in the same change as behavior milestones (see `found.md` lesson on documentation drift).
 - Verification: `cargo test` (unit tests live alongside modules; stitch has extensive pure-logic tests), `cargo check`, manual niri testing for Wayland flows.
-- Long-capture performance protections must be preserved: configurable frame-rate cap (`--fps`, hardcoded default 60, range 1–240), damage-based capture after the first frame, near-duplicate frame skip (bypassed when the capture region changed), bounded capture channel backpressure.
-- Selection-box edit mode (E key) semantics must be preserved: edges have snap targets only in edit mode; edit mode blocks wheel scroll by holding pointer input; frames captured after a resize are stitched at their deterministic known position.
+- Long-capture performance protections must be preserved: configurable frame-rate cap (`--fps`, hardcoded default 30, range 1–240), damage-based capture after the first frame, near-duplicate frame skip (bypassed when the capture region changed), bounded capture channel backpressure, and capture pause during edit-mode edge drags.
+- Selection-box edit mode (E key) semantics must be preserved: edges have snap targets only in edit mode; edit mode blocks wheel scroll by holding pointer input; frames captured after a resize are stitched at their deterministic known position; only the settled rectangle after an edge-drag release is captured.
+- Overlay rendering must map the global-logical selection through the output's real logical rect and scale (see `selected_buffer_rect`); a pseudo `(0,0,buffer)` rect hides the box on offset/scaled outputs.
+- Memory: overlay buffers are full-resolution RGBA per output (2 each) plus a base-pixels cache; footprint is resolution-driven, not fps-driven. Keep `OVERLAY_BUFFER_COUNT` minimal.
 
 ## Structure Map
 

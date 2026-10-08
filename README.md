@@ -84,6 +84,17 @@ screenshot /home/me/shots/out.png      # → /home/me/shots/out.png
 | _(default)_ | `image/png` — paste directly into image apps, chat, etc. |
 | `--url` | `file://` URI — paste as a file path |
 
+### Configuration File
+
+Optional `~/.config/screenshot/config` (or `$XDG_CONFIG_HOME/screenshot/config`), simple `key = value` lines, `#` comments. Invalid values fall back to defaults.
+
+```ini
+# Long-capture frame-rate cap (used when --fps is not given; 1-240)
+max_fps = 30
+# Visible selection-border thickness in logical pixels (1-16)
+border_width = 3
+```
+
 ### Normal Screenshot
 
 1. Run `screenshot` — all screens freeze and dim.
@@ -97,17 +108,17 @@ screenshot /home/me/shots/out.png      # → /home/me/shots/out.png
 ### Long/Scroll Screenshot (`--long`)
 
 1. Run `screenshot --long` — enter region selection.
-2. **Drag** to select the capture area on a single output.
-3. The overlay dims except for the selected region. The tool starts capturing frames.
+2. **Drag** to select the capture area on a single output. If the box spans two outputs its border turns **red** as a warning; releasing then clamps the box to the largest piece that fits one output and enters edit mode so you can keep adjusting. Back on a single output the border turns white again.
+3. The overlay dims except for the selected region. The tool starts capturing frames (inset one pixel inside the box so the border itself is never captured).
 4. **Scroll** the content within the selected region.
 5. Press **↑** / **↓** / **←** / **→** to hint the scroll direction for better stitching.
-6. Press **E** during capture to enter selection-box **editing mode**: the box edges can be dragged to resize the capture region and wheel events are blocked (the displayed content cannot scroll while editing). Resizing is stitched at the exact edited position, which enables:
+6. Press **E** during capture to enter selection-box **editing mode**: the box edges can be dragged to resize it and the box interior can be dragged to move it; wheel events are blocked (the displayed content cannot scroll while editing). Resizing is stitched at the exact edited position, which enables:
    - capturing content that is narrower on top and wider on the bottom (T-shaped captures),
    - scrolling vertically first and horizontally afterwards (L-shaped captures, hint with **←** / **→**),
    - extending the bottom edge after scrolling so static content (headers/footers that repeat while scrolling and would break stitching) is captured once, perfectly attached below.
 7. Press **Enter** or **Space** to finish — the tool stitches all frames and saves.
 8. Press **Esc** to cancel.
-9. Long screenshots always use cursor-free capture frames; **H** applies only to normal screenshots. Long capture is capped at 30 fps by default (`--fps` to change); frames are damage-driven, so slower machines and static content naturally capture less often.
+9. Long screenshots always use cursor-free capture frames; **H** applies only to normal screenshots. Long capture is capped at 30 fps by default (`--fps` or the config file's `max_fps` to change); frames are damage-driven, so slower machines and static content naturally capture less often.
 
 > **Tip**: Scroll slowly for best results. The stitcher tracks frame overlap automatically; direction hints improve accuracy with fast or jumpy scrolling.
 
