@@ -3,12 +3,17 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 use crate::cli::{Command, Mode};
-use crate::stitch::{ImageRgbView, PushResult, RawStitcher};
+use crate::stitch::{FrameScreenOffset, ImageRgbView, PushResult, RawStitcher};
+use crate::wayland::screencopy::CaptureOutputRegion;
 use crate::wayland::selection::LongDirection;
 
 const LONG_UI_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const LONG_MAX_FRAME_RATE: u32 = 120;
-const LONG_FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / LONG_MAX_FRAME_RATE as u64);
+/// Granularity of the capture-thread pacing sleep loop.
+const LONG_FRAME_PACE_SLEEP: Duration = Duration::from_millis(2);
+
+fn long_frame_interval(max_frame_rate: u32) -> Duration {
+    Duration::from_nanos(1_000_000_000 / u64::from(max_frame_rate.max(1)))
+}
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     match Command::parse()? {
@@ -76,24 +81,29 @@ fn run_long(args: crate::cli::Args) -> Result<(), Box<dyn Error>> {
 
 enum CaptureMessage {
     PrepareCapture { #[allow(dead_code)] index: usize, ack: mpsc::SyncSender<()> },
-    Frame(crate::image::Image),
+    Frame { image: crate::image::Image, region: CaptureOutputRegion },
     Error(#[allow(dead_code)] String),
     Finished,
 }
 
 struct LongCaptureWorker {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    region: std::sync::Arc<std::sync::Mutex<CaptureOutputRegion>>,
     receiver: mpsc::Receiver<CaptureMessage>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl LongCaptureWorker {
-    fn start(region: crate::wayland::screencopy::CaptureOutputRegion) -> Self {
+    fn start(region: CaptureOutputRegion, max_frame_rate: u32) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let region = std::sync::Arc::new(std::sync::Mutex::new(region));
         let (sender, receiver) = mpsc::sync_channel::<CaptureMessage>(4);
         let thread_stop = std::sync::Arc::clone(&stop);
+        let thread_region = std::sync::Arc::clone(&region);
+        let frame_interval = long_frame_interval(max_frame_rate);
         let thread = std::thread::spawn(move || {
-            let mut session = match crate::wayland::screencopy::CaptureSession::new(region.output_name) {
+            let output_name = thread_region.lock().map(|region| region.output_name).unwrap_or_default();
+            let mut session = match crate::wayland::screencopy::CaptureSession::new(output_name) {
                 Ok(s) => s,
                 Err(err) => {
                     let _ = sender.send(CaptureMessage::Error(err.to_string()));
@@ -105,15 +115,19 @@ impl LongCaptureWorker {
             while !thread_stop.load(std::sync::atomic::Ordering::Relaxed) {
                 if index > 0 {
                     if let Some(prev) = last {
-                        while prev.elapsed() < LONG_FRAME_INTERVAL {
+                        while prev.elapsed() < frame_interval {
                             if thread_stop.load(std::sync::atomic::Ordering::Relaxed) {
                                 return;
                             }
-                            std::thread::sleep(Duration::from_millis(2));
+                            std::thread::sleep(LONG_FRAME_PACE_SLEEP);
                         }
                     }
                 }
                 last = Some(std::time::Instant::now());
+                let region = match thread_region.lock() {
+                    Ok(region) => *region,
+                    Err(_) => return,
+                };
                 let (ack_tx, ack_rx) = mpsc::sync_channel(0);
                 if sender.send(CaptureMessage::PrepareCapture { index, ack: ack_tx }).is_err() {
                     return;
@@ -130,7 +144,7 @@ impl LongCaptureWorker {
                 }
                 match session.capture_region_frame_without_cursor(region, index > 0) {
                     Ok(image) => {
-                        if sender.send(CaptureMessage::Frame(image)).is_err() {
+                        if sender.send(CaptureMessage::Frame { image, region }).is_err() {
                             return;
                         }
                     }
@@ -143,7 +157,15 @@ impl LongCaptureWorker {
             }
             let _ = sender.send(CaptureMessage::Finished);
         });
-        Self { stop, receiver, thread: Some(thread) }
+        Self { stop, region, receiver, thread: Some(thread) }
+    }
+
+    /// Updates the capture region used for subsequent frames. Selection-box
+    /// edits in long mode call this so the worker follows the resized box.
+    fn update_region(&self, region: CaptureOutputRegion) {
+        if let Ok(mut current) = self.region.lock() {
+            *current = region;
+        }
     }
 
     fn recv_timeout(&self, dur: Duration) -> Result<CaptureMessage, RecvTimeoutError> {
@@ -178,12 +200,15 @@ fn run_long_capture(
         return Err(err);
     }
 
-    let regions = viewport.capture_regions();
-    let mut worker = LongCaptureWorker::start(regions[0]);
+    let initial_region = viewport.capture_regions()[0];
+    let mut worker = LongCaptureWorker::start(initial_region, args.max_frame_rate);
     let mut stitcher = RawStitcher::new();
     let mut cancelled = false;
     let mut capture_finished = false;
-    let mut prev_raw: Option<crate::image::Image> = None;
+    let mut prev_raw: Option<(CaptureOutputRegion, crate::image::Image)> = None;
+    // Live selection state followed from edit-mode edge drags.
+    let mut live_region = initial_region;
+    let mut live_rect = viewport.rect;
 
     while !capture_finished {
         match worker.recv_timeout(LONG_UI_POLL_INTERVAL) {
@@ -191,18 +216,26 @@ fn run_long_capture(
                 let _ = selection_session.prepare_capture_clean();
                 let _ = ack.send(());
             }
-            Ok(CaptureMessage::Frame(frame)) => {
-                if let Some(ref prev) = prev_raw {
-                    if raw_frame_nearly_identical(prev, &frame) {
+            Ok(CaptureMessage::Frame { image, region }) => {
+                // Near-duplicate frames are skipped only while the selection
+                // geometry is unchanged: an edit-mode resize produces frames
+                // that are mostly identical yet carry brand-new strips.
+                if let Some((prev_region, ref prev)) = prev_raw {
+                    if prev_region == region && raw_frame_nearly_identical(prev, &image) {
                         continue;
                     }
                 }
-                let current_frame = prev_raw.insert(frame);
+                prev_raw = Some((region, image));
                 let direction: Option<LongDirection> = match selection_session.long_direction() {
                     Some(crate::wayland::selection::SearchDirection::Down) => Some(LongDirection::Down),
                     Some(crate::wayland::selection::SearchDirection::Up) => Some(LongDirection::Up),
-                    Some(crate::wayland::selection::SearchDirection::Vertical) => None,
-                    None => None,
+                    Some(crate::wayland::selection::SearchDirection::Left) => Some(LongDirection::Left),
+                    Some(crate::wayland::selection::SearchDirection::Right) => Some(LongDirection::Right),
+                    Some(crate::wayland::selection::SearchDirection::Vertical) | None => None,
+                };
+                let current_frame = match prev_raw.as_ref() {
+                    Some((_, image)) => image,
+                    None => continue,
                 };
                 let compose = match ImageRgbView::new(current_frame) {
                     Ok(v) => v,
@@ -212,20 +245,25 @@ fn run_long_capture(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let outcome = match stitcher.push_frame_views(compose, analysis, direction) {
+                let offset = FrameScreenOffset { x: region.region.x, y: region.region.y };
+                let outcome = match stitcher.push_frame_with_offset(&compose, &analysis, direction, offset) {
                     Ok(o) => o,
                     Err(_) => continue,
                 };
                 if matches!(outcome, PushResult::Initialized | PushResult::Accepted { .. }) {
                     if let Some(s) = stitcher.stitched() {
                         if let Ok(image) = crate::stitch::image_from_stitched_frame(s) {
+                            let (capture_width, capture_height) = (
+                                u32::try_from(live_region.region.width.max(0)).unwrap_or(1),
+                                u32::try_from(live_region.region.height.max(0)).unwrap_or(1),
+                            );
                             let snapshot = crate::wayland::selection::LongPreviewSnapshot {
                                 image,
                                 current_origin_x: s.current_origin_x,
                                 current_origin_y: s.current_origin_y,
-                                viewport_rect: viewport.rect,
-                                capture_width: viewport.capture_size().map(|(w, _)| w).unwrap_or(1),
-                                capture_height: viewport.capture_size().map(|(_, h)| h).unwrap_or(1),
+                                viewport_rect: live_rect,
+                                capture_width: capture_width.max(1),
+                                capture_height: capture_height.max(1),
                             };
                             let _ = selection_session.update_long_capture_preview(snapshot);
                         }
@@ -253,6 +291,25 @@ fn run_long_capture(
             break;
         }
         let _ = selection_session.dispatch_poll(0);
+        // Follow selection-box edits made in edit mode: the worker region and
+        // the preview mapping track the adjusted rectangle, and each frame is
+        // tagged with the region it was captured from so the stitcher can
+        // place geometry-changed frames deterministically.
+        if let Some(rect) = selection_session.selection_rect() {
+            if rect != live_rect {
+                match crate::geometry::SelectedViewport::from_outputs(
+                    rect,
+                    &selection_session.output_infos(),
+                ) {
+                    Ok(viewport) if viewport.regions.len() == 1 => {
+                        live_rect = rect;
+                        live_region = viewport.capture_regions()[0];
+                        worker.update_region(live_region);
+                    }
+                    _ => {}
+                }
+            }
+        }
         match selection_session.long_status() {
             crate::wayland::selection::LongSessionStatus::Running => {}
             crate::wayland::selection::LongSessionStatus::FinishRequested => break,

@@ -36,6 +36,21 @@ pub struct StitchedFrame {
     pub compose_height: u32,
     pub active_crop: ComposeCrop,
     pub fixed_bands: FixedBands,
+    /// Filled horizontal extent per row as `(start_x, end_x)` in canvas pixels.
+    /// Rows grow to the canvas bounding box when frames with different
+    /// geometries are stitched; unfilled extents stay transparent on output.
+    /// An empty vector means every row is considered fully covered.
+    pub row_coverage: Vec<(u32, u32)>,
+}
+
+/// On-screen top-left offset (in capture buffer pixels) of the region a frame
+/// was captured from. Consecutive frames share an offset while the selection
+/// box is unchanged; a changed offset marks a selection-box edit whose frame
+/// must be stitched at a known, deterministic canvas position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FrameScreenOffset {
+    pub x: i32,
+    pub y: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

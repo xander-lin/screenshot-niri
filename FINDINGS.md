@@ -5,7 +5,8 @@
 - `screenshot-rs-rebuild` is a fresh, niri-only Rust screenshot tool with binary name `screenshot`.
 - Supported runtime target is niri on Wayland through wlroots protocols exposed by niri.
 - Normal interactive region screenshots are in scope.
-- Out of scope for user-facing/runtime behavior: non-niri compositors, X11, long screenshots, stitching, focus-grab behavior, and diagnostics compatibility paths.
+- Out of scope for user-facing/runtime behavior: non-niri compositors, X11, focus-grab behavior, and diagnostics compatibility paths.
+- Long screenshots and stitching are implemented end-to-end and wired into the CLI (verified 2026-10-08 against `src/app.rs`, `src/cli.rs`, and git history).
 
 ## Module Relationships
 
@@ -17,16 +18,17 @@
 - `wayland::selection` caches per-overlay base and dimmed frozen buffers after layer-surface configure so pointer-motion redraws avoid per-pixel frozen resampling and alpha blending.
 - `geometry` maps selected logical regions to per-output capture regions.
 - `image` represents captured buffers, composites selected regions, and writes PNG files.
-- `stitch` is a test-only vertical image-stitching foundation for future long screenshots; it is not wired into CLI or Wayland flow yet.
+- `stitch` is the full multi-stage matcher ported from the original project (canvas exact placement, perceptual bands, fuzzy hash, fast-motion scan, fixed-band detection, previous-frame fallback); `app` drives it from the long-capture worker thread.
 - `clipboard` serves the saved screenshot through `wlr-data-control` as `image/png` or file URI data.
 
 ## Architecture Decisions
 
 - Original long screenshot architecture exists in `/home/life/Work/screenshot-rs`; next rebuild work should first understand and port that architecture in stages.
 - Manual-scroll MVP is no longer the recommended longshot target unless the original implementation approach proves infeasible for the rebuild.
-- Initial stitching support should remain pure image logic until longshot orchestration exists; `--long` remains unsupported.
-- The rebuild now has a minimal test-only `RawStitcher` foundation for ordered raw frames using average-RGB-thresholded vertical Top/Bottom overlap; it is not the full original multi-stage or perceptual matcher.
-- `RawStitcher` now tracks minimal Top/Bottom match metadata and a current viewport for accepted raw frames; it first checks near-duplicate frames against the previous frame using same-geometry average RGB difference with alpha/X ignored and threshold `2.0`, then checks exact vertical in-canvas placement at x=0, then falls back to append/prepend placement relative to the current viewport using average RGB overlap threshold `3.0` with alpha/X ignored and `Vertical`/`Down`/`Up` direction filtering, and still is not the original multi-direction or multi-stage matcher.
+- Superseded (2026-10-08): `--long` is now supported end-to-end (selection → continuous capture → stitching → PNG + clipboard), and the full original matcher was ported into `src/stitch/`.
+- The earlier minimal average-RGB `RawStitcher` foundation description is superseded by the full port above; `RawStitcher` is now the orchestrating entry point over the ported submodules.
+- Long capture frame rate is configurable (`--fps`, 1–240) with a hardcoded default of 60; the cap is a ceiling over damage-driven pull capture, so slower machines and static content naturally capture less often (2026-10-08).
+- Selection-box edit mode (2026-10-08): E toggles editing; edges have snap targets only in edit mode; edit mode holds pointer input on the overlay so wheel events cannot scroll the underlying content; each frame is tagged with its capture region and the app/stitcher place region-changed frames at the deterministic offset-implied position (crop/band state resets for the new geometry). The canvas grows into ragged T/L shapes tracked by per-row coverage; uncovered extents output transparent.
 - Do not introduce external input synthesis or app-specific automatic scrolling first; prefer porting the original pointer-passthrough continuous-capture model.
 - Normal screenshot performance optimization is acceptable for now based on user feedback, so work should proceed to long screenshot foundations unless new performance data appears.
 

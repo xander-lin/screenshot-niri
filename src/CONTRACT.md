@@ -5,24 +5,24 @@
 - Responsibilities: parse supported flags, reject invalid combinations, resolve output paths, and render help text.
 - Non-responsibilities: Wayland interaction, filesystem image writing, and clipboard serving.
 - Inputs: process args, `XDG_RUNTIME_DIR`, `XDG_PICTURES_DIR`, `HOME`, and explicit paths/names.
-- Outputs: `Args` with mode, clipboard mode, and output path.
+- Outputs: `Args` with mode, clipboard mode, output path, and long-capture frame-rate cap (`--fps`, default 60, range 1-240).
 - Dependencies: standard library and `libc` for local timestamp and uid fallback path.
 - Forbidden dependencies: compositor-specific code and filesystem capture logic.
-- Failure modes: unknown flags, missing flag values, unsafe temp directory, invalid `--name`, and mutually exclusive output modes.
+- Failure modes: unknown flags, missing flag values, unsafe temp directory, invalid `--name`, out-of-range or non-numeric `--fps`, and mutually exclusive output modes.
 - Verification method: unit tests for parsing and path resolution, plus `cargo check`.
 - Replacement contract: preserve user-facing flag behavior and return typed options without side effects beyond private temp-dir creation.
 
 ## `app`
 
-- Responsibilities: orchestrate normal screenshot flow, run niri-only preflight for normal capture, pass frozen output frames into selection, and reject unsupported long screenshots.
+- Responsibilities: orchestrate normal screenshot flow, run niri-only preflight, pass frozen output frames into selection, orchestrate long capture (fps-capped worker thread, region-tagged frames, selection-edit region following), and drive offset-aware stitching.
 - Non-responsibilities: low-level protocol dispatch and PNG encoding internals.
-- Inputs: parsed `Args`.
+- Inputs: parsed `Args` (including `max_frame_rate`).
 - Outputs: saved PNG path and clipboard provider startup.
-- Dependencies: `cli`, `runtime`, `wayland::screencopy`, `wayland::selection`, `image`, and `clipboard`.
-- Forbidden dependencies: long-capture modules, compositor adaptation branches, and diagnostics bins.
-- Failure modes: unsupported `--long`, non-niri runtime environment, cancelled selection, capture failure, write failure, and clipboard setup failure.
+- Dependencies: `cli`, `runtime`, `wayland::screencopy`, `wayland::selection`, `geometry`, `image`, `stitch`, and `clipboard`.
+- Forbidden dependencies: compositor adaptation branches and diagnostics bins.
+- Failure modes: unsupported multi-output long selection, non-niri runtime environment, cancelled selection, capture failure, write failure, and clipboard setup failure.
 - Verification method: integration/manual test under niri and `cargo check`.
-- Replacement contract: keep the same high-level sequence: preflight, freeze, select, composite, write, clipboard.
+- Replacement contract: keep the same high-level sequence: preflight, freeze, select, composite, write, clipboard; long capture keeps the pacing cap, damage wait, prepare-capture-clean handshake, and per-frame capture-region tagging.
 
 ## `runtime`
 
@@ -62,15 +62,15 @@
 
 ## `stitch`
 
-- Responsibilities: provide pure vertical image overlap detection with a small average RGB difference threshold, exact in-canvas placement detection, append/prepend operations, and a minimal test-only `RawStitcher` state foundation with current viewport, viewport-relative Top/Bottom match metadata, near-duplicate average RGB difference detection before placement, and explicit direction filtering for future long-screenshot assembly.
-- Non-responsibilities: CLI flag handling, Wayland capture, scrolling, output selection, PNG writing, and enabling `--long` runtime behavior.
-- Inputs: existing `image::Image` buffers using the project BGRA/XRGB/ARGB8888 convention, overlap search bounds, explicit append overlap, test-only ordered raw frames, and optional test-only search direction filters.
-- Outputs: largest vertical overlap length whose paired rows are within the average RGB match threshold, first top-to-bottom exact in-canvas vertical placement, a newly stitched `Image` preserving the source format and row stride, average RGB frame difference for same-geometry images, or test-only push state results for initialized, duplicate, accepted, and no-match frames with accepted-frame viewport-relative Top/Bottom match metadata and finish-time stitched image plus current viewport.
+- Responsibilities: provide the multi-stage vertical matcher (canvas placement, perceptual bands, fuzzy hash, fast-motion scan, fixed-band detection, previous-frame fallback) plus offset-tagged geometry placement: frames arrive with the on-screen offset of their capture region, and a changed offset/size stitches the frame at its deterministic known position, growing the canvas into ragged T/L shapes with per-row coverage so never-captured corners output transparent.
+- Non-responsibilities: CLI flag handling, Wayland capture, scrolling, output selection, and PNG writing.
+- Inputs: existing `image::Image` buffers via `ImageRgbView` (or any `RgbSource` in tests) tagged with `FrameScreenOffset`, overlap search bounds, and optional search direction filters (`Down`/`Up`/`Left`/`Right`).
+- Outputs: push results for initialized, duplicate, accepted, and no-match frames; stitched frames with viewport/anchor origins, per-row coverage, and `image_from_stitched_frame` BGRA output with transparent uncovered extents.
 - Dependencies: `image::Image`, standard error handling, and `wayland-client` SHM format names.
 - Forbidden dependencies: Wayland protocol flow, runtime environment checks, filesystem access, clipboard state, and CLI modules.
-- Failure modes: unsupported formats, zero dimensions, short stride/data, width, stride, or format mismatch, invalid overlap ranges, no overlap within the RGB threshold, and arithmetic overflow.
-- Verification method: unit tests for exact and thresholded overlap detection, largest-overlap preference, first-match exact canvas placement, mismatch rejection, append/prepend bytes, invalid overlap, `RawStitcher` initialization, near-duplicate handling, exact in-canvas and viewport-relative Top/Bottom thresholded overlap placement with viewport/match metadata, alpha-ignored overlap matching, direction-filtered no-match preservation, empty finish, plus `cargo check`.
-- Replacement contract: keep stitching deterministic, side-effect-free, and test-only until longshot orchestration exists; rebuild placement first checks near-duplicates against the previous frame by average RGB difference for same geometry, then checks exact vertical in-canvas placement at x=0, then falls back to average-RGB-thresholded vertical Top/Bottom append/prepend relative to the current viewport with explicit `Vertical`/`Down`/`Up` direction filtering and does not include the original multi-direction, multi-stage, or perceptual matcher.
+- Failure modes: unsupported formats, zero dimensions, short stride/data, width/stride/format mismatch, invalid overlap ranges, no overlap within the RGB threshold, geometry-frame overflow, and arithmetic overflow.
+- Verification method: unit tests for exact and thresholded overlap detection, canvas placement, mismatch rejection, geometry extension/widening/shrink/movement placement with coverage and transparency, near-duplicate handling, direction-filtered no-match preservation, empty finish, plus `cargo check`.
+- Replacement contract: keep stitching deterministic and side-effect-free; geometry-changed frames keep being placed at the offset-implied position with crop/band state reset for the new geometry rather than fuzzy-matched.
 
 ## `clipboard`
 
@@ -98,12 +98,12 @@
 
 ## `wayland::selection`
 
-- Responsibilities: bind layer-shell/xdg-output, display frozen output frames with dimmed outside-selection mask and visible border, redraw dirty overlay regions during drag, and return a drag-selected viewport.
-- Non-responsibilities: screencopy, PNG writing, clipboard, and long-mode interaction.
+- Responsibilities: bind layer-shell/xdg-output, display frozen output frames with dimmed outside-selection mask and visible border, redraw dirty overlay regions during drag, return a drag-selected viewport, and provide selection-box edit mode (E key) with per-edge snap targets, output-clamped edge drags, pointer-input grabbing (wheel blocking) during long-capture editing, long-mode preview and status, horizontal/vertical direction hints, and live selection-rect/output-info accessors for the capture loop.
+- Non-responsibilities: screencopy, PNG writing, clipboard, and capture-region recomputation policy.
 - Inputs: frozen captured output frames, Wayland pointer/keyboard events, and output logical geometry.
-- Outputs: selected viewport or cancellation.
+- Outputs: selected viewport or cancellation; long-session status, direction hints, live selection rect, and output infos.
 - Dependencies: `wayland-client`, `wayland-protocols`, `wayland-protocols-wlr`, `tempfile`, and `libc`.
 - Forbidden dependencies: focus-grab extensions and non-niri compositor branches.
 - Failure modes: missing layer-shell/compositor/shm/seat/output globals, missing frozen output frame, unsupported frozen frame format, no pointer, cancellation, or empty selection.
-- Verification method: unit tests for overlay pixels/dirty regions, manual niri drag-selection test, and `cargo check`.
-- Replacement contract: return geometry-only selection data usable by screencopy compositing.
+- Verification method: unit tests for overlay pixels/dirty regions/edge hit-testing/edge clamping, manual niri drag-selection and edit-mode test, and `cargo check`.
+- Replacement contract: return geometry-only selection data usable by screencopy compositing; keep edit-mode edge semantics (snap targets exist only in edit mode; edit mode blocks wheel propagation by holding pointer input; Enter/Space confirms/finishes from edit mode).

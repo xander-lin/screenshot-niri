@@ -35,6 +35,7 @@ impl StitchedFrame {
             compose_height: frame.height,
             active_crop,
             fixed_bands,
+            row_coverage: vec![(0, frame.width); frame.height as usize],
         }
     }
 }
@@ -49,9 +50,19 @@ pub fn image_from_stitched_frame(frame: &StitchedFrame) -> Result<Image, Box<dyn
     for y in 0..frame.height as usize {
         let src_row = y * frame.stride as usize;
         let dst_row = y * stride as usize;
+        let covered = frame
+            .row_coverage
+            .get(y)
+            .copied()
+            .unwrap_or((0, frame.width));
         for x in 0..frame.width as usize {
-            let src = src_row + x * 3;
             let dst = dst_row + x * 4;
+            if covered.1 > covered.0 && (x < covered.0 as usize || x >= covered.1 as usize) {
+                // Never captured: keep RGB zeroed and fully transparent so the
+                // ragged corners of T/L-shaped stitches stay see-through.
+                continue;
+            }
+            let src = src_row + x * 3;
             data[dst] = frame.data[src + 2];
             data[dst + 1] = frame.data[src + 1];
             data[dst + 2] = frame.data[src];
@@ -62,7 +73,7 @@ pub fn image_from_stitched_frame(frame: &StitchedFrame) -> Result<Image, Box<dyn
         width: frame.width,
         height: frame.height,
         stride,
-        format: Format::Xrgb8888,
+        format: Format::Argb8888,
         data,
     })
 }
@@ -158,6 +169,30 @@ fn append_frame_at_position_with_overlap_mode(
     let stitched_dst_y = (-min_y) as u32;
     let frame_dst_x = (frame_x - min_x) as u32;
     let frame_dst_y = (frame_y - min_y) as u32;
+    let mut row_coverage = vec![(0u32, 0u32); output_height as usize];
+    for (y, &(start, end)) in stitched.row_coverage.iter().enumerate() {
+        if end <= start {
+            continue;
+        }
+        let out_y = stitched_dst_y as usize + y;
+        if out_y < output_height as usize {
+            let start = stitched_dst_x.saturating_add(start).min(output_width);
+            let end = stitched_dst_x.saturating_add(end).min(output_width);
+            row_coverage[out_y] = (start, end);
+        }
+    }
+    for y in 0..frame.height as usize {
+        let out_y = frame_dst_y as usize + y;
+        if out_y >= output_height as usize {
+            break;
+        }
+        let frame_end = frame_dst_x.saturating_add(frame.width).min(output_width);
+        let (start, end) = row_coverage[out_y];
+        // Union hull of the existing extent and the frame extent. Adjacent or
+        // overlapping fills (the normal case) stay exact; a fully disjoint
+        // fill over-covers the gap, which only affects never-captured corners.
+        row_coverage[out_y] = (start.min(frame_dst_x), end.max(frame_end));
+    }
     blit_rgb(
         &stitched.data,
         stitched.width,
@@ -213,6 +248,7 @@ fn append_frame_at_position_with_overlap_mode(
     stitched.height = output_height;
     stitched.stride = output_stride;
     stitched.data = data;
+    stitched.row_coverage = row_coverage;
     stitched.current_origin_x = frame_x - min_x;
     stitched.current_origin_y = frame_y - min_y;
     stitched.anchor_origin_x -= min_x;

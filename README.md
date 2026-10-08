@@ -37,6 +37,7 @@ screenshot [OPTIONS] [PATH]
 |------|------|-------------|
 | _(default)_ | Normal | Drag to select a region, save, copy to clipboard |
 | `--long` | Long/Scroll | Select a region, scroll to capture more, press Enter to finish |
+| `--fps N` | — | Long-capture frame-rate cap in fps (default: 60, range: 1–240) |
 
 ### Output Path
 
@@ -91,6 +92,7 @@ screenshot /home/me/shots/out.png      # → /home/me/shots/out.png
 4. Press **Esc** at any time to cancel.
 5. The frozen preview and the saved screenshot use the cursor-free frame by default. Press **H** to show the cursor (toggle between the captured with-cursor and without-cursor frames). The live selection cursor stays visible.
 6. Press **1**–**9** to skip selection entirely and capture a full screen; screens are numbered left to right by their position.
+7. Press **E** (during the drag or afterwards) to enter selection-box **editing mode**: each of the four box edges has a snap target you can grab and drag to resize the box. Press **E** again or **Enter/Space** to capture with the adjusted box.
 
 ### Long/Scroll Screenshot (`--long`)
 
@@ -98,10 +100,14 @@ screenshot /home/me/shots/out.png      # → /home/me/shots/out.png
 2. **Drag** to select the capture area on a single output.
 3. The overlay dims except for the selected region. The tool starts capturing frames.
 4. **Scroll** the content within the selected region.
-5. Press **↑** / **↓** to hint the scroll direction for better stitching.
-6. Press **Enter** or **Space** to finish — the tool stitches all frames and saves.
-7. Press **Esc** to cancel.
-8. Long screenshots always use cursor-free capture frames; **H** applies only to normal screenshots.
+5. Press **↑** / **↓** / **←** / **→** to hint the scroll direction for better stitching.
+6. Press **E** during capture to enter selection-box **editing mode**: the box edges can be dragged to resize the capture region and wheel events are blocked (the displayed content cannot scroll while editing). Resizing is stitched at the exact edited position, which enables:
+   - capturing content that is narrower on top and wider on the bottom (T-shaped captures),
+   - scrolling vertically first and horizontally afterwards (L-shaped captures, hint with **←** / **→**),
+   - extending the bottom edge after scrolling so static content (headers/footers that repeat while scrolling and would break stitching) is captured once, perfectly attached below.
+7. Press **Enter** or **Space** to finish — the tool stitches all frames and saves.
+8. Press **Esc** to cancel.
+9. Long screenshots always use cursor-free capture frames; **H** applies only to normal screenshots. Long capture is capped at 60 fps by default (`--fps` to change); frames are damage-driven, so slower machines and static content naturally capture less often.
 
 > **Tip**: Scroll slowly for best results. The stitcher tracks frame overlap automatically; direction hints improve accuracy with fast or jumpy scrolling.
 

@@ -19,7 +19,8 @@ mod types;
 
 use canvas::{
     append_frame_at_position, append_frame_at_position_overwriting_overlap_rows,
-    extract_stitched_region, translate_viewport_rect, viewport_rect_within_stitched,
+    canvas_overlap_rect, extract_stitched_region, translate_viewport_rect,
+    viewport_rect_within_stitched,
 };
 #[cfg(test)]
 use fixed_bands::detect_fixed_bands;
@@ -47,7 +48,7 @@ use placement::{canvas_search_axis, find_canvas_placement_match};
 use rgb::{
     average_difference_same_source, average_luminance_difference_source, crop_rgb_frame,
     pixel_difference_source, pixel_offset, rgb_frame_from_source, validate_rgb_frame,
-    validate_rgb_source, CroppedRgbSource, RgbSource,
+    validate_rgb_source, CroppedRgbSource,
 };
 
 pub use canvas::image_from_stitched_frame;
@@ -59,11 +60,11 @@ pub use hash::{
     estimate_vertical_multi_level_fuzzy_hash_motion_with_stats, FuzzyHashMotionStats,
 };
 #[allow(unused_imports)]
-pub use rgb::{average_difference_same, rgb_frame_from_image, ImageRgbView};
+pub use rgb::{average_difference_same, rgb_frame_from_image, ImageRgbView, RgbSource};
 pub use types::{
     AppendDirection, ComposeCrop, DuplicateAnalysisMotion, FastMotionAgreement,
     FastMotionCandidate, FastMotionTrace, FastMotionVerifyPass, FixedBands, FrameMatch,
-    MotionEstimate, PushResult, RgbFrame, SearchDirection, StitchDecisionPath,
+    FrameScreenOffset, MotionEstimate, PushResult, RgbFrame, SearchDirection, StitchDecisionPath,
     StitchProfileBreakdown, StitchedFrame, ViewportRect,
 };
 
@@ -362,6 +363,7 @@ pub struct RawStitcher {
     last_fast_motion_trace: Option<FastMotionTrace>,
     last_profile_breakdown: StitchProfileBreakdown,
     accepted_direction: AcceptedDirectionMemory,
+    last_screen_offset: Option<FrameScreenOffset>,
 }
 
 impl RawStitcher {
@@ -382,6 +384,7 @@ impl RawStitcher {
             last_fast_motion_trace: None,
             last_profile_breakdown: StitchProfileBreakdown::default(),
             accepted_direction: AcceptedDirectionMemory::default(),
+            last_screen_offset: None,
         }
     }
 
@@ -406,6 +409,7 @@ impl RawStitcher {
         self.push_frame_sources(&compose_frame, &analysis_frame, direction)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn push_frame_views(
         &mut self,
         compose_frame: ImageRgbView<'_>,
@@ -413,6 +417,122 @@ impl RawStitcher {
         direction: Option<LongDirection>,
     ) -> Result<PushResult, Box<dyn Error>> {
         self.push_frame_sources(&compose_frame, &analysis_frame, direction)
+    }
+
+    /// Pushes a frame tagged with the on-screen offset of its capture region.
+    ///
+    /// While the offset matches the previously pushed frame (and the frame
+    /// keeps the active geometry), frames flow through the regular matcher
+    /// pipeline. When the offset changes — the selection box was resized in
+    /// edit mode — the frame is stitched at the deterministic position implied
+    /// by the offset delta: the still-overlapping part must show the same
+    /// content (edit mode blocks scrolling), so the frame extends the canvas
+    /// by exactly the resized strips and the canvas may become ragged
+    /// (T/L-shaped), with never-captured corners left transparent.
+    pub fn push_frame_with_offset<C, A>(
+        &mut self,
+        compose_frame: &C,
+        analysis_frame: &A,
+        direction: Option<LongDirection>,
+        screen_offset: FrameScreenOffset,
+    ) -> Result<PushResult, Box<dyn Error>>
+    where
+        C: RgbSource,
+        A: RgbSource,
+    {
+        validate_rgb_source(compose_frame)?;
+        validate_rgb_source(analysis_frame)?;
+        let geometry_changed = match (self.stitched.as_ref(), self.last_screen_offset) {
+            (None, _) => false,
+            (Some(_), last_offset) => {
+                Some(screen_offset) != last_offset
+                    || compose_frame.width() != self.active_crop.map_or(0, |crop| crop.width)
+                    || compose_frame.height() != self.active_crop.map_or(0, |crop| crop.height)
+            }
+        };
+        if !geometry_changed {
+            let result = self.push_frame_sources(compose_frame, analysis_frame, direction)?;
+            if matches!(result, PushResult::Initialized) {
+                self.last_screen_offset = Some(screen_offset);
+            }
+            return Ok(result);
+        }
+        self.push_geometry_frame(compose_frame, analysis_frame, screen_offset)
+    }
+
+    fn push_geometry_frame(
+        &mut self,
+        compose_frame: &impl RgbSource,
+        analysis_frame: &impl RgbSource,
+        new_offset: FrameScreenOffset,
+    ) -> Result<PushResult, Box<dyn Error>> {
+        let frame = rgb_frame_from_source(compose_frame)?;
+        let previous_rect = self.viewport_rect.ok_or("missing viewport rect")?;
+        let last_offset = self.last_screen_offset.ok_or("missing last screen offset")?;
+        let crop = self.active_crop.ok_or("missing active crop")?;
+        // The previous viewport anchors the crop's top row on screen; the new
+        // frame is consumed whole (crop resets), anchored at its own top row.
+        let delta_x = new_offset.x - last_offset.x;
+        let delta_y = new_offset.y - (last_offset.y + crop.y as i32);
+        let frame_x = previous_rect
+            .x
+            .checked_add(delta_x)
+            .ok_or("geometry frame x overflow")?;
+        let frame_y = previous_rect
+            .y
+            .checked_add(delta_y)
+            .ok_or("geometry frame y overflow")?;
+
+        let stitched = self.stitched.as_ref().ok_or("missing stitched frame")?;
+        let overlap = canvas_overlap_rect(stitched, &frame, frame_x, frame_y);
+        let (overlap_len, score) = match overlap {
+            Some((x0, y0, x1, y1)) => {
+                let width = x1.saturating_sub(x0);
+                let height = y1.saturating_sub(y0);
+                let canvas_region = extract_stitched_region(
+                    stitched,
+                    ViewportRect { x: x0 as i32, y: y0 as i32, width, height },
+                )?;
+                let frame_region = crop_rgb_frame(
+                    &frame,
+                    ComposeCrop {
+                        x: (x0 as i32 - frame_x) as u32,
+                        y: (y0 as i32 - frame_y) as u32,
+                        width,
+                        height,
+                    },
+                )?;
+                (height.min(width), average_difference_same(&canvas_region, &frame_region))
+            }
+            None => (0, 0.0),
+        };
+        let direction = if delta_y < 0 || (delta_y == 0 && delta_x == 0) {
+            AppendDirection::Top
+        } else if delta_y > 0 {
+            AppendDirection::Bottom
+        } else if delta_x > 0 {
+            AppendDirection::Right
+        } else {
+            AppendDirection::Left
+        };
+        let match_info = FrameMatch { direction, overlap: overlap_len, delta_x, delta_y, score };
+
+        let stitched = self.stitched.as_mut().ok_or("missing stitched frame")?;
+        let new_rect = append_frame_at_position(stitched, previous_rect, &frame, match_info)?;
+        self.viewport_rect = Some(new_rect);
+        let bands = FixedBands::default();
+        let new_crop = bands
+            .active_crop(frame.width, frame.height)
+            .ok_or("invalid active crop after geometry change")?;
+        self.active_crop = Some(new_crop);
+        self.fixed_detector = FixedBandDetector::default();
+        self.previous_compose_frame = Some(frame);
+        self.previous_perceptual_frame = Some(PerceptualFrame::from_source(analysis_frame));
+        self.previous_perceptual_delta = None;
+        self.accepted_direction = AcceptedDirectionMemory::default();
+        self.last_screen_offset = Some(new_offset);
+        self.last_profile_breakdown.path = Some(StitchDecisionPath::CanvasAccepted);
+        Ok(PushResult::Accepted { match_info })
     }
 
     fn push_frame_sources<C, A>(
@@ -3631,11 +3751,158 @@ mod tests {
         let previous = frame(2, 2, 10);
         let stitched = StitchedFrame::from_first_frame(&previous);
         let image = image_from_stitched_frame(&stitched).unwrap();
-        assert_eq!(image.format, Format::Xrgb8888);
+        assert_eq!(image.format, Format::Argb8888);
         assert_eq!(image.stride, 8);
         assert_eq!(image.data[0], previous.data[2]);
         assert_eq!(image.data[1], previous.data[1]);
         assert_eq!(image.data[2], previous.data[0]);
         assert_eq!(image.data[3], 255);
+    }
+
+    #[test]
+    fn converts_uncovered_stitched_corners_to_transparent() {
+        let previous = frame(4, 2, 10);
+        let mut stitched = StitchedFrame::from_first_frame(&previous);
+        // Simulate a ragged canvas: only the left half of each row is captured.
+        stitched.row_coverage = vec![(0, 2), (0, 2)];
+        let image = image_from_stitched_frame(&stitched).unwrap();
+        // Covered pixel keeps full alpha; uncovered right half is transparent.
+        assert_eq!(image.data[3], 255);
+        assert_eq!(image.data[4 * 2 + 0], 0);
+        assert_eq!(image.data[4 * 2 + 3], 0);
+    }
+
+    #[test]
+    fn geometry_offset_extension_grows_canvas_and_preserves_overlap() {
+        let mut stitcher = RawStitcher::new();
+        // First frame: 4x4 grey.
+        let first = frame(4, 4, 90);
+        let first_analysis = frame(4, 4, 90);
+        assert!(matches!(
+            stitcher.push_frame_with_offset(&first, &first_analysis, None, FrameScreenOffset { x: 0, y: 0 }),
+            Ok(PushResult::Initialized)
+        ));
+
+        // Selection box extended downward by 2 rows: same top-left, taller.
+        let mut extended = frame(4, 6, 90);
+        // The bottom strip carries new (brighter) static content.
+        for y in 4..6 {
+            for x in 0..4 {
+                let offset = (y * extended.stride + x * 3) as usize;
+                extended.data[offset..offset + 3].copy_from_slice(&[200, 200, 200]);
+            }
+        }
+        let extended_analysis = extended.clone();
+        let result = stitcher
+            .push_frame_with_offset(&extended, &extended_analysis, None, FrameScreenOffset { x: 0, y: 0 })
+            .unwrap();
+        assert!(matches!(result, PushResult::Accepted { .. }));
+
+        let stitched = stitcher.stitched().unwrap();
+        assert_eq!(stitched.width, 4);
+        assert_eq!(stitched.height, 6);
+        // Old overlap content is preserved (not overwritten by the frame).
+        let image = image_from_stitched_frame(stitched).unwrap();
+        assert_eq!(image.data[0], 90);
+        // New strip captured below the previous content.
+        let strip = &image.data[(4 * 4) * 4..];
+        assert_eq!(&strip[0..3], &[200, 200, 200]);
+        // Everything is covered after a pure bottom extension.
+        assert!(stitched.row_coverage.iter().all(|&(s, e)| s == 0 && e == 4));
+    }
+
+    #[test]
+    fn geometry_offset_widening_leaves_transparent_corner() {
+        let mut stitcher = RawStitcher::new();
+        let first = frame(4, 4, 90);
+        assert!(matches!(
+            stitcher.push_frame_with_offset(&first, &first, None, FrameScreenOffset { x: 100, y: 100 }),
+            Ok(PushResult::Initialized)
+        ));
+
+        // Selection box widened to the right by 4 px on the same screen rows.
+        let mut widened = frame(8, 4, 90);
+        for y in 0..4 {
+            for x in 4..8 {
+                let offset = (y * widened.stride + x * 3) as usize;
+                widened.data[offset..offset + 3].copy_from_slice(&[180, 180, 180]);
+            }
+        }
+        let widened_analysis = widened.clone();
+        let result = stitcher
+            .push_frame_with_offset(&widened, &widened_analysis, None, FrameScreenOffset { x: 100, y: 100 })
+            .unwrap();
+        assert!(matches!(result, PushResult::Accepted { .. }));
+
+        let stitched = stitcher.stitched().unwrap();
+        assert_eq!(stitched.width, 8);
+        assert_eq!(stitched.height, 4);
+        // All rows fully covered: the widened frame spans the whole width.
+        assert!(stitched.row_coverage.iter().all(|&(s, e)| s == 0 && e == 8));
+    }
+
+    #[test]
+    fn geometry_offset_shrink_then_normal_push_continues() {
+        let mut stitcher = RawStitcher::new();
+        let first = frame(6, 6, 90);
+        assert!(matches!(
+            stitcher.push_frame_with_offset(&first, &first, None, FrameScreenOffset { x: 0, y: 0 }),
+            Ok(PushResult::Initialized)
+        ));
+
+        // Shrink: selection box pulled in from the right by 2 px.
+        let shrunk = frame(4, 6, 90);
+        let shrunk_analysis = shrunk.clone();
+        let result = stitcher
+            .push_frame_with_offset(&shrunk, &shrunk_analysis, None, FrameScreenOffset { x: 0, y: 0 })
+            .unwrap();
+        assert!(matches!(result, PushResult::Accepted { .. }));
+
+        // A later same-geometry frame goes through the normal pipeline again
+        // (accepted as a duplicate because the content is unchanged).
+        let later = frame(4, 6, 90);
+        let result = stitcher
+            .push_frame_with_offset(&later, &later, None, FrameScreenOffset { x: 0, y: 0 })
+            .unwrap();
+        assert!(matches!(result, PushResult::Duplicate));
+
+        // Canvas keeps the original width; the shrunken rows stay covered.
+        let stitched = stitcher.stitched().unwrap();
+        assert_eq!(stitched.width, 6);
+        assert!(stitched.row_coverage.iter().all(|&(s, e)| s == 0 && e == 6));
+    }
+
+    #[test]
+    fn geometry_offset_movement_translates_the_frame() {
+        let mut stitcher = RawStitcher::new();
+        let first = frame(4, 4, 90);
+        assert!(matches!(
+            stitcher.push_frame_with_offset(&first, &first, None, FrameScreenOffset { x: 10, y: 10 }),
+            Ok(PushResult::Initialized)
+        ));
+
+        // Selection moved left by 3 and up by 2 (screen), same size.
+        let moved = frame(4, 4, 90);
+        let moved_analysis = moved.clone();
+        let result = stitcher
+            .push_frame_with_offset(&moved, &moved_analysis, None, FrameScreenOffset { x: 7, y: 8 })
+            .unwrap();
+        assert!(matches!(result, PushResult::Accepted { .. }));
+
+        let stitched = stitcher.stitched().unwrap();
+        assert_eq!(stitched.width, 7);
+        assert_eq!(stitched.height, 6);
+        // The frame moved left/up, so it occupies the canvas top-left corner
+        // while the original content shifted to x 3..7, y 2..6.
+        assert_eq!(stitched.current_origin_x, 0);
+        assert_eq!(stitched.current_origin_y, 0);
+        assert_eq!(stitched.row_coverage[0], (0, 4));
+        assert_eq!(stitched.row_coverage[5], (3, 7));
+        // Uncovered top-right corner of the L stays transparent on output;
+        // the bottom row is covered only where the old canvas sits (x 3..7).
+        let image = image_from_stitched_frame(stitched).unwrap();
+        assert_eq!(image.data[(0 * 7 + 6) * 4 + 3], 0);
+        assert_eq!(image.data[(5 * 7 + 0) * 4 + 3], 0);
+        assert_eq!(image.data[(5 * 7 + 3) * 4 + 3], 255);
     }
 }

@@ -32,14 +32,21 @@ const BTN_LEFT: u32 = 0x110;
 const KEY_ESC: u32 = 1;
 const KEY_L: u32 = 38;
 const KEY_H: u32 = 35;
+const KEY_E: u32 = 18;
 const KEY_ENTER: u32 = 28;
 const KEY_SPACE: u32 = 57;
 const KEY_DOWN: u32 = 108;
 const KEY_UP: u32 = 103;
+const KEY_LEFT: u32 = 105;
+const KEY_RIGHT: u32 = 106;
 const KEY_DIGIT_FIRST: u32 = 2;
 const KEY_DIGIT_LAST: u32 = 10;
 const OVERLAY_BUFFER_COUNT: usize = 3;
 const SELECTION_BORDER_WIDTH: i32 = 3;
+/// Logical-pixel snap range around each selection edge in edit mode.
+const EDGE_SNAP_RANGE: i32 = 8;
+/// Smallest selection kept while dragging an edge.
+const MIN_SELECTION_SIZE: i32 = 8;
 const OVERLAY_OUTSIDE_MASK_BGRA: [u8; 4] = [0, 0, 0, 110];
 const OVERLAY_SELECTED_TRANSPARENT_BGRA: [u8; 4] = [0, 0, 0, 0];
 const OVERLAY_BORDER_WHITE_BGRA: [u8; 4] = [255, 255, 255, 255];
@@ -103,6 +110,13 @@ impl DragState {
 
     fn is_finished(self) -> bool {
         matches!(self, Self::Finished(_))
+    }
+
+    fn finished_rect_mut(&mut self) -> Option<&mut LogicalRect> {
+        match self {
+            Self::Finished(rect) => Some(rect),
+            _ => None,
+        }
     }
 }
 
@@ -197,6 +211,10 @@ struct UiState {
     long_direction: Option<SearchDirection>,
     long_preview: Option<LongPreviewSnapshot>,
     pending_render: Option<bool>,
+    /// Selection-box edit mode (toggled with E). While set, the four box
+    /// edges have snap targets and can be dragged to resize the box.
+    editing: bool,
+    edge_drag: Option<SelectionEdge>,
 }
 
 impl UiState {
@@ -244,6 +262,8 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
         long_direction: None,
             long_preview: None,
             pending_render: None,
+        editing: false,
+        edge_drag: None,
     };
 
     conn.display().get_registry(&qh, ());
@@ -269,7 +289,7 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
     create_overlays(&mut state, &qh)?;
     conn.flush()?;
 
-    while !state.drag.is_terminal() {
+    while selection_loop_active(&state) {
         event_queue.blocking_dispatch(&mut state)?;
     }
     if state.drag == DragState::Cancelled {
@@ -287,8 +307,102 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
 pub enum SearchDirection {
     Down,
     Up,
+    Left,
+    Right,
     #[allow(dead_code)]
     Vertical,
+}
+
+/// One of the four selection-box edges that can be grabbed in edit mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// Returns the edge whose on-screen segment is nearest to `(x, y)`, provided
+/// the distance is within `snap` logical pixels. Deterministic tie-break
+/// order is Left, Top, Right, Bottom, so corners resolve consistently.
+pub fn hit_test_edge(rect: LogicalRect, x: i32, y: i32, snap: i32) -> Option<SelectionEdge> {
+    if rect.width <= 0 || rect.height <= 0 {
+        return None;
+    }
+    let candidates = [
+        (
+            SelectionEdge::Left,
+            distance_point_segment_squared(x, y, rect.x, rect.y, rect.x, rect.bottom()),
+        ),
+        (
+            SelectionEdge::Top,
+            distance_point_segment_squared(x, y, rect.x, rect.y, rect.right(), rect.y),
+        ),
+        (
+            SelectionEdge::Right,
+            distance_point_segment_squared(x, y, rect.right(), rect.y, rect.right(), rect.bottom()),
+        ),
+        (
+            SelectionEdge::Bottom,
+            distance_point_segment_squared(x, y, rect.x, rect.bottom(), rect.right(), rect.bottom()),
+        ),
+    ];
+    let snap_squared = f64::from(snap).max(0.0) * f64::from(snap).max(0.0);
+    let mut best: Option<(SelectionEdge, f64)> = None;
+    for (edge, distance) in candidates {
+        if distance <= snap_squared && best.map_or(true, |(_, best_distance)| distance < best_distance) {
+            best = Some((edge, distance));
+        }
+    }
+    best.map(|(edge, _)| edge)
+}
+
+fn distance_point_segment_squared(px: i32, py: i32, ax: i32, ay: i32, bx: i32, by: i32) -> f64 {
+    let dx = f64::from(bx - ax);
+    let dy = f64::from(by - ay);
+    let length_squared = dx * dx + dy * dy;
+    let to_x = f64::from(px - ax);
+    let to_y = f64::from(py - ay);
+    if length_squared == 0.0 {
+        return to_x * to_x + to_y * to_y;
+    }
+    let t = ((to_x * dx + to_y * dy) / length_squared).clamp(0.0, 1.0);
+    let closest_x = to_x - t * dx;
+    let closest_y = to_y - t * dy;
+    closest_x * closest_x + closest_y * closest_y
+}
+
+/// Moves one edge of `rect` to follow the pointer, clamped to `bounds` and to
+/// the minimum selectable size. The opposite edge always stays fixed.
+pub fn apply_edge_drag(
+    rect: LogicalRect,
+    edge: SelectionEdge,
+    x: i32,
+    y: i32,
+    bounds: LogicalRect,
+) -> LogicalRect {
+    match edge {
+        SelectionEdge::Left => {
+            let max_x = rect.right() - MIN_SELECTION_SIZE;
+            let new_x = x.clamp(bounds.x.min(max_x), max_x.max(bounds.x));
+            LogicalRect { x: new_x, width: rect.right() - new_x, ..rect }
+        }
+        SelectionEdge::Right => {
+            let min_right = rect.x + MIN_SELECTION_SIZE;
+            let new_right = x.clamp(min_right, bounds.right().max(min_right));
+            LogicalRect { width: new_right - rect.x, ..rect }
+        }
+        SelectionEdge::Top => {
+            let max_y = rect.bottom() - MIN_SELECTION_SIZE;
+            let new_y = y.clamp(bounds.y.min(max_y), max_y.max(bounds.y));
+            LogicalRect { y: new_y, height: rect.bottom() - new_y, ..rect }
+        }
+        SelectionEdge::Bottom => {
+            let min_bottom = rect.y + MIN_SELECTION_SIZE;
+            let new_bottom = y.clamp(min_bottom, bounds.bottom().max(min_bottom));
+            LogicalRect { height: new_bottom - rect.y, ..rect }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,6 +489,8 @@ impl SelectionSession {
             long_direction: None,
             long_preview: None,
             pending_render: None,
+            editing: false,
+            edge_drag: None,
         };
 
         conn.display().get_registry(&qh, ());
@@ -408,7 +524,7 @@ impl SelectionSession {
     }
 
     pub fn run_selection(&mut self) -> Result<SelectionOutcome, Box<dyn Error>> {
-        while !self.state.drag.is_terminal() {
+        while selection_loop_active(&self.state) {
             self.event_queue.blocking_dispatch(&mut self.state)?;
         }
         self.event_queue.dispatch_pending(&mut self.state)?;
@@ -421,6 +537,19 @@ impl SelectionSession {
         }
     }
 
+    /// Current selection rectangle once a selection exists, live-updated by
+    /// edge drags in edit mode. The long-capture loop polls this to follow
+    /// selection-box edits made during capture.
+    pub fn selection_rect(&self) -> Option<LogicalRect> {
+        self.state.drag.selected_rect()
+    }
+
+    /// Advertised output geometry, for recomputing viewports after the
+    /// selection rectangle changed in edit mode.
+    pub fn output_infos(&self) -> Vec<OutputInfo> {
+        self.state.output_infos()
+    }
+
     pub fn set_selected_viewport_passthrough(
         &mut self,
         viewport: &SelectedViewport,
@@ -431,6 +560,8 @@ impl SelectionSession {
         self.state.long_finish_requested = false;
         self.state.long_direction = None;
         self.state.long_preview = None;
+        self.state.editing = false;
+        self.state.edge_drag = None;
         for overlay in &mut self.state.overlays {
             overlay.render_cache = None;
             overlay.base_pixels = None;
@@ -542,6 +673,12 @@ impl SelectionSession {
         let _ = self.conn.flush();
         Ok(())
     }
+}
+
+/// The interactive selection loop keeps running while a drag is in progress
+/// or while edit mode holds a finished rectangle open for adjustment.
+fn selection_loop_active(state: &UiState) -> bool {
+    !state.drag.is_terminal() || state.editing
 }
 
 fn create_live_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Result<(), Box<dyn Error>> {
@@ -702,12 +839,87 @@ fn set_overlay_pointer_passthrough(
     Ok(())
 }
 
+/// Restores full pointer input on the overlays so edit mode can receive
+/// button/motion events. Receiving the pointer also means wheel events stop
+/// at the overlay: the underlying content cannot scroll while the selection
+/// box is being edited.
+fn set_overlay_pointer_input_interactive(state: &mut UiState) {
+    for overlay in &mut state.overlays {
+        overlay.surface.set_input_region(None);
+        overlay.surface.commit();
+    }
+}
+
+/// Drops cached overlay bases so the next render rebuilds them with the
+/// current selection rectangle (used after selection-box edits).
+fn invalidate_overlay_bases(state: &mut UiState) {
+    for overlay in &mut state.overlays {
+        overlay.base_pixels = None;
+    }
+}
+
 fn digit_key_index(key: u32) -> Option<usize> {
     if (KEY_DIGIT_FIRST..=KEY_DIGIT_LAST).contains(&key) {
         Some((key - KEY_DIGIT_FIRST) as usize)
     } else {
         None
     }
+}
+
+/// Toggles selection-box edit mode (E key). Entering edit mode finalizes an
+/// in-progress drag into an adjustable rectangle; in long mode it also grabs
+/// pointer input (blocking wheel scroll). Leaving edit mode restores long
+/// mode pointer passthrough.
+fn handle_edit_toggle(state: &mut UiState, qh: &QueueHandle<UiState>) {
+    if state.editing {
+        state.editing = false;
+        state.edge_drag = None;
+        if state.long_mode {
+            let _ = set_overlay_pointer_passthrough(state, qh);
+        }
+        invalidate_overlay_bases(state);
+        render_overlays(state);
+    } else if state.drag.current_rect().is_some() {
+        if let DragState::Dragging { .. } = state.drag {
+            let (x, y) = state
+                .pointer_global_position()
+                .unwrap_or((state.pointer_x, state.pointer_y));
+            state.drag.finish(x, y);
+        }
+        state.editing = true;
+        state.edge_drag = None;
+        if state.long_mode {
+            set_overlay_pointer_input_interactive(state);
+        }
+        invalidate_overlay_bases(state);
+        render_overlays(state);
+    }
+}
+
+/// Output-local bounds the selection is being edited within, so edge drags
+/// cannot move the box off the output it was captured on.
+fn selection_output_bounds(state: &UiState, rect: LogicalRect) -> LogicalRect {
+    let center_x = rect.x + rect.width / 2;
+    let center_y = rect.y + rect.height / 2;
+    state
+        .outputs
+        .iter()
+        .find(|output| {
+            let logical = output.info.logical;
+            center_x >= logical.x
+                && center_x < logical.right()
+                && center_y >= logical.y
+                && center_y < logical.bottom()
+        })
+        .map(|output| output.info.logical)
+        .or_else(|| {
+            state
+                .outputs
+                .iter()
+                .find(|output| output.info.logical.intersection(rect).is_some())
+                .map(|output| output.info.logical)
+        })
+        .unwrap_or(rect)
 }
 
 fn full_output_rect_by_index(output_infos: &[OutputInfo], index: usize) -> Option<LogicalRect> {
@@ -1097,6 +1309,11 @@ fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, prev
             if src_off + 3 >= img_data.len() {
                 continue;
             }
+            // Never-captured corners of ragged (T/L-shaped) stitched canvases
+            // stay transparent; leave the dimmed overlay visible beneath them.
+            if img_data[src_off + 3] == 0 {
+                continue;
+            }
             let dst_off = (oy as usize) * buf_stride + (ox as usize) * 4;
             data[dst_off] = img_data[src_off];
             data[dst_off + 1] = img_data[src_off + 1];
@@ -1243,69 +1460,113 @@ impl Dispatch<WlPointer, ()> for UiState {
             wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
                 state.pointer_x = surface_x as i32;
                 state.pointer_y = surface_y as i32;
-                if let Some((x, y)) = state.pointer_global_position() {
-                    if state.drag.update(x, y) {
-                        render_overlays(state);
+                let Some((x, y)) = state.pointer_global_position() else {
+                    return;
+                };
+                if let Some(edge) = state.edge_drag {
+                    if let Some(rect) = state.drag.selected_rect() {
+                        let bounds = selection_output_bounds(state, rect);
+                        let updated = apply_edge_drag(rect, edge, x, y, bounds);
+                        if updated != rect {
+                            if let Some(current) = state.drag.finished_rect_mut() {
+                                *current = updated;
+                            }
+                            invalidate_overlay_bases(state);
+                            render_overlays(state);
+                        }
                     }
+                } else if state.drag.update(x, y) {
+                    render_overlays(state);
                 }
             }
             wl_pointer::Event::Button { button, state: button_state, .. } if button == BTN_LEFT => {
                 let WEnum::Value(button_state) = button_state else {
                     return;
                 };
-                if let Some((x, y)) = state.pointer_global_position() {
-                    match button_state {
-                        wl_pointer::ButtonState::Pressed => state.drag.begin(x, y),
-                        wl_pointer::ButtonState::Released => state.drag.finish(x, y),
-                        _ => {}
+                let Some((x, y)) = state.pointer_global_position() else {
+                    return;
+                };
+                match button_state {
+                    wl_pointer::ButtonState::Pressed => {
+                        if state.editing && state.drag.is_finished() {
+                            // Edges have snap targets only in edit mode.
+                            state.edge_drag = state
+                                .drag
+                                .selected_rect()
+                                .and_then(|rect| hit_test_edge(rect, x, y, EDGE_SNAP_RANGE));
+                        } else if !state.editing {
+                            state.drag.begin(x, y);
+                        }
                     }
-                    render_overlays(state);
+                    wl_pointer::ButtonState::Released => {
+                        if state.edge_drag.take().is_some() {
+                            // Finished one edge drag; stay in edit mode.
+                        } else if !state.editing {
+                            state.drag.finish(x, y);
+                        }
+                    }
+                    _ => {}
                 }
+                render_overlays(state);
             }
+            // Axis (wheel) events are intentionally ignored: edit mode keeps
+            // pointer input on the overlay so scrolling stops here and the
+            // displayed content never moves while the box is adjusted.
             _ => {}
         }
     }
 }
 
 impl Dispatch<WlKeyboard, ()> for UiState {
-    fn event(state: &mut Self, _: &WlKeyboard, event: wl_keyboard::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(state: &mut Self, _: &WlKeyboard, event: wl_keyboard::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
         if let wl_keyboard::Event::Key { key, state: key_state, .. } = event {
-            if key == KEY_ESC && matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed)) {
+            if !matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed)) {
+                return;
+            }
+            if key == KEY_ESC {
+                state.editing = false;
+                state.edge_drag = None;
                 state.drag = DragState::Cancelled;
-            } else if key == KEY_L
-                && matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed))
-            {
+            } else if key == KEY_E {
+                handle_edit_toggle(state, qh);
+            } else if key == KEY_L {
+                state.editing = false;
+                state.edge_drag = None;
                 state.long_requested = true;
                 state.long_mode = true;
                 if state.drag.is_finished() {
                     state.drag.finish(state.pointer_x, state.pointer_y);
                 }
-            } else if key == KEY_H
-                && !state.long_mode
-                && matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed))
-            {
+            } else if key == KEY_H && !state.long_mode {
                 toggle_frozen_frame(state);
-            } else if !state.long_mode
-                && state.drag == DragState::Idle
-                && matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed))
-            {
-                if let Some(rect) = digit_key_index(key).and_then(|index| full_output_rect_by_index(&state.output_infos(), index)) {
-                    state.drag = DragState::Finished(rect);
+            } else if key == KEY_ENTER || key == KEY_SPACE {
+                // Confirm the edited rectangle: leaving edit mode lets the
+                // selection loop return the adjusted rect (and finishes a
+                // running long capture).
+                state.editing = false;
+                state.edge_drag = None;
+                if state.long_mode && state.drag.is_finished() {
+                    state.long_finish_requested = true;
                 }
-            } else if state.drag.is_finished()
-                && matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed))
-            {
+            } else if state.long_mode && state.drag.is_finished() {
                 match key {
-                    KEY_ENTER | KEY_SPACE => {
-                        state.long_finish_requested = true;
-                    }
                     KEY_DOWN => {
                         state.long_direction = Some(SearchDirection::Down);
                     }
                     KEY_UP => {
                         state.long_direction = Some(SearchDirection::Up);
                     }
+                    KEY_LEFT => {
+                        state.long_direction = Some(SearchDirection::Left);
+                    }
+                    KEY_RIGHT => {
+                        state.long_direction = Some(SearchDirection::Right);
+                    }
                     _ => {}
+                }
+            } else if !state.long_mode && state.drag == DragState::Idle {
+                if let Some(rect) = digit_key_index(key).and_then(|index| full_output_rect_by_index(&state.output_infos(), index)) {
+                    state.drag = DragState::Finished(rect);
                 }
             }
         }
@@ -1491,6 +1752,66 @@ mod tests {
         assert_eq!(digit_key_index(KEY_DIGIT_LAST), Some(8));
         assert_eq!(digit_key_index(KEY_DIGIT_LAST + 1), None);
         assert_eq!(digit_key_index(KEY_H), None);
+    }
+
+    #[test]
+    fn hit_test_edge_finds_nearest_edge_within_snap() {
+        let rect = LogicalRect { x: 100, y: 100, width: 40, height: 30 };
+        assert_eq!(hit_test_edge(rect, 98, 115, 8), Some(SelectionEdge::Left));
+        assert_eq!(hit_test_edge(rect, 142, 115, 8), Some(SelectionEdge::Right));
+        assert_eq!(hit_test_edge(rect, 120, 97, 8), Some(SelectionEdge::Top));
+        assert_eq!(hit_test_edge(rect, 120, 133, 8), Some(SelectionEdge::Bottom));
+        // Deep inside the box nothing snaps.
+        assert_eq!(hit_test_edge(rect, 120, 115, 8), None);
+        assert_eq!(hit_test_edge(rect, 50, 50, 8), None);
+    }
+
+    #[test]
+    fn hit_test_edge_resolves_corners_deterministically() {
+        let rect = LogicalRect { x: 100, y: 100, width: 40, height: 30 };
+        // Equidistant to the left and top edges: Left wins by tie-break order.
+        assert_eq!(hit_test_edge(rect, 97, 97, 8), Some(SelectionEdge::Left));
+        assert_eq!(hit_test_edge(rect, 143, 133, 8), Some(SelectionEdge::Right));
+    }
+
+    #[test]
+    fn hit_test_edge_rejects_empty_rectangles() {
+        let rect = LogicalRect { x: 100, y: 100, width: 0, height: 30 };
+        assert_eq!(hit_test_edge(rect, 100, 110, 8), None);
+    }
+
+    #[test]
+    fn apply_edge_drag_moves_edges_independently() {
+        let rect = LogicalRect { x: 100, y: 100, width: 40, height: 30 };
+        let bounds = LogicalRect { x: 0, y: 0, width: 1920, height: 1080 };
+        assert_eq!(
+            apply_edge_drag(rect, SelectionEdge::Left, 90, 115, bounds),
+            LogicalRect { x: 90, y: 100, width: 50, height: 30 }
+        );
+        assert_eq!(
+            apply_edge_drag(rect, SelectionEdge::Right, 150, 115, bounds),
+            LogicalRect { x: 100, y: 100, width: 50, height: 30 }
+        );
+        assert_eq!(
+            apply_edge_drag(rect, SelectionEdge::Top, 115, 80, bounds),
+            LogicalRect { x: 100, y: 80, width: 40, height: 50 }
+        );
+        assert_eq!(
+            apply_edge_drag(rect, SelectionEdge::Bottom, 115, 140, bounds),
+            LogicalRect { x: 100, y: 100, width: 40, height: 40 }
+        );
+    }
+
+    #[test]
+    fn apply_edge_drag_clamps_to_bounds_and_min_size() {
+        let rect = LogicalRect { x: 100, y: 100, width: 40, height: 30 };
+        let bounds = LogicalRect { x: 90, y: 90, width: 60, height: 60 };
+        assert_eq!(apply_edge_drag(rect, SelectionEdge::Left, 0, 115, bounds).x, 90);
+        assert_eq!(apply_edge_drag(rect, SelectionEdge::Left, 200, 115, bounds).width, MIN_SELECTION_SIZE);
+        assert_eq!(apply_edge_drag(rect, SelectionEdge::Right, 500, 115, bounds).width, 50);
+        assert_eq!(apply_edge_drag(rect, SelectionEdge::Right, 0, 115, bounds).width, MIN_SELECTION_SIZE);
+        assert_eq!(apply_edge_drag(rect, SelectionEdge::Top, 115, 0, bounds).y, 90);
+        assert_eq!(apply_edge_drag(rect, SelectionEdge::Bottom, 115, 500, bounds).height, 50);
     }
 
     #[test]

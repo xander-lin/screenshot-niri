@@ -13,7 +13,7 @@ pub struct ImageRgbView<'a> {
     crop: ComposeCrop,
 }
 
-pub(super) trait RgbSource {
+pub trait RgbSource {
     fn width(&self) -> u32;
     fn height(&self) -> u32;
     fn pixel_rgb(&self, x: u32, y: u32) -> [u8; 3];

@@ -30,6 +30,7 @@ pub struct Args {
     pub mode: Mode,
     pub clipboard_mode: ClipboardMode,
     pub output_path: PathBuf,
+    pub max_frame_rate: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,7 +39,12 @@ pub struct ClipboardProviderArgs {
     pub mode: ClipboardMode,
 }
 
-pub const HELP: &str = "screenshot — Wayland screenshot tool: region, full-screen, and long/scroll capture\n\nUsage: screenshot [OPTIONS] [PATH]\n\nOptions:\n  -h, --help           Show this help text\n  -V, --version        Show version information\n      --long           Interactive long/scroll screenshot mode\n      --file [PATH]    Save to PATH, or to the Pictures/Screenshots directory when omitted\n  -o, --output PATH    Save to PATH instead of a temporary file\n      --name NAME      Output filename; adds .png when missing, timestamped when omitted\n      --url            Put a file URI on the clipboard instead of the image\n\nInteraction:\n  Drag                 Select a region; release saves and copies to the clipboard\n  1-9                  Capture a full screen; screens are numbered left to right\n  H                    Toggle the cursor in the output (cursor hidden by default)\n  L                    Switch the selected region to long/scroll capture\n  Scroll               Scroll the content inside the region during long capture\n  Up / Down            Hint the scroll direction for better stitching\n  Enter or Space       Finish long capture and stitch\n  Esc                  Cancel at any time\n\nWithout --file or --output, the PNG is written under $XDG_RUNTIME_DIR (or\n/tmp/screenshot-rust-<uid>) and the clipboard receives the image itself,\nor a file URI with --url.\n";
+/// Hardcoded default long-capture frame-rate cap (fps).
+pub const DEFAULT_MAX_FRAME_RATE: u32 = 60;
+/// Upper bound accepted for `--fps`.
+pub const MAX_FRAME_RATE_LIMIT: u32 = 240;
+
+pub const HELP: &str = "screenshot — Wayland screenshot tool: region, full-screen, and long/scroll capture\n\nUsage: screenshot [OPTIONS] [PATH]\n\nOptions:\n  -h, --help           Show this help text\n  -V, --version        Show version information\n      --long           Interactive long/scroll screenshot mode\n      --fps N          Long-capture frame-rate cap in fps (default: 60, range: 1-240)\n      --file [PATH]    Save to PATH, or to the Pictures/Screenshots directory when omitted\n  -o, --output PATH    Save to PATH instead of a temporary file\n      --name NAME      Output filename; adds .png when missing, timestamped when omitted\n      --url            Put a file URI on the clipboard instead of the image\n\nInteraction:\n  Drag                 Select a region; release saves and copies to the clipboard\n  1-9                  Capture a full screen; screens are numbered left to right\n  H                    Toggle the cursor in the output (cursor hidden by default)\n  L                    Switch the selected region to long/scroll capture\n  E                    Toggle selection-box editing; drag an edge to resize it.\n                        Editing blocks scroll; Enter or Space captures\n  Scroll               Scroll the content inside the region during long capture\n  Up / Down            Hint the vertical scroll direction for better stitching\n  Left / Right         Hint the horizontal scroll direction during long capture\n  Enter or Space       Finish long capture and stitch\n  Esc                  Cancel at any time\n\nWithout --file or --output, the PNG is written under $XDG_RUNTIME_DIR (or\n/tmp/screenshot-rust-<uid>) and the clipboard receives the image itself,\nor a file URI with --url.\n";
 
 impl Command {
     pub fn parse() -> Result<Self, Box<dyn Error>> {
@@ -58,6 +64,7 @@ impl Args {
     fn parse_from(raw: Vec<OsString>) -> Result<Self, Box<dyn Error>> {
         let mut help = false;
         let mut long = false;
+        let mut max_frame_rate: Option<u32> = None;
         let mut clipboard_mode = ClipboardMode::ImagePng;
         let mut output_path = None;
         let mut file_requested = false;
@@ -75,6 +82,14 @@ impl Args {
                 std::process::exit(0);
             } else if arg == "--long" {
                 long = true;
+                index += 1;
+            } else if arg == "--fps" {
+                index += 1;
+                let value = raw.get(index).ok_or("--fps requires a frame rate")?;
+                max_frame_rate = Some(parse_frame_rate(value)?);
+                index += 1;
+            } else if let Some(value) = strip_os_prefix(arg, "--fps=") {
+                max_frame_rate = Some(parse_frame_rate(value)?);
                 index += 1;
             } else if arg == "--url" {
                 clipboard_mode = ClipboardMode::FileUri;
@@ -137,8 +152,23 @@ impl Args {
             mode: if long { Mode::Long } else { Mode::Normal },
             clipboard_mode,
             output_path,
+            max_frame_rate: max_frame_rate.unwrap_or(DEFAULT_MAX_FRAME_RATE),
         })
     }
+}
+
+fn parse_frame_rate(value: &OsStr) -> Result<u32, Box<dyn Error>> {
+    let text = value.to_str().ok_or("--fps must be a number")?;
+    let fps = text
+        .parse::<u32>()
+        .map_err(|_| format!("--fps must be a whole number of frames per second, got {text:?}"))?;
+    if fps == 0 || fps > MAX_FRAME_RATE_LIMIT {
+        return Err(format!(
+            "--fps must be between 1 and {MAX_FRAME_RATE_LIMIT}, got {fps}"
+        )
+        .into());
+    }
+    Ok(fps)
 }
 
 fn parse_clipboard_provider(raw: Vec<OsString>) -> Result<Command, Box<dyn Error>> {
@@ -311,5 +341,28 @@ mod tests {
     fn long_is_parsed_as_long_mode() {
         let args = Args::parse_from(vec![OsString::from("--long")]).unwrap();
         assert_eq!(args.mode, Mode::Long);
+    }
+
+    #[test]
+    fn fps_defaults_to_sixty() {
+        let args = Args::parse_from(vec![]).unwrap();
+        assert_eq!(args.max_frame_rate, 60);
+    }
+
+    #[test]
+    fn fps_accepts_flag_and_equals_forms() {
+        let args = Args::parse_from(vec![OsString::from("--fps"), OsString::from("30")]).unwrap();
+        assert_eq!(args.max_frame_rate, 30);
+        let args = Args::parse_from(vec![OsString::from("--fps=120")]).unwrap();
+        assert_eq!(args.max_frame_rate, 120);
+    }
+
+    #[test]
+    fn fps_rejects_missing_out_of_range_and_non_numeric_values() {
+        assert!(Args::parse_from(vec![OsString::from("--fps")]).is_err());
+        assert!(Args::parse_from(vec![OsString::from("--fps"), OsString::from("0")]).is_err());
+        assert!(Args::parse_from(vec![OsString::from("--fps"), OsString::from("241")]).is_err());
+        assert!(Args::parse_from(vec![OsString::from("--fps"), OsString::from("fast")]).is_err());
+        assert!(Args::parse_from(vec![OsString::from("--fps"), OsString::from("--file")]).is_err());
     }
 }
