@@ -109,7 +109,7 @@ border_width = 3
 
 1. Run `screenshot --long` — enter region selection.
 2. **Drag** to select the capture area on a single output. If the box spans two outputs its border turns **red** as a warning; releasing then clamps the box to the largest piece that fits one output and enters edit mode so you can keep adjusting. Back on a single output the border turns white again.
-3. The overlay dims except for the selected region. The tool starts capturing frames (inset one pixel inside the box so the border itself is never captured).
+3. The overlay dims except for the selected region. The tool starts capturing frames (inset one pixel inside the box so the border itself is never captured). While you drag an edge or move the box the border is temporarily hidden — the capture looks through the whole drag trajectory, which keeps border pixels out of the stitched result.
 4. **Scroll** the content within the selected region.
 5. Press **↑** / **↓** / **←** / **→** to hint the scroll direction for better stitching.
 6. Press **E** during capture to enter selection-box **editing mode**: the box edges can be dragged to resize it and the box interior can be dragged to move it; wheel events are blocked (the displayed content cannot scroll while editing). Resizing is stitched at the exact edited position, which enables:

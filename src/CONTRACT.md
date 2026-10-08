@@ -26,7 +26,7 @@
 
 ## `app`
 
-- Responsibilities: orchestrate normal screenshot flow, run niri-only preflight, pass frozen output frames into selection, orchestrate long capture (fps-capped worker thread, region-tagged frames, selection-edit region following), and drive offset-aware stitching.
+- Responsibilities: orchestrate normal screenshot flow, run niri-only preflight, pass frozen output frames into selection, orchestrate long capture (fps-capped worker thread, region-tagged frames, PrepareCapture handshake that hands the capture region back to the worker from the same rectangle used for the clean overlay render), and drive offset-aware stitching.
 - Non-responsibilities: low-level protocol dispatch and PNG encoding internals.
 - Inputs: parsed `Args` (including `max_frame_rate`).
 - Outputs: saved PNG path and clipboard provider startup.
@@ -34,7 +34,7 @@
 - Forbidden dependencies: compositor adaptation branches and diagnostics bins.
 - Failure modes: unsupported multi-output long selection, non-niri runtime environment, cancelled selection, capture failure, write failure, and clipboard setup failure.
 - Verification method: integration/manual test under niri and `cargo check`.
-- Replacement contract: keep the same high-level sequence: preflight, freeze, select, composite, write, clipboard; long capture keeps the pacing cap, damage wait, prepare-capture-clean handshake, and per-frame capture-region tagging.
+- Replacement contract: keep the same high-level sequence: preflight, freeze, select, composite, write, clipboard; long capture keeps the pacing cap, damage wait, and per-frame capture-region tagging. The capture region must stay same-source with the clean overlay render: the UI thread derives both from one rectangle inside the PrepareCapture handshake (skip the frame when an edit drag is active or the clean render cannot commit) — a worker-side region snapshot racing the overlay geometry was the root cause of white borders inside stitched captures.
 
 ## `runtime`
 
@@ -110,7 +110,7 @@
 
 ## `wayland::selection`
 
-- Responsibilities: bind layer-shell/xdg-output, display frozen output frames with dimmed outside-selection mask and visible border, redraw dirty overlay regions during drag, return a drag-selected viewport, and provide selection-box edit mode (E key) with per-edge snap targets, output-clamped edge drags, pointer-input grabbing (wheel blocking) during long-capture editing, long-mode preview and status, horizontal/vertical direction hints, and live selection-rect/output-info accessors for the capture loop.
+- Responsibilities: bind layer-shell/xdg-output, display frozen output frames with dimmed outside-selection mask and visible border, redraw dirty overlay regions during drag, return a drag-selected viewport, and provide selection-box edit mode (E key) with per-edge snap targets, output-clamped edge drags, pointer-input grabbing (wheel blocking) during long-capture editing, long-mode preview and status, horizontal/vertical direction hints, and live selection-rect/output-info accessors for the capture loop. During an edit drag the overlay hole becomes the union of the drag trajectory with the border suppressed, so in-flight capture regions (derived from the pre-drag rectangle) always look through transparent pixels.
 - Non-responsibilities: screencopy, PNG writing, clipboard, and capture-region recomputation policy.
 - Inputs: frozen captured output frames, Wayland pointer/keyboard events, and output logical geometry.
 - Outputs: selected viewport or cancellation; long-session status, direction hints, live selection rect, and output infos.
@@ -118,4 +118,4 @@
 - Forbidden dependencies: focus-grab extensions and non-niri compositor branches.
 - Failure modes: missing layer-shell/compositor/shm/seat/output globals, missing frozen output frame, unsupported frozen frame format, no pointer, cancellation, or empty selection.
 - Verification method: unit tests for overlay pixels/dirty regions/edge hit-testing/edge clamping, manual niri drag-selection and edit-mode test, and `cargo check`.
-- Replacement contract: return geometry-only selection data usable by screencopy compositing; keep edit-mode edge semantics (snap targets exist only in edit mode; edit mode blocks wheel propagation by holding pointer input; Enter/Space confirms/finishes from edit mode).
+- Replacement contract: return geometry-only selection data usable by screencopy compositing; keep edit-mode edge semantics (snap targets exist only in edit mode; edit mode blocks wheel propagation by holding pointer input; Enter/Space confirms/finishes from edit mode). All overlay render paths must map the selection through the output's real logical rect and scale, and the dim/base cache must be keyed by the rendered hole rect, border color, and border visibility — not just the buffer size. `prepare_capture_clean` reports whether the clean state was actually committed; a capture must never start against an unconfirmed overlay.

@@ -169,6 +169,10 @@ struct OverlaySurface {
     width: i32,
     height: i32,
     base_pixels: Option<Vec<u8>>,
+    /// Identity of the cached `base_pixels`: (width, height, buffer-local
+    /// hole rect, border color, whether the border was drawn). The cache is
+    /// rebuilt whenever any of these change, not just on size changes.
+    base_key: Option<(i32, i32, Option<LogicalRect>, [u8; 4], bool)>,
 }
 
 struct OverlayRenderCache {
@@ -220,6 +224,11 @@ struct UiState {
     /// edges have snap targets and can be dragged to resize the box.
     editing: bool,
     edit_drag: Option<EditDrag>,
+    /// Union of every rectangle the current edit drag has passed through.
+    /// While `edit_drag` is active the overlay hole is this union (with no
+    /// border), so an in-flight capture based on the pre-drag rectangle
+    /// always lands on transparent pixels no matter how the box moves.
+    edit_union: Option<LogicalRect>,
     /// Visible selection-border thickness in logical pixels (configurable).
     border_width: i32,
 }
@@ -271,6 +280,7 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
             pending_render: None,
         editing: false,
         edit_drag: None,
+        edit_union: None,
         border_width: crate::config::DEFAULT_BORDER_WIDTH,
     };
 
@@ -360,6 +370,27 @@ fn selection_spans_outputs(state: &UiState, rect: LogicalRect) -> bool {
 fn border_color_for_state(state: &UiState, rect: Option<LogicalRect>) -> [u8; 4] {
     let spans = rect.map_or(false, |rect| selection_spans_outputs(state, rect));
     selection_border_color(state.long_mode, spans)
+}
+
+/// Selection rectangle used for overlay rendering. During an edit-mode drag
+/// the overlay hole becomes the union of every rectangle the drag has passed
+/// through: the capture region of an in-flight capture is derived from the
+/// pre-drag rectangle, and that region must stay inside the transparent hole
+/// no matter where the box has moved meanwhile.
+fn ui_render_selection(state: &UiState) -> Option<LogicalRect> {
+    if state.edit_drag.is_some() {
+        state.edit_union.or_else(|| state.drag.current_rect())
+    } else {
+        state.drag.current_rect()
+    }
+}
+
+/// Whether the selection border is drawn on the overlay. It is suppressed
+/// while an edit drag is reshaping the box: the border would sit inside the
+/// trajectory union — and therefore inside some in-flight capture region —
+/// and leak into captured frames as a spurious white box.
+fn ui_render_border(state: &UiState) -> bool {
+    state.edit_drag.is_none()
 }
 
 /// Moves the whole box so the grab point stays under the pointer, clamped to
@@ -550,6 +581,7 @@ impl SelectionSession {
             pending_render: None,
             editing: false,
             edit_drag: None,
+            edit_union: None,
             border_width: border_width.clamp(crate::config::BORDER_WIDTH_MIN, crate::config::BORDER_WIDTH_MAX),
         };
 
@@ -630,9 +662,11 @@ impl SelectionSession {
         self.state.long_preview = None;
         self.state.editing = false;
         self.state.edit_drag = None;
+        self.state.edit_union = None;
         for overlay in &mut self.state.overlays {
             overlay.render_cache = None;
             overlay.base_pixels = None;
+            overlay.base_key = None;
         }
         // Retry until at least one overlay is rendered (buffer available)
         for _ in 0..50 {
@@ -728,11 +762,23 @@ impl SelectionSession {
         Ok(())
     }
 
-    pub fn prepare_capture_clean(&mut self) -> Result<(), Box<dyn Error>> {
-        render_overlays_full_dim(&mut self.state);
-        self.event_queue.dispatch_pending(&mut self.state)?;
-        self.conn.flush()?;
-        Ok(())
+    /// Renders the capture-clean overlay state (dim outside, transparent
+    /// hole, border outside the hole) and commits it. Returns whether at
+    /// least one overlay buffer was committed: when every buffer is still
+    /// held by the compositor the previous overlay state remains on screen,
+    /// and a capture started on top of that stale state could contain the
+    /// border — callers must skip the frame instead.
+    pub fn prepare_capture_clean(&mut self) -> bool {
+        for _ in 0..6 {
+            if render_overlays_full_dim(&mut self.state) > 0 {
+                let _ = self.event_queue.dispatch_pending(&mut self.state);
+                let _ = self.conn.flush();
+                return true;
+            }
+            // All buffers busy; wait for a wl_buffer.release and retry.
+            let _ = self.dispatch_poll(4);
+        }
+        false
     }
 
     pub fn close(self) -> Result<(), Box<dyn Error>> {
@@ -774,6 +820,7 @@ fn create_live_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Resul
             buffers: Vec::new(),
             render_cache: None,
             base_pixels: None,
+            base_key: None,
             width: output.info.logical.width.max(1),
             height: output.info.logical.height.max(1),
         });
@@ -792,7 +839,9 @@ fn render_overlays_capture_clean(state: &mut UiState) -> usize {
 
 fn render_overlays_inner(state: &mut UiState, draw_border: bool) -> usize {
     let border_width = state.border_width;
+    let draw_border = draw_border && ui_render_border(state);
     let border_color = border_color_for_state(state, state.drag.current_rect());
+    let rect = ui_render_selection(state);
     let mut committed = 0;
     for i in 0..state.overlays.len() {
         let overlay = &mut state.overlays[i];
@@ -803,16 +852,19 @@ fn render_overlays_inner(state: &mut UiState, draw_border: bool) -> usize {
         let data = unsafe { std::slice::from_raw_parts_mut(buffer.data, buffer.size) };
         let buf_size = overlay.width as usize * overlay.height as usize * 4;
         let stride = overlay.width as usize * 4;
-        let rect = state.drag.current_rect();
-        let output_logical = state.outputs.iter()
+        // Map the render selection through the output's real logical rect
+        // and scale, exactly like the fast render path does: buffer pixels,
+        // not logical units (a scale-2 output would otherwise leave most of
+        // the hole dimmed and the border inside the capture region).
+        let selection_local = state
+            .outputs
+            .iter()
             .find(|o| o.info.global_name == overlay.output_name)
-            .map(|o| o.info.logical)
-            .unwrap_or(LogicalRect { x: 0, y: 0, width: overlay.width, height: overlay.height });
-        let selection_local = rect.and_then(|r| {
-            selected_local_intersection_for_buffer(output_logical, r, overlay.width, overlay.height)
-        });
+            .and_then(|o| rect.and_then(|r| selected_buffer_rect(o.info, r, overlay.width, overlay.height)));
 
-        let rebuild = overlay.base_pixels.as_ref().map_or(true, |b| b.len() != buf_size);
+        let cache_key = (overlay.width, overlay.height, selection_local, border_color, draw_border);
+        let rebuild = overlay.base_key != Some(cache_key)
+            || overlay.base_pixels.as_ref().map_or(true, |b| b.len() != buf_size);
         if rebuild {
             for y in 0..overlay.height as usize {
                 for x in 0..overlay.width as usize {
@@ -833,11 +885,18 @@ fn render_overlays_inner(state: &mut UiState, draw_border: bool) -> usize {
             }
             let cache = data[..buf_size].to_vec();
             overlay.base_pixels = Some(cache);
+            overlay.base_key = Some(cache_key);
         } else if let Some(ref base) = overlay.base_pixels {
             data[..buf_size.min(base.len())].copy_from_slice(&base[..buf_size.min(base.len())]);
         }
 
         if let Some(ref preview) = state.long_preview {
+            let output_logical = state
+                .outputs
+                .iter()
+                .find(|o| o.info.global_name == overlay.output_name)
+                .map(|o| o.info.logical)
+                .unwrap_or(LogicalRect { x: 0, y: 0, width: overlay.width, height: overlay.height });
             draw_preview_on_overlay(data, overlay.width, overlay.height, preview, output_logical, selection_local);
         }
         overlay.surface.attach(Some(&buffer.buffer), 0, 0);
@@ -926,6 +985,7 @@ fn set_overlay_pointer_input_interactive(state: &mut UiState) {
 fn invalidate_overlay_bases(state: &mut UiState) {
     for overlay in &mut state.overlays {
         overlay.base_pixels = None;
+        overlay.base_key = None;
     }
 }
 
@@ -1182,6 +1242,7 @@ fn create_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Result<(),
             buffers: Vec::new(),
             render_cache: None,
             base_pixels: None,
+            base_key: None,
             width: output.info.logical.width.max(1),
             height: output.info.logical.height.max(1),
         });
@@ -1191,8 +1252,9 @@ fn create_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Result<(),
 
 fn render_overlays(state: &mut UiState) -> usize {
     let mut committed = 0;
-    let rect = state.drag.current_rect();
+    let rect = ui_render_selection(state);
     let border_width = state.border_width;
+    let draw_border = ui_render_border(state);
     let border = border_color_for_state(state, rect);
     for overlay in &mut state.overlays {
         let Some(buffer) = overlay.buffers.iter_mut().find(|buffer| buffer.available) else {
@@ -1202,7 +1264,7 @@ fn render_overlays(state: &mut UiState) -> usize {
             continue;
         };
         let data = unsafe { std::slice::from_raw_parts_mut(buffer.data, buffer.size) };
-        let current_selected = rect.and_then(|selected| selected_local_intersection_for_buffer(output.info.logical, selected, overlay.width, overlay.height));
+        let current_selected = rect.and_then(|selected| selected_buffer_rect(output.info, selected, overlay.width, overlay.height));
         let damage = if buffer.initialized {
             dirty_selected_region(buffer.last_selected, current_selected, overlay.width, overlay.height)
         } else {
@@ -1212,7 +1274,7 @@ fn render_overlays(state: &mut UiState) -> usize {
             continue;
         };
         let Some(render_cache) = overlay.render_cache.as_ref() else {
-            draw_overlay_dim_with_selection(data, overlay.width, overlay.height, output.info, rect, border_width, border);
+            draw_overlay_dim_with_selection(data, overlay.width, overlay.height, output.info, rect, border_width, border, draw_border);
             buffer.initialized = true;
             overlay.surface.attach(Some(&buffer.buffer), 0, 0);
             overlay.surface.damage_buffer(0, 0, overlay.width, overlay.height);
@@ -1407,6 +1469,7 @@ fn draw_overlay_dim_with_selection(
     selected: Option<LogicalRect>,
     border_width: i32,
     border: [u8; 4],
+    draw_border: bool,
 ) {
     let stride = width.max(0) as usize * 4;
     for y in 0..height.max(0) as usize {
@@ -1423,7 +1486,9 @@ fn draw_overlay_dim_with_selection(
                     data[offset..offset + 4].copy_from_slice(&OVERLAY_SELECTED_TRANSPARENT_BGRA);
                 }
             }
-            draw_selection_border(data, width, height, local.x, local.y, local.width, local.height, border_width, border);
+            if draw_border {
+                draw_selection_border(data, width, height, local.x, local.y, local.width, local.height, border_width, border);
+            }
         }
     }
 }
@@ -1435,11 +1500,6 @@ fn selected_local_intersection(output: LogicalRect, selected: LogicalRect) -> Op
         width: intersection.width,
         height: intersection.height,
     })
-}
-
-fn selected_local_intersection_for_buffer(output: LogicalRect, selected: LogicalRect, width: i32, height: i32) -> Option<LogicalRect> {
-    let buffer = LogicalRect { x: 0, y: 0, width, height };
-    selected_local_intersection(output, selected).and_then(|local| local.intersection(buffer))
 }
 
 fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, preview: &LongPreviewSnapshot, output_logical: LogicalRect, selection_local: Option<LogicalRect>) {
@@ -1669,6 +1729,14 @@ impl Dispatch<WlPointer, ()> for UiState {
                             if let Some(current) = state.drag.finished_rect_mut() {
                                 *current = updated;
                             }
+                            // Grow the drag-trajectory union: the overlay hole
+                            // during the drag is this union so an in-flight
+                            // capture (still based on the pre-drag rectangle)
+                            // never sees dim or border pixels.
+                            state.edit_union = Some(match state.edit_union {
+                                Some(union) => rect_union(union, updated),
+                                None => updated,
+                            });
                             invalidate_overlay_bases(state);
                             render_overlays(state);
                         }
@@ -1699,13 +1767,18 @@ impl Dispatch<WlPointer, ()> for UiState {
                                             .intersection(LogicalRect { x, y, width: 1, height: 1 })
                                             .map(|_| EditDrag::Move { offset_x: x - rect.x, offset_y: y - rect.y }))
                                 });
+                            state.edit_union = state.drag.selected_rect();
                         } else if !state.editing {
                             state.drag.begin(x, y);
                         }
                     }
                     wl_pointer::ButtonState::Released => {
                         if state.edit_drag.take().is_some() {
-                            // Finished one edit drag; stay in edit mode.
+                            // Finished one edit drag; stay in edit mode. The
+                            // union hole collapses back to the settled
+                            // rectangle and the border comes back.
+                            state.edit_union = None;
+                            invalidate_overlay_bases(state);
                         } else if !state.editing {
                             state.drag.finish(x, y);
                             // Long mode cannot capture a selection spanning
@@ -1985,6 +2058,7 @@ mod tests {
             Some(LogicalRect { x: 1920 + 20, y: 10, width: 30, height: 40 }),
             3,
             OVERLAY_BORDER_WHITE_BGRA,
+            true,
         );
 
         let pixel = |x: usize, y: usize| -> [u8; 4] {
@@ -2016,6 +2090,7 @@ mod tests {
             Some(LogicalRect { x: 20, y: 10, width: 30, height: 40 }),
             3,
             OVERLAY_BORDER_WHITE_BGRA,
+            true,
         );
 
         let pixel = |x: usize, y: usize| -> [u8; 4] {
@@ -2029,6 +2104,74 @@ mod tests {
         // A point inside the unscaled logical box but outside the scaled one
         // stays dimmed, proving the box was scaled rather than left logical.
         assert_eq!(pixel(25, 15), OVERLAY_OUTSIDE_MASK_BGRA);
+    }
+
+    #[test]
+    fn dim_selection_without_border_draws_only_the_hole() {
+        // During an edit drag the border is suppressed and the hole is the
+        // drag-trajectory union: every pixel around the hole stays dimmed,
+        // and pixels of a rectangle the drag moved away from become
+        // transparent too (in-flight captures must see through them).
+        let output = OutputInfo {
+            global_name: 1,
+            logical: LogicalRect { x: 0, y: 0, width: 100, height: 100 },
+            scale: 1,
+        };
+        let union = LogicalRect { x: 10, y: 10, width: 60, height: 40 };
+        let mut data = vec![0u8; 100 * 100 * 4];
+        draw_overlay_dim_with_selection(
+            &mut data,
+            100,
+            100,
+            output,
+            Some(union),
+            3,
+            OVERLAY_BORDER_WHITE_BGRA,
+            false,
+        );
+
+        let pixel = |x: usize, y: usize| -> [u8; 4] {
+            let offset = (y * 100 + x) * 4;
+            [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]
+        };
+        // Hole interior stays transparent.
+        assert_eq!(pixel(20, 20), OVERLAY_SELECTED_TRANSPARENT_BGRA);
+        // The border ring just outside the hole is NOT drawn: it stays dim.
+        assert_eq!(pixel(20, 9), OVERLAY_OUTSIDE_MASK_BGRA);
+        assert_eq!(pixel(9, 20), OVERLAY_OUTSIDE_MASK_BGRA);
+        assert_eq!(pixel(20, 50), OVERLAY_OUTSIDE_MASK_BGRA);
+    }
+
+    #[test]
+    fn render_selection_uses_union_only_while_edit_drag_is_active() {
+        let mut state = ui_state();
+        state.drag = DragState::Finished(SELECTED);
+        // No drag in progress: the render selection is the live rectangle.
+        assert_eq!(ui_render_selection(&state), Some(SELECTED));
+        assert!(ui_render_border(&state));
+        // During an edit drag the union takes over and the border is off.
+        state.edit_drag = Some(EditDrag::Move { offset_x: 1, offset_y: 1 });
+        state.edit_union = Some(LogicalRect { x: 0, y: 0, width: 90, height: 90 });
+        assert_eq!(ui_render_selection(&state), Some(LogicalRect { x: 0, y: 0, width: 90, height: 90 }));
+        assert!(!ui_render_border(&state));
+    }
+
+    #[test]
+    fn edit_union_grows_monotonically_across_the_drag_trajectory() {
+        // Simulated Motion handler updates: the union must contain every
+        // intermediate rectangle, so the pre-drag capture region always lies
+        // inside the transparent hole.
+        let start = LogicalRect { x: 40, y: 40, width: 20, height: 20 };
+        let mut union = start;
+        for updated in [
+            LogicalRect { x: 45, y: 40, width: 20, height: 20 },
+            LogicalRect { x: 45, y: 48, width: 20, height: 20 },
+            LogicalRect { x: 38, y: 48, width: 20, height: 20 },
+        ] {
+            union = rect_union(union, updated);
+        }
+        assert!(union.intersection(start).map(|i| i == start).unwrap_or(false));
+        assert_eq!(union, LogicalRect { x: 38, y: 40, width: 27, height: 28 });
     }
 
     #[test]
@@ -2157,6 +2300,7 @@ mod tests {
             pending_render: None,
             editing: false,
             edit_drag: None,
+            edit_union: None,
             border_width: crate::config::DEFAULT_BORDER_WIDTH,
         }
     }

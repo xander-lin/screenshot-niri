@@ -103,32 +103,57 @@ fn run_long(args: crate::cli::Args, config: crate::config::Config) -> Result<(),
 }
 
 enum CaptureMessage {
-    PrepareCapture { #[allow(dead_code)] index: usize, ack: mpsc::SyncSender<()> },
+    PrepareCapture { #[allow(dead_code)] index: usize, ack: mpsc::SyncSender<PrepareAck> },
     Frame { image: crate::image::Image, region: CaptureOutputRegion },
     Error(#[allow(dead_code)] String),
     Finished,
 }
 
+/// Reply to a PrepareCapture handshake. The region is computed by the UI
+/// thread from the very rectangle it used to render the capture-clean
+/// overlay, so the capture region and the on-screen hole/border geometry are
+/// always derived from the same instant — the worker never captures with a
+/// stale region while the overlay already shows a different box (the root
+/// cause of spurious white borders in stitched long captures).
+enum PrepareAck {
+    Capture(CaptureOutputRegion),
+    /// Skip this frame: an edit drag is reshaping the box, or the clean
+    /// overlay could not be committed (all buffers busy).
+    Skip,
+}
+
+/// Capture region for a settled selection rectangle on a single output,
+/// inset one logical pixel per side. Returns `None` for selections that do
+/// not map to exactly one output (long capture cannot follow them).
+fn prepare_capture_region(
+    rect: crate::geometry::LogicalRect,
+    outputs: &[crate::geometry::OutputInfo],
+) -> Option<CaptureOutputRegion> {
+    let viewport = crate::geometry::SelectedViewport::from_outputs(rect, outputs).ok()?;
+    if viewport.regions.len() != 1 {
+        return None;
+    }
+    let scale = viewport.regions[0].output_scale;
+    Some(inset_capture_region(viewport.capture_regions()[0], scale))
+}
+
 struct LongCaptureWorker {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    region: std::sync::Arc<std::sync::Mutex<CaptureOutputRegion>>,
     receiver: mpsc::Receiver<CaptureMessage>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl LongCaptureWorker {
-    fn start(region: CaptureOutputRegion, max_frame_rate: u32) -> Self {
+    fn start(initial_region: CaptureOutputRegion, max_frame_rate: u32) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let region = std::sync::Arc::new(std::sync::Mutex::new(region));
         let (sender, receiver) = mpsc::sync_channel::<CaptureMessage>(4);
         let thread_stop = std::sync::Arc::clone(&stop);
         let thread_paused = std::sync::Arc::clone(&paused);
-        let thread_region = std::sync::Arc::clone(&region);
+        let output_name = initial_region.output_name;
         let frame_interval = long_frame_interval(max_frame_rate);
         let thread = std::thread::spawn(move || {
-            let output_name = thread_region.lock().map(|region| region.output_name).unwrap_or_default();
             let mut session = match crate::wayland::screencopy::CaptureSession::new(output_name) {
                 Ok(s) => s,
                 Err(err) => {
@@ -138,7 +163,7 @@ impl LongCaptureWorker {
             };
             let mut last: Option<std::time::Instant> = None;
             let mut index: usize = 0;
-            while !thread_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            'outer: while !thread_stop.load(std::sync::atomic::Ordering::Relaxed) {
                 // While an edit-mode edge drag is in progress the box geometry
                 // is in flux; idle instead of capturing intermediate sizes.
                 if thread_paused.load(std::sync::atomic::Ordering::Relaxed) {
@@ -156,24 +181,28 @@ impl LongCaptureWorker {
                     }
                 }
                 last = Some(std::time::Instant::now());
-                let region = match thread_region.lock() {
-                    Ok(region) => *region,
-                    Err(_) => return,
-                };
                 let (ack_tx, ack_rx) = mpsc::sync_channel(0);
                 if sender.send(CaptureMessage::PrepareCapture { index, ack: ack_tx }).is_err() {
                     return;
                 }
-                loop {
+                // The UI thread owns the authoritative region: it renders the
+                // capture-clean overlay and hands back the region derived
+                // from that same rectangle. Skipping means the geometry was
+                // in flux (edit drag) or the clean render failed; retry.
+                let region = 'ack: loop {
                     if thread_stop.load(std::sync::atomic::Ordering::Relaxed) {
                         return;
                     }
                     match ack_rx.recv_timeout(Duration::from_millis(10)) {
-                        Ok(_) => break,
+                        Ok(PrepareAck::Capture(region)) => break 'ack region,
+                        Ok(PrepareAck::Skip) => {
+                            std::thread::sleep(Duration::from_millis(8));
+                            continue 'outer;
+                        }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     }
-                }
+                };
                 match session.capture_region_frame_without_cursor(region, true) {
                     Ok(image) => {
                         if sender.send(CaptureMessage::Frame { image, region }).is_err() {
@@ -189,15 +218,7 @@ impl LongCaptureWorker {
             }
             let _ = sender.send(CaptureMessage::Finished);
         });
-        Self { stop, paused, region, receiver, thread: Some(thread) }
-    }
-
-    /// Updates the capture region used for subsequent frames. Selection-box
-    /// edits in long mode call this so the worker follows the resized box.
-    fn update_region(&self, region: CaptureOutputRegion) {
-        if let Ok(mut current) = self.region.lock() {
-            *current = region;
-        }
+        Self { stop, paused, receiver, thread: Some(thread) }
     }
 
     /// Pauses or resumes frame capture. Paused while an edit-mode edge drag
@@ -261,8 +282,29 @@ fn run_long_capture(
     while !capture_finished {
         match worker.recv_timeout(LONG_UI_POLL_INTERVAL) {
             Ok(CaptureMessage::PrepareCapture { ack, .. }) => {
-                let _ = selection_session.prepare_capture_clean();
-                let _ = ack.send(());
+                // Decision made on the UI thread, single-threaded: the clean
+                // overlay render and the region handed back to the worker are
+                // derived from the same rectangle at the same instant. During
+                // an edit drag (or when the clean render cannot commit) the
+                // frame is skipped rather than captured against stale
+                // geometry — that mismatch was the root cause of white
+                // borders inside stitched long captures.
+                let decision = if selection_session.edit_drag_active() {
+                    None
+                } else {
+                    selection_session
+                        .prepare_capture_clean()
+                        .then(|| {
+                            selection_session
+                                .selection_rect()
+                                .and_then(|rect| prepare_capture_region(rect, &selection_session.output_infos()))
+                        })
+                        .flatten()
+                };
+                let _ = match decision {
+                    Some(region) => ack.send(PrepareAck::Capture(region)),
+                    None => ack.send(PrepareAck::Skip),
+                };
             }
             Ok(CaptureMessage::Frame { image, region }) => {
                 if should_skip_duplicate_frame(prev_raw.as_ref().map(|(r, i)| (*r, i)), region, &image) {
@@ -328,19 +370,18 @@ fn run_long_capture(
             // Drain remaining frames from queue before exit
             while let Ok(msg) = worker.recv_timeout(Duration::from_millis(0)) {
                 if let CaptureMessage::PrepareCapture { ack, .. } = msg {
-                    let _ = ack.send(());
+                    let _ = ack.send(PrepareAck::Skip);
                 }
             }
             break;
         }
         let _ = selection_session.dispatch_poll(0);
-        // Pause capture while an edit-mode edge drag is reshaping the box;
-        // resume on release so the next frame captures the settled geometry.
-        worker.set_paused(selection_session.edit_drag_active());
-        // Follow selection-box edits made in edit mode: the worker region and
-        // the preview mapping track the adjusted rectangle, and each frame is
-        // tagged with the region it was captured from so the stitcher can
-        // place geometry-changed frames deterministically.
+        // Follow selection-box edits made in edit mode first (the preview
+        // mapping tracks the adjusted rectangle), then let the worker resume:
+        // paused-flag and geometry must never race apart. The capture region
+        // itself is no longer fed to the worker here — it is derived from
+        // the same rectangle as the clean render inside the PrepareCapture
+        // handshake above.
         if let Some(rect) = selection_session.selection_rect() {
             if rect != live_rect {
                 match crate::geometry::SelectedViewport::from_outputs(
@@ -353,12 +394,14 @@ fn run_long_capture(
                             viewport.capture_regions()[0],
                             viewport.regions[0].output_scale,
                         );
-                        worker.update_region(live_region);
                     }
                     _ => {}
                 }
             }
         }
+        // Pause capture while an edit-mode edge drag is reshaping the box;
+        // resume on release so the next frame captures the settled geometry.
+        worker.set_paused(selection_session.edit_drag_active());
         match selection_session.long_status() {
             crate::wayland::selection::LongSessionStatus::Running => {}
             crate::wayland::selection::LongSessionStatus::FinishRequested => break,
@@ -485,6 +528,41 @@ mod tests {
         let config = crate::config::Config { max_fps: 15, border_width: 3 };
         assert_eq!(Some(45).unwrap_or(config.max_fps), 45);
         assert_eq!(None.unwrap_or(config.max_fps), 15);
+    }
+
+    #[test]
+    fn prepare_capture_region_insets_single_output_selection() {
+        let outputs = vec![crate::geometry::OutputInfo {
+            global_name: 7,
+            logical: crate::geometry::LogicalRect { x: 1920, y: 0, width: 1920, height: 1080 },
+            scale: 1,
+        }];
+        let rect = crate::geometry::LogicalRect { x: 2000, y: 100, width: 300, height: 200 };
+        let region = prepare_capture_region(rect, &outputs).expect("single-output selection maps");
+        assert_eq!(region.output_name, 7);
+        // Output-local coordinates, inset one logical pixel per side.
+        assert_eq!(region.region, Region { x: 80 + 1, y: 100 + 1, width: 298, height: 198 });
+    }
+
+    #[test]
+    fn prepare_capture_region_rejects_spanning_selections() {
+        let outputs = vec![
+            crate::geometry::OutputInfo {
+                global_name: 1,
+                logical: crate::geometry::LogicalRect { x: 0, y: 0, width: 1920, height: 1080 },
+                scale: 1,
+            },
+            crate::geometry::OutputInfo {
+                global_name: 2,
+                logical: crate::geometry::LogicalRect { x: 1920, y: 0, width: 1920, height: 1080 },
+                scale: 1,
+            },
+        ];
+        let spanning = crate::geometry::LogicalRect { x: 1800, y: 10, width: 300, height: 100 };
+        assert!(prepare_capture_region(spanning, &outputs).is_none());
+        // A selection off every output is equally unmappable.
+        let outside = crate::geometry::LogicalRect { x: -500, y: -500, width: 10, height: 10 };
+        assert!(prepare_capture_region(outside, &outputs).is_none());
     }
 
     #[test]
