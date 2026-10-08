@@ -63,6 +63,26 @@ impl LogicalRect {
         let height = y2 - y1;
         (width > 0 && height > 0).then_some(Self { x: x1, y: y1, width, height })
     }
+
+    pub fn area(self) -> i64 {
+        i64::from(self.width.max(0)) * i64::from(self.height.max(0))
+    }
+}
+
+/// Whether a selection rectangle overlaps more than one output. Long capture
+/// works on a single output, so a spanning selection must be clamped first.
+pub fn rect_spans_outputs(rect: LogicalRect, outputs: &[OutputInfo]) -> bool {
+    outputs.iter().filter(|output| rect.intersection(output.logical).is_some()).count() > 1
+}
+
+/// Largest single-output piece of a possibly spanning selection: the
+/// intersection with the output that covers the most of it.
+pub fn clamp_rect_to_largest_output(rect: LogicalRect, outputs: &[OutputInfo]) -> LogicalRect {
+    outputs
+        .iter()
+        .filter_map(|output| rect.intersection(output.logical))
+        .max_by_key(|intersection| intersection.area())
+        .unwrap_or(rect)
 }
 
 impl SelectedViewport {
@@ -184,5 +204,42 @@ mod tests {
         let output = [OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 0, width: 100, height: 80 }, scale: 1 }];
         assert!(SelectedViewport::from_outputs(LogicalRect { x: 0, y: 0, width: 0, height: 10 }, &output).is_err());
         assert!(SelectedViewport::from_outputs(LogicalRect { x: 200, y: 0, width: 10, height: 10 }, &output).is_err());
+    }
+
+    #[test]
+    fn spans_outputs_detects_multi_output_selections() {
+        let outputs = [
+            OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 0, width: 100, height: 80 }, scale: 1 },
+            OutputInfo { global_name: 2, logical: LogicalRect { x: 100, y: 0, width: 100, height: 80 }, scale: 1 },
+        ];
+        let single = LogicalRect { x: 10, y: 10, width: 30, height: 30 };
+        let spanning = LogicalRect { x: 80, y: 10, width: 40, height: 30 };
+        let outside = LogicalRect { x: 500, y: 500, width: 10, height: 10 };
+        assert!(!rect_spans_outputs(single, &outputs));
+        assert!(rect_spans_outputs(spanning, &outputs));
+        assert!(!rect_spans_outputs(outside, &outputs));
+    }
+
+    #[test]
+    fn clamp_to_largest_output_keeps_dominant_piece() {
+        let outputs = [
+            OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 0, width: 100, height: 80 }, scale: 1 },
+            OutputInfo { global_name: 2, logical: LogicalRect { x: 100, y: 0, width: 100, height: 80 }, scale: 1 },
+        ];
+        // 70 px on the left output, 30 px on the right one.
+        let spanning = LogicalRect { x: 30, y: 10, width: 70, height: 30 };
+        assert_eq!(
+            clamp_rect_to_largest_output(spanning, &outputs),
+            LogicalRect { x: 30, y: 10, width: 70, height: 30 }
+        );
+        // Mostly on the right output: keeps only that piece.
+        let mostly_right = LogicalRect { x: 80, y: 10, width: 40, height: 30 };
+        assert_eq!(
+            clamp_rect_to_largest_output(mostly_right, &outputs),
+            LogicalRect { x: 100, y: 10, width: 20, height: 30 }
+        );
+        // No overlap: returned unchanged (callers treat it as an error case).
+        let outside = LogicalRect { x: 500, y: 500, width: 10, height: 10 };
+        assert_eq!(clamp_rect_to_largest_output(outside, &outputs), outside);
     }
 }

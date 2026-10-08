@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod clipboard;
+mod config;
 mod geometry;
 mod image;
 mod runtime;

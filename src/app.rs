@@ -15,25 +15,48 @@ fn long_frame_interval(max_frame_rate: u32) -> Duration {
     Duration::from_nanos(1_000_000_000 / u64::from(max_frame_rate.max(1)))
 }
 
+/// Shrinks a capture region one logical pixel inward on every side (scaled
+/// to buffer pixels) so the selection overlay's own border — however the
+/// compositor rasterizes it — can never bleed into captured frames.
+fn inset_capture_region(
+    region: CaptureOutputRegion,
+    scale: i32,
+) -> CaptureOutputRegion {
+    let inset = scale.max(1);
+    CaptureOutputRegion {
+        output_name: region.output_name,
+        region: crate::wayland::screencopy::Region {
+            x: region.region.x + inset,
+            y: region.region.y + inset,
+            width: (region.region.width - 2 * inset).max(1),
+            height: (region.region.height - 2 * inset).max(1),
+        },
+        dst_x: region.dst_x,
+        dst_y: region.dst_y,
+    }
+}
+
 pub fn run() -> Result<(), Box<dyn Error>> {
+    let config = crate::config::Config::load();
     match Command::parse()? {
         Command::Screenshot(args) if args.help => {
             print!("{}", crate::cli::HELP);
             Ok(())
         }
-        Command::Screenshot(args) if args.mode == Mode::Long => run_long(args),
-        Command::Screenshot(args) => run_normal(args),
+        Command::Screenshot(args) if args.mode == Mode::Long => run_long(args, config),
+        Command::Screenshot(args) => run_normal(args, config),
         Command::ClipboardProvider(args) => crate::clipboard::serve_path(&args.path, args.mode),
     }
 }
 
-fn run_normal(args: crate::cli::Args) -> Result<(), Box<dyn Error>> {
+fn run_normal(args: crate::cli::Args, config: crate::config::Config) -> Result<(), Box<dyn Error>> {
     crate::runtime::ensure_niri_session()?;
     let frozen_outputs = crate::wayland::screencopy::capture_outputs_with_cursor()?;
     let frozen_outputs_without_cursor = crate::wayland::screencopy::capture_outputs_without_cursor()?;
     let mut session = crate::wayland::selection::SelectionSession::with_frozen_pair(
         &frozen_outputs,
         &frozen_outputs_without_cursor,
+        config.border_width,
     )?;
     match session.run_selection()? {
         crate::wayland::selection::SelectionOutcome::Selected(viewport) => {
@@ -56,7 +79,7 @@ fn run_normal(args: crate::cli::Args) -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         crate::wayland::selection::SelectionOutcome::LongModeRequested(viewport) => {
-            run_long_capture(args, viewport, session)
+            run_long_capture(args, viewport, session, config)
         }
         crate::wayland::selection::SelectionOutcome::Cancelled => {
             session.close()?;
@@ -65,9 +88,9 @@ fn run_normal(args: crate::cli::Args) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn run_long(args: crate::cli::Args) -> Result<(), Box<dyn Error>> {
+fn run_long(args: crate::cli::Args, config: crate::config::Config) -> Result<(), Box<dyn Error>> {
     crate::runtime::ensure_niri_session()?;
-    let mut selection_session = crate::wayland::selection::SelectionSession::new_long()?;
+    let mut selection_session = crate::wayland::selection::SelectionSession::new_long(config.border_width)?;
     let viewport = match selection_session.run_selection()? {
         crate::wayland::selection::SelectionOutcome::Selected(viewport) => viewport,
         crate::wayland::selection::SelectionOutcome::LongModeRequested(viewport) => viewport,
@@ -76,7 +99,7 @@ fn run_long(args: crate::cli::Args) -> Result<(), Box<dyn Error>> {
             return Err("selection cancelled".into());
         }
     };
-    run_long_capture(args, viewport, selection_session)
+    run_long_capture(args, viewport, selection_session, config)
 }
 
 enum CaptureMessage {
@@ -151,7 +174,7 @@ impl LongCaptureWorker {
                         Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     }
                 }
-                match session.capture_region_frame_without_cursor(region, index > 0) {
+                match session.capture_region_frame_without_cursor(region, true) {
                     Ok(image) => {
                         if sender.send(CaptureMessage::Frame { image, region }).is_err() {
                             return;
@@ -206,18 +229,27 @@ fn run_long_capture(
     args: crate::cli::Args,
     viewport: crate::geometry::SelectedViewport,
     mut selection_session: crate::wayland::selection::SelectionSession,
+    config: crate::config::Config,
 ) -> Result<(), Box<dyn Error>> {
+    // L-promoted selections may span outputs even though the interactive
+    // long path already clamps: fall back to the largest single-output piece.
+    let mut viewport = viewport;
     if viewport.regions.len() != 1 {
-        selection_session.close()?;
-        return Err("long capture selection must be contained within a single output".into());
+        let infos = selection_session.output_infos();
+        let clamped = crate::geometry::clamp_rect_to_largest_output(viewport.rect, &infos);
+        viewport = crate::geometry::SelectedViewport::from_outputs(clamped, &infos)?;
     }
     if let Err(err) = selection_session.set_selected_viewport_passthrough(&viewport) {
         selection_session.close()?;
         return Err(err);
     }
 
-    let initial_region = viewport.capture_regions()[0];
-    let mut worker = LongCaptureWorker::start(initial_region, args.max_frame_rate);
+    let initial_region = inset_capture_region(
+        viewport.capture_regions()[0],
+        viewport.regions[0].output_scale,
+    );
+    let max_frame_rate = args.max_frame_rate.unwrap_or(config.max_fps);
+    let mut worker = LongCaptureWorker::start(initial_region, max_frame_rate);
     let mut stitcher = RawStitcher::new();
     let mut cancelled = false;
     let mut capture_finished = false;
@@ -304,7 +336,7 @@ fn run_long_capture(
         let _ = selection_session.dispatch_poll(0);
         // Pause capture while an edit-mode edge drag is reshaping the box;
         // resume on release so the next frame captures the settled geometry.
-        worker.set_paused(selection_session.edge_drag_active());
+        worker.set_paused(selection_session.edit_drag_active());
         // Follow selection-box edits made in edit mode: the worker region and
         // the preview mapping track the adjusted rectangle, and each frame is
         // tagged with the region it was captured from so the stitcher can
@@ -317,7 +349,10 @@ fn run_long_capture(
                 ) {
                     Ok(viewport) if viewport.regions.len() == 1 => {
                         live_rect = rect;
-                        live_region = viewport.capture_regions()[0];
+                        live_region = inset_capture_region(
+                            viewport.capture_regions()[0],
+                            viewport.regions[0].output_scale,
+                        );
                         worker.update_region(live_region);
                     }
                     _ => {}
@@ -423,6 +458,33 @@ mod tests {
         assert_eq!(long_frame_interval(240), Duration::from_nanos(1_000_000_000 / 240));
         // Degenerate zero falls back to a 1 fps crawl instead of dividing by zero.
         assert_eq!(long_frame_interval(0), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn inset_capture_region_shrinks_one_logical_pixel_per_side() {
+        let region = region_at(100, 200, 300, 400);
+        // Scale 1: exactly one buffer pixel inward per side.
+        assert_eq!(
+            inset_capture_region(region, 1),
+            region_at(101, 201, 298, 398)
+        );
+        // Scale 2: one logical pixel equals two buffer pixels.
+        assert_eq!(
+            inset_capture_region(region, 2),
+            region_at(102, 202, 296, 396)
+        );
+        // Degenerate tiny regions stay at least one pixel in size.
+        let tiny = region_at(0, 0, 2, 2);
+        assert_eq!(inset_capture_region(tiny, 1).region.width, 1);
+        assert_eq!(inset_capture_region(tiny, 1).region.height, 1);
+    }
+
+    #[test]
+    fn effective_frame_rate_prefers_flag_over_config() {
+        // `--fps` wins when given; otherwise the config file value applies.
+        let config = crate::config::Config { max_fps: 15, border_width: 3 };
+        assert_eq!(Some(45).unwrap_or(config.max_fps), 45);
+        assert_eq!(None.unwrap_or(config.max_fps), 15);
     }
 
     #[test]

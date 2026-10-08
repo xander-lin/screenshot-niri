@@ -30,7 +30,9 @@ pub struct Args {
     pub mode: Mode,
     pub clipboard_mode: ClipboardMode,
     pub output_path: PathBuf,
-    pub max_frame_rate: u32,
+    /// Explicit `--fps` override; `None` falls back to the config file's
+    /// `max_fps` (and the hardcoded default when no config exists).
+    pub max_frame_rate: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,11 +42,13 @@ pub struct ClipboardProviderArgs {
 }
 
 /// Hardcoded default long-capture frame-rate cap (fps).
-pub const DEFAULT_MAX_FRAME_RATE: u32 = 30;
+pub use crate::config::DEFAULT_MAX_FRAME_RATE;
+/// Hardcoded default selection-border thickness in logical pixels.
+pub use crate::config::DEFAULT_BORDER_WIDTH;
 /// Upper bound accepted for `--fps`.
-pub const MAX_FRAME_RATE_LIMIT: u32 = 240;
+pub use crate::config::MAX_FRAME_RATE_LIMIT;
 
-pub const HELP: &str = "screenshot — Wayland screenshot tool: region, full-screen, and long/scroll capture\n\nUsage: screenshot [OPTIONS] [PATH]\n\nOptions:\n  -h, --help           Show this help text\n  -V, --version        Show version information\n      --long           Interactive long/scroll screenshot mode\n      --fps N          Long-capture frame-rate cap in fps (default: 30, range: 1-240)\n      --file [PATH]    Save to PATH, or to the Pictures/Screenshots directory when omitted\n  -o, --output PATH    Save to PATH instead of a temporary file\n      --name NAME      Output filename; adds .png when missing, timestamped when omitted\n      --url            Put a file URI on the clipboard instead of the image\n\nInteraction:\n  Drag                 Select a region; release saves and copies to the clipboard\n  1-9                  Capture a full screen; screens are numbered left to right\n  H                    Toggle the cursor in the output (cursor hidden by default)\n  L                    Switch the selected region to long/scroll capture\n  E                    Toggle selection-box editing; drag an edge to resize it.\n                        Editing blocks scroll; Enter or Space captures\n  Scroll               Scroll the content inside the region during long capture\n  Up / Down            Hint the vertical scroll direction for better stitching\n  Left / Right         Hint the horizontal scroll direction during long capture\n  Enter or Space       Finish long capture and stitch\n  Esc                  Cancel at any time\n\nWithout --file or --output, the PNG is written under $XDG_RUNTIME_DIR (or\n/tmp/screenshot-rust-<uid>) and the clipboard receives the image itself,\nor a file URI with --url.\n";
+pub const HELP: &str = "screenshot — Wayland screenshot tool: region, full-screen, and long/scroll capture\n\nUsage: screenshot [OPTIONS] [PATH]\n\nOptions:\n  -h, --help           Show this help text\n  -V, --version        Show version information\n      --long           Interactive long/scroll screenshot mode\n      --fps N          Long-capture frame-rate cap in fps (default: 30, range: 1-240;\n                      overrides the max_fps setting in ~/.config/screenshot/config)\n      --file [PATH]    Save to PATH, or to the Pictures/Screenshots directory when omitted\n  -o, --output PATH    Save to PATH instead of a temporary file\n      --name NAME      Output filename; adds .png when missing, timestamped when omitted\n      --url            Put a file URI on the clipboard instead of the image\n\nInteraction:\n  Drag                 Select a region; release saves and copies to the clipboard\n  1-9                  Capture a full screen; screens are numbered left to right\n  H                    Toggle the cursor in the output (cursor hidden by default)\n  L                    Switch the selected region to long/scroll capture\n  E                    Toggle selection-box editing; drag an edge to resize it.\n                        Editing blocks scroll; Enter or Space captures\n  Scroll               Scroll the content inside the region during long capture\n  Up / Down            Hint the vertical scroll direction for better stitching\n  Left / Right         Hint the horizontal scroll direction during long capture\n  Enter or Space       Finish long capture and stitch\n  Esc                  Cancel at any time\n\nWithout --file or --output, the PNG is written under $XDG_RUNTIME_DIR (or\n/tmp/screenshot-rust-<uid>) and the clipboard receives the image itself,\nor a file URI with --url.\n";
 
 impl Command {
     pub fn parse() -> Result<Self, Box<dyn Error>> {
@@ -152,7 +156,7 @@ impl Args {
             mode: if long { Mode::Long } else { Mode::Normal },
             clipboard_mode,
             output_path,
-            max_frame_rate: max_frame_rate.unwrap_or(DEFAULT_MAX_FRAME_RATE),
+            max_frame_rate,
         })
     }
 }
@@ -344,17 +348,17 @@ mod tests {
     }
 
     #[test]
-    fn fps_defaults_to_thirty() {
+    fn fps_defaults_to_unset_for_config_resolution() {
         let args = Args::parse_from(vec![]).unwrap();
-        assert_eq!(args.max_frame_rate, 30);
+        assert_eq!(args.max_frame_rate, None);
     }
 
     #[test]
     fn fps_accepts_flag_and_equals_forms() {
         let args = Args::parse_from(vec![OsString::from("--fps"), OsString::from("30")]).unwrap();
-        assert_eq!(args.max_frame_rate, 30);
+        assert_eq!(args.max_frame_rate, Some(30));
         let args = Args::parse_from(vec![OsString::from("--fps=120")]).unwrap();
-        assert_eq!(args.max_frame_rate, 120);
+        assert_eq!(args.max_frame_rate, Some(120));
     }
 
     #[test]
