@@ -37,7 +37,7 @@ screenshot [OPTIONS] [PATH]
 |------|------|-------------|
 | _(default)_ | Normal | Drag to select a region, save, copy to clipboard |
 | `--long` | Long/Scroll | Select a region, scroll to capture more, press Enter to finish |
-| `--fps N` | — | Long-capture frame-rate cap in fps (default: 60, range: 1–240) |
+| `--fps N` | — | Long-capture frame-rate cap in fps (default: 30, range: 1–240) |
 
 ### Output Path
 
@@ -107,7 +107,7 @@ screenshot /home/me/shots/out.png      # → /home/me/shots/out.png
    - extending the bottom edge after scrolling so static content (headers/footers that repeat while scrolling and would break stitching) is captured once, perfectly attached below.
 7. Press **Enter** or **Space** to finish — the tool stitches all frames and saves.
 8. Press **Esc** to cancel.
-9. Long screenshots always use cursor-free capture frames; **H** applies only to normal screenshots. Long capture is capped at 60 fps by default (`--fps` to change); frames are damage-driven, so slower machines and static content naturally capture less often.
+9. Long screenshots always use cursor-free capture frames; **H** applies only to normal screenshots. Long capture is capped at 30 fps by default (`--fps` to change); frames are damage-driven, so slower machines and static content naturally capture less often.
 
 > **Tip**: Scroll slowly for best results. The stitcher tracks frame overlap automatically; direction hints improve accuracy with fast or jumpy scrolling.
 

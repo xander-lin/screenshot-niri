@@ -5,7 +5,7 @@
 - Responsibilities: parse supported flags, reject invalid combinations, resolve output paths, and render help text.
 - Non-responsibilities: Wayland interaction, filesystem image writing, and clipboard serving.
 - Inputs: process args, `XDG_RUNTIME_DIR`, `XDG_PICTURES_DIR`, `HOME`, and explicit paths/names.
-- Outputs: `Args` with mode, clipboard mode, output path, and long-capture frame-rate cap (`--fps`, default 60, range 1-240).
+- Outputs: `Args` with mode, clipboard mode, output path, and long-capture frame-rate cap (`--fps`, default 30, range 1-240).
 - Dependencies: standard library and `libc` for local timestamp and uid fallback path.
 - Forbidden dependencies: compositor-specific code and filesystem capture logic.
 - Failure modes: unknown flags, missing flag values, unsafe temp directory, invalid `--name`, out-of-range or non-numeric `--fps`, and mutually exclusive output modes.

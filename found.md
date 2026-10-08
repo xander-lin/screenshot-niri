@@ -24,7 +24,7 @@ Verified mistakes and actionable lessons only. Do not fabricate incidents; recor
 
 ## 4. Path-wide `git checkout -- src/` destroyed uncommitted test work during mutation testing
 
-- **Mistake/context**: While mutation-testing the edit-mode feature (2026-10-08), mutations were reverted with `git checkout -- src/` while the new gap-closing tests were still uncommitted; the revert wiped an hour of uncommitted work (later reconstructed from session context and re-committed as `35ac995`).
-- **Root cause**: Mutation experiments and uncommitted feature work shared the working tree; the revert path was wider than the mutations and no `git status` check preceded it.
-- **Correction**: Reconstructed the work, committed it, then re-ran the mutation protocol on a clean tree.
-- **Prevention**: Commit (or stash) before any mutation/revert experiment; verify `git status --short` shows only the intended mutations before reverting; revert mutations with precise inverse edits or `git checkout -- <specific mutated files>` confirmed clean, never a broad path while dirty.
+- **Mistake/context**: While mutation-testing the edit-mode feature (2026-10-08), mutations were reverted with `git checkout -- src/` while the new gap-closing tests were still uncommitted; the revert wiped an hour of uncommitted work (later reconstructed from session context and re-committed as `35ac995`). The same mistake was repeated later the same day: `git checkout -- src/wayland/selection.rs` reverted a mutation and also the uncommitted live-selection-box fix (reconstructed, commit `8176f0e`).
+- **Root cause**: Mutation experiments and uncommitted feature work shared the working tree; the revert path was wider than the mutations and no `git status` check preceded it. Despite the recorded prevention rule, compound shell commands (`cmd1 && cmd2 ; git checkout -- …`) made the destructive revert a muscle-memory tail.
+- **Correction**: Reconstructed and committed both times; subsequent mutations ran on a committed tree.
+- **Prevention**: Commit **before** every mutation experiment — no exceptions. Revert mutations only after `git status --short` confirms the tree is clean apart from the mutation, and never chain the revert into a compound command with `;`.
