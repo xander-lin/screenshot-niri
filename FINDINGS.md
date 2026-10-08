@@ -47,6 +47,7 @@
 - Fuzzy/threshold overlap `RawStitcher` validation passed with `cargo test stitch` (39 passed), `cargo test` (69 passed), and `cargo check`.
 - Manual niri session testing before the frozen-background change was reported successful for selection, capture, file writing, and clipboard behavior.
 - Post-cache manual niri feedback reports selection responsiveness and CPU behavior are much improved; this does not prove all performance issues are solved.
+- Edit-mode/geometry-stitching validation (2026-10-08): mutation testing initially showed four injected bugs surviving the full suite (region-change duplicate bypass, crop-anchor delta, Enter not leaving edit mode, preview transparency); decision logic was extracted into pure functions (`should_skip_duplicate_frame`, `resolve_key_action`/`apply_key_action`) and regression tests added until each mutation is caught. Suite: 240 tests. Wayland dispatch/compositor behavior (input-region grabbing, wheel blocking, passthrough toggling) remains manually-testable only under a live niri session.
 
 ## Maintenance Rule
 

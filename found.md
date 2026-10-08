@@ -21,3 +21,10 @@ Verified mistakes and actionable lessons only. Do not fabricate incidents; recor
 - **Root cause**: Judging API liveness from the bin target's warnings without checking `#[cfg(test)]` users.
 - **Correction**: Restored the method behind `#[cfg_attr(not(test), allow(dead_code))]`.
 - **Prevention**: Before removing anything flagged dead, grep the whole crate including test modules (`grep -rn "<name>" src/`); prefer `#[cfg_attr(not(test), allow(dead_code))]` for test-only public API over deletion.
+
+## 4. Path-wide `git checkout -- src/` destroyed uncommitted test work during mutation testing
+
+- **Mistake/context**: While mutation-testing the edit-mode feature (2026-10-08), mutations were reverted with `git checkout -- src/` while the new gap-closing tests were still uncommitted; the revert wiped an hour of uncommitted work (later reconstructed from session context and re-committed as `35ac995`).
+- **Root cause**: Mutation experiments and uncommitted feature work shared the working tree; the revert path was wider than the mutations and no `git status` check preceded it.
+- **Correction**: Reconstructed the work, committed it, then re-ran the mutation protocol on a clean tree.
+- **Prevention**: Commit (or stash) before any mutation/revert experiment; verify `git status --short` shows only the intended mutations before reverting; revert mutations with precise inverse edits or `git checkout -- <specific mutated files>` confirmed clean, never a broad path while dirty.
