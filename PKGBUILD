@@ -4,7 +4,7 @@
 pkgname=screenshot-niri
 pkgver=0.1.0
 pkgrel=2
-pkgdesc="Niri Wayland screenshot tool — normal and long/scroll screenshots with frozen-background selection overlay"
+pkgdesc="Wayland screenshot tool — region, full-screen, and long/scroll capture with a frozen-background selection overlay"
 arch=('x86_64')
 url="https://github.com/xander-lin/screenshot-niri"
 license=('MIT')

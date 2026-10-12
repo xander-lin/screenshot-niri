@@ -1,15 +1,14 @@
 pkgbase = screenshot-niri
-	pkgdesc = Niri Wayland screenshot tool — normal and long/scroll screenshots with frozen-background selection overlay
+	pkgdesc = Wayland screenshot tool — region, full-screen, and long/scroll capture with a frozen-background selection overlay
 	pkgver = 0.1.0
-	pkgrel = 1
+	pkgrel = 2
 	url = https://github.com/xander-lin/screenshot-niri
 	arch = x86_64
 	license = MIT
 	makedepends = cargo
 	makedepends = git
-	depends = 
 	conflicts = screenshot-plain
-	source = git+https://github.com/xander-lin/screenshot-niri.git
+	source = screenshot-niri::git+https://github.com/xander-lin/screenshot-niri.git
 	sha256sums = SKIP
 
 pkgname = screenshot-niri

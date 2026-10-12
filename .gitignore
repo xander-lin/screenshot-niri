@@ -1,4 +1,9 @@
 /target/
+/pkg/
+/screenshot-niri/
 .idea/
 .omo/
+.cortexkit/
 perf.data*
+*.pkg.tar.*
+*.tar.gz
