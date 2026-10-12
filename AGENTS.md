@@ -28,9 +28,9 @@
 ## Project Principles
 
 - Each module has a contract in `src/CONTRACT.md` (responsibilities, non-responsibilities, inputs/outputs, failure modes, verification). Respect and update it when changing module boundaries.
-- `FINDINGS.md` is the durable project memory; code is authoritative over docs — verify against code before relying on doc claims.
-- Keep docs (`CONTRACT.md`, `FINDINGS.md`, `README.md`) in sync in the same change as behavior milestones (see `found.md` lesson on documentation drift).
-- Verification: `cargo test` (unit tests live alongside modules; stitch has extensive pure-logic tests), `cargo check`, manual niri testing for Wayland flows.
+- `found.md` holds durable project memory (module relationships, architecture decisions) and lessons learned; code is authoritative over docs — verify against code before relying on doc claims.
+- Keep docs (`CONTRACT.md`, `found.md`, `README.md`, `AGENTS.md`) in sync in the same change as behavior milestones (see the documentation-drift lesson in `found.md`).
+- Verification: `cargo test` (unit tests live alongside modules; stitch has extensive pure-logic tests), `cargo check`, manual testing of Wayland flows under a live compositor.
 - Long-capture performance protections must be preserved: configurable frame-rate cap (`--fps`, hardcoded default 30, range 1–240), damage-based capture after the first frame, near-duplicate frame skip (bypassed when the capture region changed), bounded capture channel backpressure, and capture pause during edit-mode edge drags.
 - Selection-box edit mode (E key) semantics must be preserved: edges have snap targets only in edit mode; edit mode blocks wheel scroll by holding pointer input; frames captured after a resize are stitched at their deterministic known position; only the settled rectangle after an edge-drag release is captured.
 - Overlay rendering maps through the output's real logical rect and actual overlay buffer dimensions (`selected_buffer_rect`), not `wl_output.scale`: overlay surfaces currently use buffer scale 1. Long screencopy requests use output-local logical coordinates; frozen-image crop rectangles use pixels.

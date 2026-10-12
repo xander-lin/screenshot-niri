@@ -33,7 +33,7 @@
 - Dependencies: `cli`, `wayland::screencopy`, `wayland::selection`, `geometry`, `image`, `stitch`, and `clipboard`.
 - Forbidden dependencies: compositor adaptation branches and diagnostics bins.
 - Failure modes: unsupported multi-output long selection, unavailable Wayland connection/protocols, cancelled selection, capture failure, write failure, and clipboard setup failure. Worker errors are propagated rather than silently saving a partial capture.
-- Verification method: integration/manual test under niri and `cargo check`.
+- Verification method: integration/manual test under a live Wayland compositor and `cargo check`.
 - Replacement contract: preserve freeze, select, composite, write, clipboard; long capture keeps pacing, damage waits, and per-frame region tags. Use output-local logical coordinates for screencopy requests, with offsets converted to returned-frame pixels for stitching. PrepareCapture returns the exact rendered rectangle after synchronizing the selected output's commit; frame receipt releases its exclusion. Discard frames invalidated by edits before deduplication/stitching. Skip requests during active edit drags or unavailable buffers. Stop must interrupt damage waits. Compatibility is user-tested, not gated by `NIRI_SOCKET` or `XDG_CURRENT_DESKTOP`.
 
 ## `geometry`
@@ -81,7 +81,7 @@
 - Dependencies: `wayland-client` and `wayland-protocols-wlr` data-control protocol.
 - Forbidden dependencies: external clipboard commands and compositor-specific fallbacks.
 - Failure modes: missing data-control manager, missing seat, provider startup failure, or send I/O failure.
-- Verification method: manual paste tests under niri and `cargo check`.
+- Verification method: manual paste tests under a live Wayland compositor and `cargo check`.
 - Replacement contract: keep `image/png` and file URI clipboard modes available from a saved path.
 
 ## `wayland::screencopy`
@@ -93,7 +93,7 @@
 - Dependencies: `wayland-client`, `wayland-protocols-wlr`, `tempfile`, and `libc`.
 - Forbidden dependencies: non-wlr capture APIs and compositor adaptation branches.
 - Failure modes: missing globals, unsupported buffer format, failed SHM allocation, screencopy failure, and protocol cancellation.
-- Verification method: manual niri capture plus `cargo check`.
+- Verification method: manual capture under a live Wayland compositor plus `cargo check`.
 - Replacement contract: provide frozen output frames suitable for selection-time compositing. Persistent damage waits must poll the stop flag with bounded latency so joining the worker does not require fresh screen damage.
 
 ## `wayland::selection`
@@ -105,5 +105,5 @@
 - Dependencies: `wayland-client`, `wayland-protocols`, `wayland-protocols-wlr`, `tempfile`, and `libc`.
 - Forbidden dependencies: focus-grab extensions and compositor-name checks.
 - Failure modes: missing layer-shell/compositor/shm/seat/output globals, missing frozen output frame, unsupported frozen frame format, no pointer, cancellation, or empty selection.
-- Verification method: unit tests for overlay pixels/dirty regions/edge hit-testing/edge clamping, manual niri drag-selection and edit-mode test, and `cargo check`.
+- Verification method: unit tests for overlay pixels/dirty regions/edge hit-testing/edge clamping, manual drag-selection and edit-mode test under a live Wayland compositor, and `cargo check`.
 - Replacement contract: return geometry-only selection data usable by screencopy compositing; preserve edit-mode input semantics. Map through the real logical output rect and actual overlay dimensions. Cache only dim/hole; composite preview then border every time. Frozen/live borders share one closed outside-ring pixel rule, including corners and configured thickness. Frozen damage includes the ring; edit borders follow the current rectangle, not the larger exclusion hole. `prepare_capture_clean` commits on the selected output and roundtrips before acknowledgment. `complete_capture` returns false for any frame exposed to a geometry change (sticky even after moving back); the app must discard it before stitching. Preview remains excluded from the pending region until completion.

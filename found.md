@@ -1,79 +1,104 @@
-# found.md — Lessons Learned
+# found.md — Project Memory & Lessons Learned
 
-Verified mistakes and actionable lessons only. Do not fabricate incidents; record new ones promptly.
+Durable, verified project memory plus actionable lessons. Code is authoritative over docs.
 
-## 1. Documentation drift: FINDINGS.md/CONTRACT.md claimed long mode was unsupported while the code implemented it
+Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**. Record only verified incidents; never fabricate.
 
-- **Mistake/context**: On 2026-10-08, `FINDINGS.md` (Project Scope, Module Relationships, Architecture Decisions) and `src/CONTRACT.md` (`app`, `stitch`) still described long screenshots as "out of scope", "test-only", and "`--long` remains unsupported", but `src/app.rs` (`run_long`, `LongCaptureWorker`), `src/cli.rs` (`--long`), and the full `src/stitch.rs` + `src/stitch/` port (commits `b289606`..`a8eb251`) implement long capture end-to-end.
-- **Root cause**: Documentation was not updated in the same changes that landed the longshot work; the docs had drifted across several milestones.
-- **Correction**: Updated the stale FINDINGS.md scope/relationship claims and the `src/CONTRACT.md` `cli`/`app`/`stitch`/`wayland::selection` entries (2026-10-08).
-- **Prevention**: Treat code as the source of truth when answering questions or planning work — verify with `grep`/`read` before citing docs. When completing a behavior milestone, update `CONTRACT.md` and `FINDINGS.md` in the same commit.
+---
 
-## 2. Profiling artifacts were committed to the repository
+## Project Context
 
-- **Mistake/context**: `perf.data`/`perf.data.old` were committed during performance work and later removed from git by commit `650e4a3` ("Remove perf data, add to gitignore"). The files still exist on disk (now ignored).
-- **Root cause**: Profiling output was generated inside the repo before a `.gitignore` rule existed.
-- **Prevention**: Write profiling/temp artifacts outside the repo (e.g. `/tmp/opencode`) or ensure ignore rules exist first; review `git status` before committing.
+`screenshot-rs-rebuild` is a Wayland screenshot tool (binary `screenshot`), originally developed against niri's wlroots protocols. Normal region capture and long/scroll capture are implemented end-to-end.
 
-## 3. Removed an "unused" pub method that lib tests still used
+- **No compositor gate**: the launcher no longer checks `NIRI_SOCKET` or `XDG_CURRENT_DESKTOP`. It attempts the Wayland protocols and leaves compositor compatibility to user testing. Out of scope: X11, focus-grab extensions, diagnostics bins.
+- **Modules**: `cli` parses args and resolves output paths. `app` orchestrates capture → selection → composite → write → clipboard (no preflight). `wayland::screencopy` freezes outputs and drives the persistent long-capture session. `wayland::selection` renders the layer-shell overlay and collects geometry. `geometry` maps logical selections to per-output regions. `image` composites and writes PNG. `stitch` is the multi-stage matcher (canvas placement, perceptual bands, fuzzy hash, fast-motion scan, fixed bands, previous-frame fallback), driven by `app` from the long-capture worker. `clipboard` serves `image/png` or file URI via `wlr-data-control`.
+- **Config** (`~/.config/screenshot/config`): `max_fps` (long-capture cap, default 30, range 1–240) and `border_width` (1–16). The cap is a ceiling over damage-driven pull capture.
+- **Long capture**: `--long` selects one output, captures continuously, and stitches on Enter/Space. `E` toggles edit mode (per-edge resize, interior move) which blocks wheel scroll; region-changed frames are placed at the deterministic offset-implied position, growing ragged T/L canvases whose uncovered extents stay transparent. Capture pauses during edge drags.
+- **Memory model**: per output, 2 full-resolution RGBA overlay buffers plus a base/dim cache; footprint is resolution-driven, not fps-driven. Per-frame capture SHM is munmapped on drop.
+- **Clipboard provider**: the lingering post-screenshot `screenshot` process is the detached `--clipboard-provider`; Wayland requires the data source to stay alive to serve pastes. Expected, not a leak.
 
-- **Mistake/context**: While wiring `push_frame_with_offset` (2026-10-08), `RawStitcher::push_frame_views` looked dead from the bin target's warnings, so it was deleted; `cargo test` then failed because two lib tests call it. The bin-target dead-code warning was misleading: the method was test-only API.
-- **Root cause**: Judging API liveness from the bin target's warnings without checking `#[cfg(test)]` users.
-- **Correction**: Restored the method behind `#[cfg_attr(not(test), allow(dead_code))]`.
-- **Prevention**: Before removing anything flagged dead, grep the whole crate including test modules (`grep -rn "<name>" src/`); prefer `#[cfg_attr(not(test), allow(dead_code))]` for test-only public API over deletion.
+---
 
-## 4. Path-wide `git checkout -- src/` destroyed uncommitted test work during mutation testing
+## Lessons Learned
 
-- **Mistake/context**: While mutation-testing the edit-mode feature (2026-10-08), mutations were reverted with `git checkout -- src/` while the new gap-closing tests were still uncommitted; the revert wiped an hour of uncommitted work (later reconstructed from session context and re-committed as `35ac995`). The same mistake was repeated later the same day: `git checkout -- src/wayland/selection.rs` reverted a mutation and also the uncommitted live-selection-box fix (reconstructed, commit `8176f0e`).
-- **Root cause**: Mutation experiments and uncommitted feature work shared the working tree; the revert path was wider than the mutations and no `git status` check preceded it. Despite the recorded prevention rule, compound shell commands (`cmd1 && cmd2 ; git checkout -- …`) made the destructive revert a muscle-memory tail.
-- **Correction**: Reconstructed and committed both times; subsequent mutations ran on a committed tree.
-- **Prevention**: Commit **before** every mutation experiment — no exceptions. Revert mutations only after `git status --short` confirms the tree is clean apart from the mutation, and never chain the revert into a compound command with `;`.
+### 1. Documentation drift: FINDINGS.md/CONTRACT.md claimed long mode was unsupported while code implemented it
 
-## 5. Capture region and overlay geometry raced across threads (white borders in stitched output)
+- **Context**: Docs still described long screenshots as "out of scope"/"test-only" while `src/app.rs`, `src/cli.rs`, and `src/stitch/` implemented them (commits `b289606`..`a8eb251`).
+- **Root cause**: Docs were not updated in the same changes that landed the work.
+- **Correction**: Updated the stale scope/relationship claims and `src/CONTRACT.md` entries.
+- **Prevention**: Treat code as source of truth; verify with `grep`/`read` before citing docs. Update `CONTRACT.md` and this file in the same commit as behavior changes.
 
-- **Mistake/context**: Long captures occasionally contained a spurious white box (2026-10-08 user report; pixel-scanning the output showed a 3px pure-white rectangle sitting exactly on a stitch seam). The capture worker kept its own region snapshot read before `PrepareCapture`, while the UI thread rendered the capture-clean overlay from whatever `drag` rectangle it had when handling that message; edit-mode drags changed the rectangle in between, so captures swept across freshly drawn borders. Two aggravators made the contamination persist: near-duplicate frame skipping kept polluted canvas rows from being overwritten, and the long-mode preview re-displayed the polluted canvas next to the box where a later edit-extend could re-capture it.
-- **Root cause**: One logical fact ("what region is being captured right now") was owned by two threads with no same-source handshake; the paused flag and region updates also ran in the wrong order in the UI loop tail (unpause before region update), and `prepare_capture_clean` ignored whether its render actually committed.
-- **Correction**: The PrepareCapture ack now carries the region derived from the exact rectangle used for the clean render (worker never trusts a local snapshot; frames are skipped during drags or failed renders); edit drags render the drag-trajectory union as the hole with the border suppressed; `prepare_capture_clean` reports commit success; the dim/base cache is keyed on (size, hole rect, border color, visibility).
-- **Prevention**: When two threads must agree on geometry, derive both sides from a single decision point (send the decision through the handshake, don't duplicate state). Any "clean-up before an asynchronous action" must verify the clean-up happened, not fire-and-forget. When a bug involves visual output, pixel-scan the artifact to locate it geometrically before hypothesizing — the offset (border 3px + inset 1px) pinned the root cause immediately.
+### 2. Profiling artifacts were committed to the repository
 
-## 6. Capture exclusion ended before the asynchronous frame completed
+- **Context**: `perf.data`/`perf.data.old` were committed during performance work before a `.gitignore` rule existed.
+- **Prevention**: Write profiling/temp artifacts outside the repo (e.g. `/tmp/opencode`) or add ignore rules first; review `git status` before committing.
 
-- **Mistake/context**: The earlier border fix cleared its transparent trajectory on mouse release and accepted any output's successful redraw as capture-ready. It also dispatched input after drawing and then read the possibly changed selection for the acknowledgment. The documentation dismissed release-time races as too short for human input.
-- **Root cause**: A commit/flush was treated as capture completion; neither cross-connection scheduling nor damage waiting has a fixed completion deadline, and monitor identity was missing from the readiness decision.
-- **Correction**: Retain the exact prepared rectangle until the worker delivers its frame; all redraws preserve its transparent hole, including release/cancel and preview redraw. Commit on the selected output, roundtrip before acknowledging the worker, and return the saved rectangle rather than rereading mutable selection. Damage waits now poll cancellation so retaining exclusion cannot hang shutdown on a static screen.
-- **Prevention**: Test delayed completion across shrink/move/release and preview redraw at pixel level; treat flush, commit, and frame completion as separate events. Validate readiness for the actual target output and do not infer timing guarantees from expected frame rates.
+### 3. Removed an "unused" pub method that lib tests still used
 
-## 7. Output scale was used for both protocol geometry and overlay buffers
+- **Context**: `RawStitcher::push_frame_views` looked dead from bin-target warnings but was called by two lib tests.
+- **Root cause**: Judging API liveness from bin-target warnings without checking `#[cfg(test)]` users.
+- **Correction**: Restored it behind `#[cfg_attr(not(test), allow(dead_code))]`.
+- **Prevention**: Before removing anything flagged dead, grep the whole crate including test modules; prefer the cfg-attr allow for test-only public API.
 
-- **Mistake/context**: Long capture reused physical-pixel frozen-image crop rectangles as `capture_output_region` arguments, and overlay holes multiplied logical positions by `wl_output.scale` despite allocating logical-sized buffers with surface buffer scale 1.
-- **Root cause**: The shared rectangle type obscured coordinate units. Existing scale-2 rendering tests allocated a hypothetical 2x buffer, missing the real allocation path.
-- **Correction**: Long requests use output-local logical units as specified by the wlr-screencopy XML. Stitch offsets use returned-frame pixels; overlay holes map through actual buffer dimensions. Added tests reproducing the real logical-sized overlay on a scale-2 output. During this change, an initial tiny-region inset adjustment failed the existing 2x2 test; corrected the inset to preserve the required minimum size and added containment checks for 1–4 pixel selections.
-- **Prevention**: Trace units through allocation, surface scale, protocol request, returned buffer, preview, and stitching. Test both logical-sized and scaled buffers on offset outputs, plus degenerate sizes; do not weaken existing assertions when an implementation change breaks them.
+### 4. Path-wide `git checkout -- src/` destroyed uncommitted work
 
-## 8. Packaging from the project root removed the source directory
+- **Context**: Mutation testing reverted with `git checkout -- src/...` while new tests/features were uncommitted; the revert wiped them twice.
+- **Root cause**: Mutation experiments shared the tree with uncommitted work; the revert path was wider than the mutation and no `git status` preceded it.
+- **Prevention**: Commit **before** every mutation experiment. Revert only after `git status --short` confirms the tree is clean apart from the mutation; never chain the revert with `;`.
 
-- **Mistake/context**: During local installation (2026-10-12), a temporary PKGBUILD was written under `/tmp/opencode`, but `makepkg --cleanbuild` ran from the project root. It used the upstream-fetching PKGBUILD and treated the project's `src/` as disposable build output. An earlier archive attempt also ran in `/tmp/opencode` and accidentally included its own output.
-- **Root cause**: Shell working directories were not matched to each operation; creating a file in another directory does not change the directory of subsequent commands.
-- **Correction**: Restored the complete source directory from the pre-build working-tree archive and verified `git diff --exit-code -- src` against the staged source. Built the intended local archive in the isolated package directory, passed 278 release tests, and installed `screenshot-niri 0.1.0-6` through pacman. Removed accidental build artifacts via trash.
-- **Prevention**: Run packaging only in an isolated directory, explicitly set the tool's working directory, inspect PKGBUILD there, and check the reported package version before installing. Create source archives from an explicit project root with the archive outside it. Never use makepkg clean/cleanbuild from a Rust project root containing its own `src/`.
+### 5. Capture region and overlay geometry raced across threads (white borders)
 
-## 9. Cached selection borders were overpainted by the stitched preview
+- **Context**: Stitched captures could contain a spurious white box at a stitch seam. The worker read its region before `PrepareCapture` while the UI thread rendered from whatever rectangle it had at dispatch; edit drags changed it in between.
+- **Root cause**: One fact ("what region is captured now") was owned by two threads with no same-source handshake; `prepare_capture_clean` ignored whether its render committed.
+- **Correction**: The ack carries the region derived from the same rectangle as the clean render; the worker never trusts a local snapshot.
+- **Prevention**: Derive both sides from one decision point via the handshake. Verify asynchronous clean-up actually happened. Pixel-scan visual artifacts before hypothesizing.
 
-- **Mistake/context**: User testing of the long overlay showed the selection border underneath preview pixels. The live base cache included the border, then the preview was drawn over it; a separate input redraw path omitted the preview altogether.
-- **Root cause**: Final visual layers were mixed into a background cache and multiple live render paths had different compositing behavior.
-- **Correction**: Cache only dim mask and transparent hole; render preview and then border on every live redraw. Reuse one live renderer for input, preview, and capture preparation; merge identical overlay constructors and remove the unused borderless entrypoint.
-- **Prevention**: Test final composed pixels, including all four border edges and repeated cache reuse with changing color, thickness, and visibility. Keep capture exclusion tests against the same foreground compositor so stacking changes cannot reintroduce screenshot contamination.
+### 6. Capture exclusion ended before the asynchronous frame completed
 
-## 10. Border strips omitted corners and frozen/live borders disagreed
+- **Context**: The earlier fix cleared its exclusion on mouse release and accepted any output's redraw as capture-ready; it also reread mutable selection for the ack.
+- **Root cause**: A commit/flush was treated as capture completion; damage waits have no fixed deadline, and monitor identity was missing.
+- **Correction**: Retain the exact prepared rectangle until the worker delivers its frame; commit on the selected output, roundtrip before acking, and return the saved rectangle. Damage waits poll cancellation so shutdown never hangs.
+- **Prevention**: Treat flush, commit, and frame completion as separate events. Validate readiness for the actual target output; never infer timing guarantees from expected frame rates.
 
-- **Mistake/context**: Live border strips stopped at the selection's side extents, leaving four corner squares blank. Frozen selection used an unrelated inside-border rule. Edit visibility was suppressed to keep pending captures clean, hiding the box during movement.
-- **Root cause**: Multiple border definitions and using UI suppression instead of rejecting invalid asynchronous frames.
-- **Correction**: One outside-ring pixel predicate defines frozen and live borders, including corners and configured thickness; dirty damage includes the ring. Edit borders follow the current rectangle continuously, with sticky pending-frame invalidation on geometry change and discard before stitching.
-- **Prevention**: Compare frozen/live border masks pixel-for-pixel for widths 1–16; verify partial redraw equals a full redraw after movement. Test move-away-and-back invalidation, since final rectangle equality alone cannot prove frame validity.
+### 7. Output scale was used for both protocol geometry and overlay buffers
 
-## 11. Widening did not fill previously uncaptured canvas strips
+- **Context**: Long capture reused pixel-space crop rectangles as `capture_output_region` args, and overlay holes multiplied logical positions by `wl_output.scale` despite logical-sized buffers at surface scale 1.
+- **Root cause**: A shared rectangle type obscured coordinate units.
+- **Correction**: Long requests use output-local logical units; stitch offsets use returned-frame pixels; overlay holes map through actual buffer dimensions.
+- **Prevention**: Trace units through allocation, surface scale, protocol request, returned buffer, preview, and stitching. Test logical-sized and scaled buffers on offset outputs and degenerate sizes; do not weaken existing assertions.
 
-- **Mistake/context**: Inspection for repeated wide/narrow/wide selections found canvas writes excluded the whole old bounding rectangle, including transparent side strips. New offset rows also unioned their coverage with the empty sentinel `(0,0)`, incorrectly making missing left strips opaque.
-- **Root cause**: Canvas bounds were treated as captured coverage, and empty coverage was treated as a real interval starting at x=0.
-- **Correction**: Preserve actual covered row intervals and copy newly captured strips inside the old bounds; initialize empty row coverage from the frame extent. Export empty rows as transparent.
-- **Prevention**: Run a textured wide → centered narrow → scroll → wide sequence, assert every output pixel and alpha, then repeat resizing. Check that recaptured strips contain real pixels and uncaptured intermediate strips remain transparent.
+### 8. Packaging from the project root removed the source directory
+
+- **Context**: `makepkg --cleanbuild` ran from the project root with an upstream-fetching PKGBUILD and treated `src/` as disposable build output.
+- **Root cause**: Shell working directories were not matched to each operation.
+- **Correction**: Restored `src/` from a pre-build archive and verified against staged content; built the intended archive in an isolated directory.
+- **Prevention**: Package only in an isolated directory with an explicit working directory; inspect PKGBUILD and check the reported version before installing. Never `makepkg clean/cleanbuild` from a Rust project root containing `src/`.
+
+### 9. Cached selection borders were overpainted by the stitched preview
+
+- **Context**: The live base cache included the border and the preview was drawn over it; a separate input redraw path omitted the preview.
+- **Root cause**: Final visual layers were mixed into a background cache, and multiple live render paths behaved differently.
+- **Correction**: Cache only dim mask and hole; composite preview then border on every live redraw; reuse one live renderer.
+- **Prevention**: Test final composed pixels, including all four border edges and cache reuse with changing color/thickness/visibility. Keep capture-exclusion tests on the same foreground compositor.
+
+### 10. Border strips omitted corners and frozen/live borders disagreed
+
+- **Context**: Live border strips stopped at side extents (blank corners), frozen selection used an unrelated inside-border rule, and edit visibility was suppressed to keep captures clean.
+- **Root cause**: Multiple border definitions and hiding the UI instead of rejecting invalid asynchronous frames.
+- **Correction**: One outside-ring predicate defines frozen and live borders (corners included); dirty damage includes the ring; edit borders follow the current rectangle continuously with sticky pending-frame invalidation on geometry change.
+- **Prevention**: Compare frozen/live border masks pixel-for-pixel for widths 1–16; verify partial redraw equals full redraw after movement; test move-away-and-back invalidation.
+
+### 11. Widening did not fill previously uncaptured canvas strips
+
+- **Context**: Canvas writes excluded the whole old bounding rectangle (including transparent side strips), and new offset rows unioned coverage with the empty `(0,0)` sentinel, making missing strips opaque.
+- **Root cause**: Canvas bounds were treated as captured coverage; empty coverage was treated as a real interval at x=0.
+- **Correction**: Preserve actual covered row intervals and copy newly captured strips inside the old bounds; initialize empty rows from the frame extent; export empty rows transparent.
+- **Prevention**: Run a textured wide → narrow → scroll → wide sequence asserting every pixel and alpha, then repeat resizing. Recaptured strips must contain pixels; uncaptured strips must stay transparent.
+
+---
+
+## Verification Memory
+
+- **2026-10-12 final state**: 133 lib + 153 bin tests pass (two profiling tests ignored); `cargo check --locked` and `cargo build --release --locked` pass. Two pre-existing clippy errors (`absurd_extreme_comparisons`) and two unused-import warnings in `cli.rs` exist at the prior commit and were not introduced by recent work.
+- Release-binary smoke checks with Niri hints unset and desktop set to `sway` reached the deliberately unavailable Wayland connection instead of a compositor-name rejection.
+- Wayland dispatch/compositor behavior (input grabbing, wheel blocking, passthrough toggling, live capture) remains manually testable only under a live session; unit tests cover the pure logic and pixel rendering.
