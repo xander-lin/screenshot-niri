@@ -21,12 +21,12 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
 
 ## Lessons Learned
 
-### 1. Documentation drift: FINDINGS.md/CONTRACT.md claimed long mode was unsupported while code implemented it
+### 1. Documentation drift: project docs claimed long mode was unsupported while code implemented it
 
-- **Context**: Docs still described long screenshots as "out of scope"/"test-only" while `src/app.rs`, `src/cli.rs`, and `src/stitch/` implemented them (commits `b289606`..`a8eb251`).
+- **Context**: Project docs still described long screenshots as "out of scope"/"test-only" while `src/app.rs`, `src/cli.rs`, and `src/stitch/` implemented them (commits `b289606`..`a8eb251`). A separate module-contract file (`src/CONTRACT.md`) also drifted.
 - **Root cause**: Docs were not updated in the same changes that landed the work.
-- **Correction**: Updated the stale scope/relationship claims and `src/CONTRACT.md` entries.
-- **Prevention**: Treat code as source of truth; verify with `grep`/`read` before citing docs. Update `CONTRACT.md` and this file in the same commit as behavior changes.
+- **Correction**: Updated the stale scope/relationship claims. Module boundaries now live as a concise "Module Contracts" section in `AGENTS.md` (the standalone file was later removed).
+- **Prevention**: Treat code as source of truth; verify with `grep`/`read` before citing docs. Update `AGENTS.md` and this file in the same commit as behavior changes.
 
 ### 2. Profiling artifacts were committed to the repository
 

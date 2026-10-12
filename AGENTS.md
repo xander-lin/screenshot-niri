@@ -27,9 +27,9 @@
 
 ## Project Principles
 
-- Each module has a contract in `src/CONTRACT.md` (responsibilities, non-responsibilities, inputs/outputs, failure modes, verification). Respect and update it when changing module boundaries.
+- Respect each module's boundary (see Module Contracts below) when changing interfaces.
 - `found.md` holds durable project memory (module relationships, architecture decisions) and lessons learned; code is authoritative over docs — verify against code before relying on doc claims.
-- Keep docs (`CONTRACT.md`, `found.md`, `README.md`, `AGENTS.md`) in sync in the same change as behavior milestones (see the documentation-drift lesson in `found.md`).
+- Keep docs (`found.md`, `README.md`, `AGENTS.md`) in sync in the same change as behavior milestones (see the documentation-drift lesson in `found.md`).
 - Verification: `cargo test` (unit tests live alongside modules; stitch has extensive pure-logic tests), `cargo check`, manual testing of Wayland flows under a live compositor.
 - Long-capture performance protections must be preserved: configurable frame-rate cap (`--fps`, hardcoded default 30, range 1–240), damage-based capture after the first frame, near-duplicate frame skip (bypassed when the capture region changed), bounded capture channel backpressure, and capture pause during edit-mode edge drags.
 - Selection-box edit mode (E key) semantics must be preserved: edges have snap targets only in edit mode; edit mode blocks wheel scroll by holding pointer input; frames captured after a resize are stitched at their deterministic known position; only the settled rectangle after an edge-drag release is captured.
@@ -46,7 +46,21 @@
 - `src/stitch.rs` + `src/stitch/` → full multi-stage matcher ported from the original (canvas exact placement, perceptual bands, fuzzy hash, fast-motion scan, fixed bands, previous-frame fallback).
 - `src/wayland/screencopy.rs` → wlr screencopy v3 client; one-shot frozen captures and persistent `CaptureSession` for long mode.
 - `src/wayland/selection.rs` → layer-shell overlay: frozen/dimmed selection UI, drag redraw, long-mode preview and status, pointer passthrough for capture.
-- `src/geometry.rs`, `src/image.rs`, `src/cli.rs`, `src/clipboard.rs` → see `src/CONTRACT.md`.
+- `src/geometry.rs`, `src/image.rs`, `src/cli.rs`, `src/clipboard.rs` → see Module Contracts below.
+
+## Module Contracts
+
+Concise boundaries for each module: what it owns, what it must not do, and how it is verified.
+
+- **`config`** — Owns optional user settings (`max_fps`, `border_width`) from `$XDG_CONFIG_HOME/screenshot/config`; parses `key = value` lines with `#` comments and clamps ranges. Must not parse CLI args or touch Wayland. Malformed/unreadable files degrade to defaults (never fatal). Verified by unit tests for parsing and range clamping.
+- **`cli`** — Owns flag parsing, invalid-combination rejection, output-path resolution, and help/version text. Must not touch Wayland, write images, or serve the clipboard. Failure: unknown flags, missing values, unsafe temp dir, invalid `--name`, out-of-range `--fps`, mutually exclusive output modes. Verified by parsing/path unit tests.
+- **`app`** — Orchestrates freeze → select → composite → write → clipboard, and long capture (fps-capped worker, PrepareCapture handshake on the exact clean-render rectangle, offset-aware stitching). Launches without compositor-name gating. Must not implement protocol dispatch or PNG encoding. Screen-space capture regions use output-local logical coordinates; stitch offsets use returned-frame pixels. Discard edit-invalidated frames before dedup/stitching. Verified by integration/manual test under a live Wayland compositor and `cargo check`.
+- **`geometry`** — Converts logical selected rectangles into per-output capture regions; clamps spanning selections to the drag-start output (`clamp_rect_to_output_at_point`, largest-piece fallback). No pointer input, registry handling, or pixel copying. Verified by intersection/scaling/mixed-output unit tests.
+- **`image`** — Represents SHM images, converts XRGB/ARGB8888 to RGBA PNG, and blits regions. No Wayland capture, path policy, or clipboard ownership. Verified by blit/format unit tests.
+- **`stitch`** — Deterministic multi-stage matcher plus offset-tagged geometry placement: changed offset/size places a frame at its known position, growing ragged T/L canvases with per-row coverage (uncovered extents transparent). Must not handle CLI, Wayland, scrolling, output selection, or PNG writing. Preserve covered pixels (not the bounding rectangle) so later widening fills recaptured strips; never-captured strips stay transparent. Verified by the extensive stitch unit tests.
+- **`clipboard`** — Serves `image/png` or file URI via `wlr-data-control`. No region selection, capture, or path decisions; no external clipboard commands. Verified by manual paste tests under a live Wayland compositor.
+- **`wayland::screencopy`** — Binds wlroots screencopy and captures outputs into SHM buffers (one-shot frozen + persistent long-capture session). Requests use output-local logical regions; persistent capture returns `None` on cancellation. No selection UI, PNG writing, or stitching. Damage waits poll a stop flag with bounded latency so joining the worker never requires fresh damage. Verified by manual capture plus `cargo check`.
+- **`wayland::selection`** — Layer-shell overlay: dimmed frozen frames, visible border, drag/edit interactions, long-mode preview/status, and live selection/output accessors. Caches only dim/hole; composites preview then border every time. Frozen and live borders share one closed outside-ring rule (corners, configured width); frozen damage includes the ring. `prepare_capture_clean` commits on the selected output and roundtrips before acking; `complete_capture` rejects any frame exposed to a geometry change (sticky), which `app` must discard. No focus-grab extensions or compositor-name checks. Verified by overlay-pixel/dirty-region/edge unit tests plus manual drag-selection and edit-mode tests.
 
 ## Commands
 
