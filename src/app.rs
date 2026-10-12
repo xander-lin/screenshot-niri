@@ -15,21 +15,22 @@ fn long_frame_interval(max_frame_rate: u32) -> Duration {
     Duration::from_nanos(1_000_000_000 / u64::from(max_frame_rate.max(1)))
 }
 
-/// Shrinks a capture region one logical pixel inward on every side (scaled
-/// to buffer pixels) so the selection overlay's own border — however the
-/// compositor rasterizes it — can never bleed into captured frames.
+/// Shrinks a region inward without moving tiny selections outside their bounds.
+/// Long screencopy requests use logical coordinates and pass scale = 1.
 fn inset_capture_region(
     region: CaptureOutputRegion,
     scale: i32,
 ) -> CaptureOutputRegion {
     let inset = scale.max(1);
+    let inset_x = inset.min((region.region.width - 1).max(0));
+    let inset_y = inset.min((region.region.height - 1).max(0));
     CaptureOutputRegion {
         output_name: region.output_name,
         region: crate::wayland::screencopy::Region {
-            x: region.region.x + inset,
-            y: region.region.y + inset,
-            width: (region.region.width - 2 * inset).max(1),
-            height: (region.region.height - 2 * inset).max(1),
+            x: region.region.x + inset_x,
+            y: region.region.y + inset_y,
+            width: (region.region.width - 2 * inset_x).max(1),
+            height: (region.region.height - 2 * inset_y).max(1),
         },
         dst_x: region.dst_x,
         dst_y: region.dst_y,
@@ -37,8 +38,8 @@ fn inset_capture_region(
 }
 
 /// Logical screen rectangle a capture region actually covers: the inset
-/// region in output-local buffer coordinates mapped back through the
-/// output's logical origin and scale. The preview must map stitched
+/// region in output-local logical coordinates mapped through the
+/// output's logical origin. The preview must map stitched
 /// content through this rectangle — using the un-inset selection box
 /// would offset the preview by the inset, and after an E-extend the new
 /// capture region would re-capture those shifted preview pixels into the
@@ -48,12 +49,11 @@ fn capture_region_logical_rect(
     outputs: &[crate::geometry::OutputInfo],
 ) -> Option<crate::geometry::LogicalRect> {
     let output = outputs.iter().find(|o| o.global_name == region.output_name)?;
-    let scale = output.scale.max(1);
     Some(crate::geometry::LogicalRect {
-        x: output.logical.x + region.region.x.div_euclid(scale),
-        y: output.logical.y + region.region.y.div_euclid(scale),
-        width: region.region.width.div_euclid(scale),
-        height: region.region.height.div_euclid(scale),
+        x: output.logical.x + region.region.x,
+        y: output.logical.y + region.region.y,
+        width: region.region.width,
+        height: region.region.height,
     })
 }
 
@@ -71,7 +71,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 }
 
 fn run_normal(args: crate::cli::Args, config: crate::config::Config) -> Result<(), Box<dyn Error>> {
-    crate::runtime::ensure_niri_session()?;
     let frozen_outputs = crate::wayland::screencopy::capture_outputs_with_cursor()?;
     let frozen_outputs_without_cursor = crate::wayland::screencopy::capture_outputs_without_cursor()?;
     let mut session = crate::wayland::selection::SelectionSession::with_frozen_pair(
@@ -110,7 +109,6 @@ fn run_normal(args: crate::cli::Args, config: crate::config::Config) -> Result<(
 }
 
 fn run_long(args: crate::cli::Args, config: crate::config::Config) -> Result<(), Box<dyn Error>> {
-    crate::runtime::ensure_niri_session()?;
     let mut selection_session = crate::wayland::selection::SelectionSession::new_long(config.border_width)?;
     let viewport = match selection_session.run_selection()? {
         crate::wayland::selection::SelectionOutcome::Selected(viewport) => viewport,
@@ -126,7 +124,7 @@ fn run_long(args: crate::cli::Args, config: crate::config::Config) -> Result<(),
 enum CaptureMessage {
     PrepareCapture { #[allow(dead_code)] index: usize, ack: mpsc::SyncSender<PrepareAck> },
     Frame { image: crate::image::Image, region: CaptureOutputRegion },
-    Error(#[allow(dead_code)] String),
+    Error(String),
     Finished,
 }
 
@@ -154,8 +152,18 @@ fn prepare_capture_region(
     if viewport.regions.len() != 1 {
         return None;
     }
-    let scale = viewport.regions[0].output_scale;
-    Some(inset_capture_region(viewport.capture_regions()[0], scale))
+    // wlr-screencopy capture_output_region takes output-local logical units,
+    // unlike the pixel rectangles used to crop frozen normal screenshots.
+    let selected = viewport.regions[0];
+    let local = selected.local_region;
+    Some(inset_capture_region(CaptureOutputRegion {
+        output_name: selected.output_global_name,
+        region: crate::wayland::screencopy::Region {
+            x: local.x, y: local.y, width: local.width, height: local.height,
+        },
+        dst_x: 0,
+        dst_y: 0,
+    }, 1))
 }
 
 struct LongCaptureWorker {
@@ -224,12 +232,13 @@ impl LongCaptureWorker {
                         Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     }
                 };
-                match session.capture_region_frame_without_cursor(region, true) {
-                    Ok(image) => {
+                match session.capture_region_frame_without_cursor(region, true, &thread_stop) {
+                    Ok(Some(image)) => {
                         if sender.send(CaptureMessage::Frame { image, region }).is_err() {
                             return;
                         }
                     }
+                    Ok(None) => break,
                     Err(err) => {
                         let _ = sender.send(CaptureMessage::Error(err.to_string()));
                         return;
@@ -286,21 +295,29 @@ fn run_long_capture(
         return Err(err);
     }
 
-    let initial_region = inset_capture_region(
-        viewport.capture_regions()[0],
-        viewport.regions[0].output_scale,
-    );
+    let initial_region = prepare_capture_region(viewport.rect, &selection_session.output_infos())
+        .ok_or("long capture requires a selection on one output")?;
     let max_frame_rate = args.max_frame_rate.unwrap_or(config.max_fps);
     let mut worker = LongCaptureWorker::start(initial_region, max_frame_rate);
     let mut stitcher = RawStitcher::new();
     let mut cancelled = false;
     let mut capture_finished = false;
+    let mut capture_error = None;
     let mut prev_raw: Option<(CaptureOutputRegion, crate::image::Image)> = None;
     // Live selection state followed from edit-mode edge drags.
-    let mut live_region = initial_region;
     let mut live_rect = viewport.rect;
 
     while !capture_finished {
+        // Service input even when duplicate/no-match frames bypass the loop tail.
+        selection_session.dispatch_poll(0)?;
+        match selection_session.long_status() {
+            crate::wayland::selection::LongSessionStatus::Running => {}
+            crate::wayland::selection::LongSessionStatus::FinishRequested => break,
+            crate::wayland::selection::LongSessionStatus::Cancelled => {
+                cancelled = true;
+                break;
+            }
+        }
         match worker.recv_timeout(LONG_UI_POLL_INTERVAL) {
             Ok(CaptureMessage::PrepareCapture { ack, .. }) => {
                 // Decision made on the UI thread, single-threaded: the clean
@@ -310,24 +327,20 @@ fn run_long_capture(
                 // frame is skipped rather than captured against stale
                 // geometry — that mismatch was the root cause of white
                 // borders inside stitched long captures.
-                let decision = if selection_session.edit_drag_active() {
-                    None
-                } else {
-                    selection_session
-                        .prepare_capture_clean()
-                        .then(|| {
-                            selection_session
-                                .selection_rect()
-                                .and_then(|rect| prepare_capture_region(rect, &selection_session.output_infos()))
-                        })
-                        .flatten()
-                };
+                let decision = selection_session.prepare_capture_clean()?
+                    .and_then(|rect| prepare_capture_region(rect, &selection_session.output_infos()));
+                if decision.is_none() {
+                    selection_session.complete_capture();
+                }
                 let _ = match decision {
                     Some(region) => ack.send(PrepareAck::Capture(region)),
                     None => ack.send(PrepareAck::Skip),
                 };
             }
             Ok(CaptureMessage::Frame { image, region }) => {
+                if !selection_session.complete_capture() {
+                    continue;
+                }
                 if should_skip_duplicate_frame(prev_raw.as_ref().map(|(r, i)| (*r, i)), region, &image) {
                     continue;
                 }
@@ -351,7 +364,7 @@ fn run_long_capture(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let offset = FrameScreenOffset { x: region.region.x, y: region.region.y };
+                let offset = frame_screen_offset(region, current_frame);
                 let outcome = match stitcher.push_frame_with_offset(&compose, &analysis, direction, offset) {
                     Ok(o) => o,
                     Err(_) => continue,
@@ -371,8 +384,8 @@ fn run_long_capture(
                             )
                             .unwrap_or(live_rect);
                             let (capture_width, capture_height) = (
-                                u32::try_from(region.region.width.max(1)).unwrap_or(1),
-                                u32::try_from(region.region.height.max(1)).unwrap_or(1),
+                                current_frame.width,
+                                current_frame.height,
                             );
                             let snapshot = crate::wayland::selection::LongPreviewSnapshot {
                                 image,
@@ -387,7 +400,8 @@ fn run_long_capture(
                     }
                 }
             }
-            Ok(CaptureMessage::Error(_)) => {
+            Ok(CaptureMessage::Error(error)) => {
+                capture_error = Some(error);
                 capture_finished = true;
             }
             Ok(CaptureMessage::Finished) => {
@@ -407,7 +421,7 @@ fn run_long_capture(
             }
             break;
         }
-        let _ = selection_session.dispatch_poll(0);
+        selection_session.dispatch_poll(0)?;
         // Follow selection-box edits made in edit mode first (the preview
         // mapping tracks the adjusted rectangle), then let the worker resume:
         // paused-flag and geometry must never race apart. The capture region
@@ -422,10 +436,6 @@ fn run_long_capture(
                 ) {
                     Ok(viewport) if viewport.regions.len() == 1 => {
                         live_rect = rect;
-                        live_region = inset_capture_region(
-                            viewport.capture_regions()[0],
-                            viewport.regions[0].output_scale,
-                        );
                     }
                     _ => {}
                 }
@@ -449,12 +459,23 @@ fn run_long_capture(
     if cancelled {
         return Err("long capture cancelled".into());
     }
+    if let Some(error) = capture_error {
+        return Err(error.into());
+    }
     let stitched = stitcher.finish().ok_or("long capture produced no frames")?;
     let final_image = crate::stitch::image_from_stitched_frame(&stitched)?;
     crate::image::write_png(&args.output_path, &final_image)?;
     crate::clipboard::serve_path_detached(&args.output_path, args.clipboard_mode)?;
     println!("saved {}", args.output_path.display());
     Ok(())
+}
+
+/// Convert logical screen offsets into the returned frame's pixel space.
+fn frame_screen_offset(region: CaptureOutputRegion, image: &crate::image::Image) -> FrameScreenOffset {
+    FrameScreenOffset {
+        x: (i64::from(region.region.x) * i64::from(image.width) / i64::from(region.region.width.max(1))) as i32,
+        y: (i64::from(region.region.y) * i64::from(image.height) / i64::from(region.region.height.max(1))) as i32,
+    }
 }
 
 /// Fast raw-frame similarity check. Samples every 8th pixel, 4px per row.
@@ -560,6 +581,40 @@ mod tests {
         let config = crate::config::Config { max_fps: 15, border_width: 3 };
         assert_eq!(Some(45).unwrap_or(config.max_fps), 45);
         assert_eq!(None.unwrap_or(config.max_fps), 15);
+    }
+
+    #[test]
+    fn tiny_capture_regions_stay_inside_selection() {
+        for width in 1..=4 {
+            for height in 1..=4 {
+                let original = region_at(99, 199, width, height);
+                let inset = inset_capture_region(original, 1).region;
+                assert!(inset.x >= 99 && inset.y >= 199);
+                assert!(inset.width > 0 && inset.height > 0);
+                assert!(inset.x + inset.width <= 99 + width);
+                assert!(inset.y + inset.height <= 199 + height);
+            }
+        }
+    }
+
+    #[test]
+    fn scaled_long_capture_requests_logical_units_and_stitches_in_pixels() {
+        let outputs = [crate::geometry::OutputInfo {
+            global_name: 1,
+            logical: crate::geometry::LogicalRect { x: -1000, y: 200, width: 1000, height: 800 },
+            scale: 2,
+        }];
+        let rect = crate::geometry::LogicalRect { x: -900, y: 250, width: 300, height: 200 };
+        let region = prepare_capture_region(rect, &outputs).unwrap();
+        assert_eq!(region, region_at(101, 51, 298, 198));
+        assert_eq!(capture_region_logical_rect(region, &outputs), Some(crate::geometry::LogicalRect {
+            x: -899, y: 251, width: 298, height: 198,
+        }));
+        let frame = solid(596, 396, 80);
+        assert_eq!(frame_screen_offset(region, &frame), FrameScreenOffset { x: 202, y: 102 });
+        // Moving left by ten logical pixels must move the canvas by twenty pixels.
+        let moved = region_at(91, 51, 298, 198);
+        assert_eq!(frame_screen_offset(moved, &frame), FrameScreenOffset { x: 182, y: 102 });
     }
 
     #[test]

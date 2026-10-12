@@ -45,7 +45,6 @@ const KEY_DIGIT_LAST: u32 = 10;
 /// cadence; each extra buffer costs one full-screen RGBA allocation per
 /// output for the whole session.
 const OVERLAY_BUFFER_COUNT: usize = 2;
-const SELECTION_BORDER_WIDTH: i32 = 3;
 /// Logical-pixel snap range around each selection edge in edit mode.
 const EDGE_SNAP_RANGE: i32 = 8;
 /// Smallest selection kept while dragging an edge.
@@ -53,7 +52,6 @@ const MIN_SELECTION_SIZE: i32 = 8;
 const OVERLAY_OUTSIDE_MASK_BGRA: [u8; 4] = [0, 0, 0, 110];
 const OVERLAY_SELECTED_TRANSPARENT_BGRA: [u8; 4] = [0, 0, 0, 0];
 const OVERLAY_BORDER_WHITE_BGRA: [u8; 4] = [255, 255, 255, 255];
-const OVERLAY_BORDER_DARK_BGRA: [u8; 4] = [0, 0, 0, 220];
 /// Warning border for long-mode selections spanning more than one output.
 const OVERLAY_BORDER_RED_BGRA: [u8; 4] = [0, 0, 255, 255];
 
@@ -169,10 +167,9 @@ struct OverlaySurface {
     width: i32,
     height: i32,
     base_pixels: Option<Vec<u8>>,
-    /// Identity of the cached `base_pixels`: (width, height, buffer-local
-    /// hole rect, border color, whether the border was drawn). The cache is
-    /// rebuilt whenever any of these change, not just on size changes.
-    base_key: Option<(i32, i32, Option<LogicalRect>, [u8; 4], bool)>,
+    /// Only the dim mask and transparent hole are cached. Preview and border
+    /// are composited afterwards, in that order, on every live redraw.
+    base_key: Option<(i32, i32, Option<LogicalRect>)>,
 }
 
 struct OverlayRenderCache {
@@ -225,10 +222,13 @@ struct UiState {
     editing: bool,
     edit_drag: Option<EditDrag>,
     /// Union of every rectangle the current edit drag has passed through.
-    /// While `edit_drag` is active the overlay hole is this union (with no
-    /// border), so an in-flight capture based on the pre-drag rectangle
-    /// always lands on transparent pixels no matter how the box moves.
+    /// While `edit_drag` is active this union excludes the preview from the
+    /// drag trajectory. The visible border follows the current box instead.
     edit_union: Option<LogicalRect>,
+    /// Selection excluded from preview until the pending capture completes.
+    capture_pending: Option<LogicalRect>,
+    /// Sticky until completion: edits may return to the original rectangle.
+    capture_invalid: bool,
     /// Global point where the selection drag started. A spanning selection
     /// is clamped to the output containing this point — the box belongs to
     /// the screen it was clicked on, not to whichever screen covers more of
@@ -286,6 +286,8 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
         editing: false,
         edit_drag: None,
         edit_union: None,
+        capture_pending: None,
+        capture_invalid: false,
         selection_anchor: None,
         border_width: crate::config::DEFAULT_BORDER_WIDTH,
     };
@@ -381,22 +383,53 @@ fn border_color_for_state(state: &UiState, rect: Option<LogicalRect>) -> [u8; 4]
 /// Selection rectangle used for overlay rendering. During an edit-mode drag
 /// the overlay hole becomes the union of every rectangle the drag has passed
 /// through: the capture region of an in-flight capture is derived from the
-/// pre-drag rectangle, and that region must stay inside the transparent hole
-/// no matter where the box has moved meanwhile.
+/// pre-drag rectangle. Border pixels may enter that hole during editing;
+/// those frames are invalidated before they can reach the stitcher.
 fn ui_render_selection(state: &UiState) -> Option<LogicalRect> {
-    if state.edit_drag.is_some() {
+    let current = if state.edit_drag.is_some() {
         state.edit_union.or_else(|| state.drag.current_rect())
     } else {
         state.drag.current_rect()
+    };
+    match (current, state.capture_pending) {
+        (Some(current), Some(pending)) => Some(rect_union(current, pending)),
+        (current, pending) => current.or(pending),
     }
 }
 
-/// Whether the selection border is drawn on the overlay. It is suppressed
-/// while an edit drag is reshaping the box: the border would sit inside the
-/// trajectory union — and therefore inside some in-flight capture region —
-/// and leak into captured frames as a spurious white box.
+/// Edits keep the current box visible. Frames exposed to an edited border
+/// are discarded instead of hiding the UI until capture completes.
 fn ui_render_border(state: &UiState) -> bool {
-    state.edit_drag.is_none()
+    state.drag.current_rect().is_some()
+}
+
+fn invalidate_changed_capture(state: &mut UiState) {
+    if state.capture_pending.is_some_and(|pending| state.drag.current_rect() != Some(pending)) {
+        state.capture_invalid = true;
+    }
+}
+
+fn border_bounds(rect: LogicalRect, thickness: i32) -> LogicalRect {
+    let thickness = thickness.max(1);
+    LogicalRect {
+        x: rect.x.saturating_sub(thickness),
+        y: rect.y.saturating_sub(thickness),
+        width: rect.width.saturating_add(thickness.saturating_mul(2)),
+        height: rect.height.saturating_add(thickness.saturating_mul(2)),
+    }
+}
+
+/// One closed, outside-only ring for both frozen selection and live capture.
+fn selection_border_pixel(x: i32, y: i32, rect: LogicalRect, thickness: i32, color: [u8; 4]) -> Option<[u8; 4]> {
+    let outer = border_bounds(rect, thickness);
+    let inside = |r: LogicalRect| x >= r.x && x < r.right() && y >= r.y && y < r.bottom();
+    (!rect.is_empty() && inside(outer) && !inside(rect)).then_some(color)
+}
+
+/// The visible box follows the current rectangle. The rendered hole may be
+/// larger during an edit drag so an in-flight capture remains clean.
+fn ui_render_border_rect(state: &UiState) -> Option<LogicalRect> {
+    ui_render_border(state).then(|| state.drag.current_rect()).flatten()
 }
 
 /// Moves the whole box so the grab point stays under the pointer, clamped to
@@ -588,6 +621,8 @@ impl SelectionSession {
             editing: false,
             edit_drag: None,
             edit_union: None,
+            capture_pending: None,
+            capture_invalid: false,
             selection_anchor: None,
             border_width: border_width.clamp(crate::config::BORDER_WIDTH_MIN, crate::config::BORDER_WIDTH_MAX),
         };
@@ -617,7 +652,7 @@ impl SelectionSession {
         if !state.frozen_outputs_without_cursor.is_empty() {
             validate_frozen_outputs(&state.outputs, &state.frozen_outputs_without_cursor)?;
         }
-        create_live_overlays(&mut state, &qh)?;
+        create_overlays(&mut state, &qh)?;
         conn.flush()?;
         Ok(Self { conn, event_queue, state })
     }
@@ -670,6 +705,12 @@ impl SelectionSession {
         self.state.editing = false;
         self.state.edit_drag = None;
         self.state.edit_union = None;
+        self.state.capture_pending = None;
+        self.state.capture_invalid = false;
+        // After L promotion, future layer configure events must not rebuild
+        // a frozen render cache over the live capture hole.
+        self.state.frozen_outputs.clear();
+        self.state.frozen_outputs_without_cursor.clear();
         for overlay in &mut self.state.overlays {
             overlay.render_cache = None;
             overlay.base_pixels = None;
@@ -769,23 +810,49 @@ impl SelectionSession {
         Ok(())
     }
 
-    /// Renders the capture-clean overlay state (dim outside, transparent
-    /// hole, border outside the hole) and commits it. Returns whether at
-    /// least one overlay buffer was committed: when every buffer is still
-    /// held by the compositor the previous overlay state remains on screen,
-    /// and a capture started on top of that stale state could contain the
-    /// border — callers must skip the frame instead.
-    pub fn prepare_capture_clean(&mut self) -> bool {
+    /// Commit a clean overlay on the selected output, then synchronize this
+    /// connection before the worker requests capture on its own connection.
+    /// Return the exact selection used. Subsequent edits invalidate that frame.
+    pub fn prepare_capture_clean(&mut self) -> Result<Option<LogicalRect>, Box<dyn Error>> {
         for _ in 0..6 {
-            if render_overlays_full_dim(&mut self.state) > 0 {
-                let _ = self.event_queue.dispatch_pending(&mut self.state);
-                let _ = self.conn.flush();
-                return true;
+            self.event_queue.dispatch_pending(&mut self.state)?;
+            if self.state.edit_drag.is_some() || self.long_status() != LongSessionStatus::Running {
+                return Ok(None);
             }
+            let Some(rect) = self.state.drag.selected_rect() else { return Ok(None); };
+            let viewport = SelectedViewport::from_outputs(rect, &self.state.output_infos())?;
+            if viewport.regions.len() != 1 {
+                return Ok(None);
+            }
+            let output_name = viewport.regions[0].output_global_name;
+            self.state.capture_pending = Some(rect);
+            self.state.capture_invalid = false;
+            if render_live_overlays(&mut self.state, Some(output_name)) > 0 {
+                // flush alone does not order requests on different connections.
+                // Events dispatched here may edit the box; invalidation is
+                // sticky until completion, even if it moves back again.
+                self.event_queue.roundtrip(&mut self.state)?;
+                return Ok(Some(rect));
+            }
+            self.state.capture_pending = None;
             // All buffers busy; wait for a wl_buffer.release and retry.
-            let _ = self.dispatch_poll(4);
+            self.dispatch_poll(4)?;
         }
-        false
+        Ok(None)
+    }
+
+    /// Return whether the completed frame is safe to stitch. A rectangle that
+    /// moved away and back still rejects the frame via sticky invalidation.
+    pub fn complete_capture(&mut self) -> bool {
+        invalidate_changed_capture(&mut self.state);
+        let valid = !self.state.capture_invalid;
+        self.state.capture_invalid = false;
+        if let Some(pending) = self.state.capture_pending.take() {
+            if self.state.drag.current_rect() != Some(pending) {
+                queue_render(&mut self.state, true);
+            }
+        }
+        valid
     }
 
     pub fn close(self) -> Result<(), Box<dyn Error>> {
@@ -802,7 +869,7 @@ fn selection_loop_active(state: &UiState) -> bool {
     !state.drag.is_terminal() || state.editing
 }
 
-fn create_live_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Result<(), Box<dyn Error>> {
+fn create_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Result<(), Box<dyn Error>> {
     let compositor = state.compositor.as_ref().ok_or("compositor does not expose wl_compositor")?;
     let layer_shell = state.layer_shell.as_ref().ok_or("compositor does not expose zwlr_layer_shell_v1")?;
     for output in &state.outputs {
@@ -836,60 +903,43 @@ fn create_live_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Resul
 }
 
 fn render_overlays_full_dim(state: &mut UiState) -> usize {
-    render_overlays_inner(state, true)
+    render_live_overlays(state, None)
 }
 
-#[allow(dead_code)]
-fn render_overlays_capture_clean(state: &mut UiState) -> usize {
-    render_overlays_inner(state, false)
-}
-
-fn render_overlays_inner(state: &mut UiState, draw_border: bool) -> usize {
+fn render_live_overlays(state: &mut UiState, output_name: Option<u32>) -> usize {
+    invalidate_changed_capture(state);
     let border_width = state.border_width;
-    let draw_border = draw_border && ui_render_border(state);
     let border_color = border_color_for_state(state, state.drag.current_rect());
     let rect = ui_render_selection(state);
+    let border_rect = ui_render_border_rect(state);
     let mut committed = 0;
     for i in 0..state.overlays.len() {
         let overlay = &mut state.overlays[i];
+        if output_name.is_some_and(|name| overlay.output_name != name) {
+            continue;
+        }
+        if overlay.render_cache.is_some() {
+            continue;
+        }
+        let Some(output) = state.outputs.iter().find(|o| o.info.global_name == overlay.output_name) else {
+            continue;
+        };
         let buffer = match overlay.buffers.iter().position(|b| b.available) {
             Some(pos) => &mut overlay.buffers[pos],
             None => continue,
         };
         let data = unsafe { std::slice::from_raw_parts_mut(buffer.data, buffer.size) };
         let buf_size = overlay.width as usize * overlay.height as usize * 4;
-        let stride = overlay.width as usize * 4;
-        // Map the render selection through the output's real logical rect
-        // and scale, exactly like the fast render path does: buffer pixels,
-        // not logical units (a scale-2 output would otherwise leave most of
-        // the hole dimmed and the border inside the capture region).
-        let selection_local = state
-            .outputs
-            .iter()
-            .find(|o| o.info.global_name == overlay.output_name)
-            .and_then(|o| rect.and_then(|r| selected_buffer_rect(o.info, r, overlay.width, overlay.height)));
+        // Map through the actual overlay buffer size, not wl_output.scale:
+        // our surfaces use buffer scale 1 even on a scaled output.
+        let selection_local = rect.and_then(|r| selected_buffer_rect(output.info, r, overlay.width, overlay.height));
+        let border_local = border_rect.and_then(|r| selected_buffer_rect(output.info, r, overlay.width, overlay.height));
 
-        let cache_key = (overlay.width, overlay.height, selection_local, border_color, draw_border);
+        let cache_key = (overlay.width, overlay.height, selection_local);
         let rebuild = overlay.base_key != Some(cache_key)
             || overlay.base_pixels.as_ref().map_or(true, |b| b.len() != buf_size);
         if rebuild {
-            for y in 0..overlay.height as usize {
-                for x in 0..overlay.width as usize {
-                    let offset = y * stride + x * 4;
-                    data[offset..offset + 4].copy_from_slice(&OVERLAY_OUTSIDE_MASK_BGRA);
-                }
-            }
-            if let Some(ref local) = selection_local {
-                for y in local.y..local.y + local.height {
-                    for x in local.x..local.x + local.width {
-                        let offset = y as usize * stride + x as usize * 4;
-                        data[offset + 3] = 0;
-                    }
-                }
-                if draw_border {
-                    draw_selection_border(data, overlay.width, overlay.height, local.x, local.y, local.width, local.height, border_width, border_color);
-                }
-            }
+            draw_live_base(data, overlay.width, overlay.height, selection_local);
             let cache = data[..buf_size].to_vec();
             overlay.base_pixels = Some(cache);
             overlay.base_key = Some(cache_key);
@@ -897,15 +947,8 @@ fn render_overlays_inner(state: &mut UiState, draw_border: bool) -> usize {
             data[..buf_size.min(base.len())].copy_from_slice(&base[..buf_size.min(base.len())]);
         }
 
-        if let Some(ref preview) = state.long_preview {
-            let output_logical = state
-                .outputs
-                .iter()
-                .find(|o| o.info.global_name == overlay.output_name)
-                .map(|o| o.info.logical)
-                .unwrap_or(LogicalRect { x: 0, y: 0, width: overlay.width, height: overlay.height });
-            draw_preview_on_overlay(data, overlay.width, overlay.height, preview, output_logical, selection_local);
-        }
+        draw_live_foreground(data, overlay.width, overlay.height, output.info.logical,
+            selection_local, border_local, state.long_preview.as_ref(), border_width, border_color);
         overlay.surface.attach(Some(&buffer.buffer), 0, 0);
         overlay.surface.damage_buffer(0, 0, overlay.width, overlay.height);
         overlay.surface.commit();
@@ -917,39 +960,25 @@ fn render_overlays_inner(state: &mut UiState, draw_border: bool) -> usize {
 
 fn draw_selection_border(data: &mut [u8], _width: i32, _height: i32, x: i32, y: i32, w: i32, h: i32, thickness: i32, border: [u8; 4]) {
     let stride = _width as usize * 4;
-    let x = x.max(0) as usize;
-    let y = y.max(0) as usize;
-    let w = w as usize;
-    let h = h as usize;
-    let right = (x + w).min(_width as usize);
-    let bottom = (y + h).min(_height as usize);
-    for step in 0..thickness.max(1) as usize {
-        if y > step && x < right {
-            let py = y - 1 - step;
-            for px in x..right {
-                let offset = py * stride + px * 4;
-                data[offset..offset + 4].copy_from_slice(&border);
-            }
-        }
-        if bottom + step < _height as usize && x < right {
-            let py = bottom + step;
-            for px in x..right {
-                let offset = py * stride + px * 4;
-                data[offset..offset + 4].copy_from_slice(&border);
-            }
-        }
-        if x > step && y < bottom {
-            let px = x - 1 - step;
-            for py in y..bottom {
-                let offset = py * stride + px * 4;
-                data[offset..offset + 4].copy_from_slice(&border);
-            }
-        }
-        if right + step < _width as usize && y < bottom {
-            let px = right + step;
-            for py in y..bottom {
-                let offset = py * stride + px * 4;
-                data[offset..offset + 4].copy_from_slice(&border);
+    let rect = LogicalRect { x, y, width: w, height: h };
+    let thickness = thickness.max(1);
+    let x0 = x.saturating_sub(thickness).max(0);
+    let y0 = y.saturating_sub(thickness).max(0);
+    let x1 = x.saturating_add(w).saturating_add(thickness).min(_width);
+    let y1 = y.saturating_add(h).saturating_add(thickness).min(_height);
+    for py in y0..y1 {
+        // Skip the interior span: border work is proportional to perimeter.
+        let spans = if py >= y && py < y + h {
+            [(x0, x.min(x1)), ((x + w).max(x0), x1)]
+        } else {
+            [(x0, x1), (0, 0)]
+        };
+        for (start, end) in spans {
+            for px in start..end {
+                if selection_border_pixel(px, py, rect, thickness, border).is_some() {
+                    let offset = py as usize * stride + px as usize * 4;
+                    data[offset..offset + 4].copy_from_slice(&border);
+                }
             }
         }
     }
@@ -1242,47 +1271,16 @@ fn bind_xdg_outputs(state: &mut UiState, qh: &QueueHandle<UiState>) {
     }
 }
 
-#[allow(dead_code)]
-fn create_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Result<(), Box<dyn Error>> {
-    let compositor = state.compositor.as_ref().ok_or("compositor does not expose wl_compositor")?;
-    let layer_shell = state.layer_shell.as_ref().ok_or("compositor does not expose zwlr_layer_shell_v1")?;
-    for output in &state.outputs {
-        let surface = compositor.create_surface(qh, ());
-        let layer_surface = layer_shell.get_layer_surface(
-            &surface,
-            Some(&output.output),
-            Layer::Overlay,
-            "screenshot-selection".into(),
-            qh,
-            output.info.global_name,
-        );
-        layer_surface.set_anchor(Anchor::Top | Anchor::Right | Anchor::Bottom | Anchor::Left);
-        layer_surface.set_exclusive_zone(-1);
-        layer_surface.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-        layer_surface.set_size(0, 0);
-        surface.commit();
-        state.overlays.push(OverlaySurface {
-            output_name: output.info.global_name,
-            surface,
-            layer_surface,
-            buffers: Vec::new(),
-            render_cache: None,
-            base_pixels: None,
-            base_key: None,
-            width: output.info.logical.width.max(1),
-            height: output.info.logical.height.max(1),
-        });
-    }
-    Ok(())
-}
-
 fn render_overlays(state: &mut UiState) -> usize {
     let mut committed = 0;
     let rect = ui_render_selection(state);
     let border_width = state.border_width;
-    let draw_border = ui_render_border(state);
-    let border = border_color_for_state(state, rect);
     for overlay in &mut state.overlays {
+        // Live overlays always use the same compositor, including edit/input
+        // redraws; the frozen-image dirty-region path is normal-mode only.
+        let Some(render_cache) = overlay.render_cache.as_ref() else {
+            continue;
+        };
         let Some(buffer) = overlay.buffers.iter_mut().find(|buffer| buffer.available) else {
             continue;
         };
@@ -1292,21 +1290,14 @@ fn render_overlays(state: &mut UiState) -> usize {
         let data = unsafe { std::slice::from_raw_parts_mut(buffer.data, buffer.size) };
         let current_selected = rect.and_then(|selected| selected_buffer_rect(output.info, selected, overlay.width, overlay.height));
         let damage = if buffer.initialized {
-            dirty_selected_region(buffer.last_selected, current_selected, overlay.width, overlay.height)
+            dirty_selected_region(
+                buffer.last_selected.map(|rect| border_bounds(rect, border_width)),
+                current_selected.map(|rect| border_bounds(rect, border_width)),
+                overlay.width, overlay.height)
         } else {
             Some(LogicalRect { x: 0, y: 0, width: overlay.width, height: overlay.height })
         };
         let Some(damage) = damage else {
-            continue;
-        };
-        let Some(render_cache) = overlay.render_cache.as_ref() else {
-            draw_overlay_dim_with_selection(data, overlay.width, overlay.height, output.info, rect, border_width, border, draw_border);
-            buffer.initialized = true;
-            overlay.surface.attach(Some(&buffer.buffer), 0, 0);
-            overlay.surface.damage_buffer(0, 0, overlay.width, overlay.height);
-            overlay.surface.commit();
-            buffer.available = false;
-            committed += 1;
             continue;
         };
         if buffer.initialized {
@@ -1322,7 +1313,7 @@ fn render_overlays(state: &mut UiState) -> usize {
         buffer.available = false;
         committed += 1;
     }
-    committed
+    committed + render_live_overlays(state, None)
 }
 
 fn frozen_outputs_from_captures(captures: &[CapturedOutput]) -> Result<Vec<FrozenOutput>, Box<dyn Error>> {
@@ -1463,30 +1454,35 @@ fn overlay_pixel(global_x: i32, global_y: i32, selected: Option<LogicalRect>, bo
     let Some(rect) = selected else {
         return OVERLAY_OUTSIDE_MASK_BGRA;
     };
+    if let Some(border) = selection_border_pixel(global_x, global_y, rect, border_width, OVERLAY_BORDER_WHITE_BGRA) {
+        return border;
+    }
     if global_x < rect.x || global_x >= rect.right() || global_y < rect.y || global_y >= rect.bottom() {
         return OVERLAY_OUTSIDE_MASK_BGRA;
     }
 
-    selected_overlay_pixel(global_x, global_y, rect, border_width)
+    OVERLAY_SELECTED_TRANSPARENT_BGRA
 }
 
 /// Maps a selection rectangle into this overlay's buffer pixels: intersect
 /// with the output's real logical geometry (the selection lives in global
-/// logical coordinates), then scale logical to buffer pixels. A pseudo
+/// logical coordinates), then map to the actual buffer dimensions. A pseudo
 /// `(0,0,buffer)` rect would misplace or hide the box on outputs that are
 /// not at the logical origin or have a scale factor.
 fn selected_buffer_rect(output: OutputInfo, selected: LogicalRect, buffer_width: i32, buffer_height: i32) -> Option<LogicalRect> {
     let local = selected_local_intersection(output.logical, selected)?;
-    let scale = output.scale.max(1);
+    let map_x = |x: i32| (i64::from(x) * i64::from(buffer_width) / i64::from(output.logical.width.max(1))) as i32;
+    let map_y = |y: i32| (i64::from(y) * i64::from(buffer_height) / i64::from(output.logical.height.max(1))) as i32;
     LogicalRect {
-        x: local.x.saturating_mul(scale),
-        y: local.y.saturating_mul(scale),
-        width: local.width.saturating_mul(scale),
-        height: local.height.saturating_mul(scale),
+        x: map_x(local.x),
+        y: map_y(local.y),
+        width: map_x(local.right()) - map_x(local.x),
+        height: map_y(local.bottom()) - map_y(local.y),
     }
     .intersection(LogicalRect { x: 0, y: 0, width: buffer_width, height: buffer_height })
 }
 
+#[cfg(test)]
 fn draw_overlay_dim_with_selection(
     data: &mut [u8],
     width: i32,
@@ -1497,6 +1493,12 @@ fn draw_overlay_dim_with_selection(
     border: [u8; 4],
     draw_border: bool,
 ) {
+    let local = selected.and_then(|sel| selected_buffer_rect(output, sel, width, height));
+    draw_live_base(data, width, height, local);
+    draw_live_foreground(data, width, height, output.logical, local, local.filter(|_| draw_border), None, border_width, border);
+}
+
+fn draw_live_base(data: &mut [u8], width: i32, height: i32, hole: Option<LogicalRect>) {
     let stride = width.max(0) as usize * 4;
     for y in 0..height.max(0) as usize {
         for x in 0..width.max(0) as usize {
@@ -1504,18 +1506,28 @@ fn draw_overlay_dim_with_selection(
             data[offset..offset + 4].copy_from_slice(&OVERLAY_OUTSIDE_MASK_BGRA);
         }
     }
-    if let Some(sel) = selected {
-        if let Some(local) = selected_buffer_rect(output, sel, width, height) {
-            for y in local.y..local.y + local.height {
-                for x in local.x..local.x + local.width {
-                    let offset = (y as usize) * stride + (x as usize) * 4;
-                    data[offset..offset + 4].copy_from_slice(&OVERLAY_SELECTED_TRANSPARENT_BGRA);
-                }
-            }
-            if draw_border {
-                draw_selection_border(data, width, height, local.x, local.y, local.width, local.height, border_width, border);
+    if let Some(local) = hole {
+        for y in local.y..local.y + local.height {
+            for x in local.x..local.x + local.width {
+                let offset = (y as usize) * stride + (x as usize) * 4;
+                data[offset..offset + 4].copy_from_slice(&OVERLAY_SELECTED_TRANSPARENT_BGRA);
             }
         }
+    }
+}
+
+/// Live compositing order: cached dim/hole base → stitched preview → border.
+/// Border geometry follows the current box, independently of capture exclusion.
+fn draw_live_foreground(
+    data: &mut [u8], width: i32, height: i32, output: LogicalRect,
+    hole: Option<LogicalRect>, border_rect: Option<LogicalRect>, preview: Option<&LongPreviewSnapshot>,
+    border_width: i32, border: [u8; 4],
+) {
+    if let Some(preview) = preview {
+        draw_preview_on_overlay(data, width, height, preview, output, hole);
+    }
+    if let Some(local) = border_rect {
+        draw_selection_border(data, width, height, local.x, local.y, local.width, local.height, border_width, border);
     }
 }
 
@@ -1620,19 +1632,6 @@ fn rect_union(a: LogicalRect, b: LogicalRect) -> LogicalRect {
     LogicalRect { x, y, width: right - x, height: bottom - y }
 }
 
-fn selected_overlay_pixel(global_x: i32, global_y: i32, rect: LogicalRect, border_width: i32) -> [u8; 4] {
-    let distance_to_edge = (global_x - rect.x)
-        .min(rect.right() - global_x - 1)
-        .min(global_y - rect.y)
-        .min(rect.bottom() - global_y - 1);
-    if distance_to_edge == 0 {
-        OVERLAY_BORDER_DARK_BGRA
-    } else if distance_to_edge < border_width {
-        OVERLAY_BORDER_WHITE_BGRA
-    } else {
-        OVERLAY_SELECTED_TRANSPARENT_BGRA
-    }
-}
 
 fn create_overlay_buffers(
     shm: &WlShm,
@@ -1755,10 +1754,10 @@ impl Dispatch<WlPointer, ()> for UiState {
                             if let Some(current) = state.drag.finished_rect_mut() {
                                 *current = updated;
                             }
-                            // Grow the drag-trajectory union: the overlay hole
-                            // during the drag is this union so an in-flight
-                            // capture (still based on the pre-drag rectangle)
-                            // never sees dim or border pixels.
+                            invalidate_changed_capture(state);
+                            // Keep the preview out of the drag trajectory.
+                            // The current border remains visible; the pending
+                            // frame has already been invalidated above.
                             state.edit_union = Some(match state.edit_union {
                                 Some(union) => rect_union(union, updated),
                                 None => updated,
@@ -1802,8 +1801,8 @@ impl Dispatch<WlPointer, ()> for UiState {
                     wl_pointer::ButtonState::Released => {
                         if state.edit_drag.take().is_some() {
                             // Finished one edit drag; stay in edit mode. The
-                            // union hole collapses back to the settled
-                            // rectangle and the border comes back.
+                            // trajectory can be discarded, but capture_pending
+                            // retains the old hole until the worker completes.
                             state.edit_union = None;
                             invalidate_overlay_bases(state);
                         } else if !state.editing {
@@ -2184,17 +2183,178 @@ mod tests {
     }
 
     #[test]
+    fn scaled_output_with_scale_one_overlay_keeps_actual_capture_area_clear() {
+        // Layer configure sizes are logical; we do not set wl_surface buffer
+        // scale. The old output.scale multiplication put the border in this hole.
+        let output = OutputInfo {
+            global_name: 2,
+            logical: LogicalRect { x: -100, y: 200, width: 100, height: 100 },
+            scale: 2,
+        };
+        let rect = LogicalRect { x: -80, y: 210, width: 30, height: 40 };
+        let mut pixels = vec![0; 100 * 100 * 4];
+        draw_overlay_dim_with_selection(&mut pixels, 100, 100, output, Some(rect), 3, OVERLAY_BORDER_WHITE_BGRA, true);
+        for y in 10..50 {
+            for x in 20..50 {
+                assert_eq!(&pixels[(y * 100 + x) * 4..(y * 100 + x + 1) * 4], &OVERLAY_SELECTED_TRANSPARENT_BGRA);
+            }
+        }
+        assert_eq!(&pixels[(9 * 100 + 20) * 4..(9 * 100 + 21) * 4], &OVERLAY_BORDER_WHITE_BGRA);
+    }
+
+    #[test]
+    fn edited_capture_is_rejected_while_current_border_stays_visible() {
+        let output = OutputInfo {
+            global_name: 1,
+            logical: LogicalRect { x: 0, y: 0, width: 100, height: 100 },
+            scale: 1,
+        };
+        let original = LogicalRect { x: 10, y: 20, width: 60, height: 60 };
+        for settled in [
+            LogicalRect { x: 30, y: 40, width: 20, height: 20 }, // shrink
+            LogicalRect { x: 50, y: 60, width: 30, height: 30 }, // move
+        ] {
+            let mut state = ui_state();
+            state.capture_pending = Some(original);
+            state.drag = DragState::Finished(settled);
+            // Release cleared edit_drag/edit_union, but the capture is still pending.
+            invalidate_changed_capture(&mut state);
+            assert!(state.capture_invalid);
+            assert!(ui_render_border(&state));
+            let hole = ui_render_selection(&state);
+            let mut pixels = vec![0; 100 * 100 * 4];
+            draw_live_base(&mut pixels, 100, 100, hole);
+            let preview = LongPreviewSnapshot {
+                image: solid_image(100, 100, &[(0, 100, [255, 255, 255, 255])]),
+                current_origin_x: 0,
+                current_origin_y: 0,
+                viewport_rect: output.logical,
+                capture_width: 100,
+                capture_height: 100,
+            };
+            draw_live_foreground(&mut pixels, 100, 100, output.logical, hole, ui_render_border_rect(&state), Some(&preview), 3,
+                OVERLAY_BORDER_WHITE_BGRA);
+            assert_eq!(pixel_at(&pixels, 100, (settled.x - 1) as usize, (settled.y - 1) as usize), OVERLAY_BORDER_WHITE_BGRA);
+            for y in settled.y..settled.bottom() {
+                for x in settled.x..settled.right() {
+                    let offset = ((y * 100 + x) * 4) as usize;
+                    assert_eq!(&pixels[offset..offset + 4], &OVERLAY_SELECTED_TRANSPARENT_BGRA);
+                }
+            }
+            // Returning to the old geometry must not make a polluted frame valid.
+            state.drag = DragState::Finished(original);
+            invalidate_changed_capture(&mut state);
+            assert!(state.capture_invalid);
+            state.drag = DragState::Finished(settled);
+            state.capture_pending = None;
+            assert_eq!(ui_render_selection(&state), Some(settled));
+            assert!(ui_render_border(&state));
+        }
+    }
+
+    #[test]
+    fn live_border_is_above_preview_on_every_redraw() {
+        let output = LogicalRect { x: 0, y: 0, width: 100, height: 100 };
+        let hole = LogicalRect { x: 30, y: 30, width: 40, height: 40 };
+        let mut base = vec![0; 100 * 100 * 4];
+        draw_live_base(&mut base, 100, 100, Some(hole));
+        // Reuse the same border-free cache while preview, border color,
+        // thickness, and visibility change between renders.
+        for (color, thickness) in [(OVERLAY_BORDER_WHITE_BGRA, 3), (OVERLAY_BORDER_RED_BGRA, 5)] {
+            let preview_color = [40, 80, 120, 255];
+            let preview = LongPreviewSnapshot {
+                image: solid_image(100, 100, &[(0, 100, preview_color)]),
+                current_origin_x: 0,
+                current_origin_y: 0,
+                viewport_rect: output,
+                capture_width: 100,
+                capture_height: 100,
+            };
+            for visible in [true, false, true] {
+                let mut data = base.clone();
+                draw_live_foreground(&mut data, 100, 100, output, Some(hole), visible.then_some(hole), Some(&preview), thickness, color);
+                let pixel = |x: i32, y: i32| {
+                    let offset = ((y * 100 + x) * 4) as usize;
+                    &data[offset..offset + 4]
+                };
+                for step in 0..thickness {
+                    for (x, y) in [(40, 29 - step), (40, 70 + step), (29 - step, 40), (70 + step, 40)] {
+                        assert_eq!(pixel(x, y), if visible { &color } else { &preview_color });
+                    }
+                }
+                assert_eq!(pixel(10, 10), &preview_color);
+                for y in hole.y..hole.bottom() {
+                    for x in hole.x..hole.right() {
+                        assert_eq!(pixel(x, y), &OVERLAY_SELECTED_TRANSPARENT_BGRA);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frozen_and_live_borders_are_identical_closed_rings_for_all_widths() {
+        let output = OutputInfo {
+            global_name: 1,
+            logical: LogicalRect { x: -100, y: 200, width: 100, height: 100 },
+            scale: 2,
+        };
+        let rect = LogicalRect { x: -70, y: 230, width: 40, height: 40 };
+        let local = selected_buffer_rect(output, rect, 100, 100).unwrap();
+        let frozen = frozen_test_output(output, 100, 100, [20, 30, 40, 255]);
+        for thickness in 1..=16 {
+            let cache = build_overlay_render_cache(100, 100, output, &frozen, thickness);
+            let mut normal = vec![0; 100 * 100 * 4];
+            let mut live = normal.clone();
+            draw_overlay(&mut normal, &cache, output, Some(rect), thickness);
+            draw_overlay_dim_with_selection(&mut live, 100, 100, output, Some(rect), thickness, OVERLAY_BORDER_WHITE_BGRA, true);
+            for y in 0..100 {
+                for x in 0..100 {
+                    // Independent expected ring, including corner squares.
+                    let expected = x >= 30 - thickness && x < 70 + thickness
+                        && y >= 30 - thickness && y < 70 + thickness
+                        && !(x >= 30 && x < 70 && y >= 30 && y < 70);
+                    let n = pixel_at(&normal, 100, x as usize, y as usize);
+                    let l = pixel_at(&live, 100, x as usize, y as usize);
+                    assert_eq!(n == OVERLAY_BORDER_WHITE_BGRA, expected, "normal {x},{y}, width {thickness}");
+                    assert_eq!(l == OVERLAY_BORDER_WHITE_BGRA, expected, "live {x},{y}, width {thickness}");
+                }
+            }
+            // Clipping keeps a border at negative/out-of-output coordinates safe.
+            let mut clipped = vec![0; 100 * 100 * 4];
+            draw_selection_border(&mut clipped, 100, 100, -5, -5, local.width, local.height, thickness, OVERLAY_BORDER_WHITE_BGRA);
+        }
+    }
+
+    #[test]
+    fn dirty_redraw_erases_old_border_including_corners() {
+        let output = OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 0, width: 100, height: 100 }, scale: 1 };
+        let old = LogicalRect { x: 20, y: 20, width: 20, height: 20 };
+        let new = LogicalRect { x: 60, y: 60, width: 20, height: 20 };
+        let frozen = frozen_test_output(output, 100, 100, [20, 30, 40, 255]);
+        let cache = build_overlay_render_cache(100, 100, output, &frozen, 16);
+        let mut data = vec![0; 100 * 100 * 4];
+        draw_overlay(&mut data, &cache, output, Some(old), 16);
+        let dirty = dirty_selected_region(Some(border_bounds(old, 16)), Some(border_bounds(new, 16)), 100, 100).unwrap();
+        draw_overlay_region(&mut data, &cache, output, Some(new), dirty, 16);
+        let mut expected = vec![0; data.len()];
+        draw_overlay(&mut expected, &cache, output, Some(new), 16);
+        assert_eq!(data, expected);
+    }
+
+    #[test]
     fn render_selection_uses_union_only_while_edit_drag_is_active() {
         let mut state = ui_state();
         state.drag = DragState::Finished(SELECTED);
         // No drag in progress: the render selection is the live rectangle.
         assert_eq!(ui_render_selection(&state), Some(SELECTED));
         assert!(ui_render_border(&state));
-        // During an edit drag the union takes over and the border is off.
+        // During an edit drag the hole expands, but the border follows the box.
         state.edit_drag = Some(EditDrag::Move { offset_x: 1, offset_y: 1 });
         state.edit_union = Some(LogicalRect { x: 0, y: 0, width: 90, height: 90 });
         assert_eq!(ui_render_selection(&state), Some(LogicalRect { x: 0, y: 0, width: 90, height: 90 }));
-        assert!(!ui_render_border(&state));
+        assert!(ui_render_border(&state));
+        assert_eq!(ui_render_border_rect(&state), Some(SELECTED));
     }
 
     #[test]
@@ -2342,6 +2502,8 @@ mod tests {
             editing: false,
             edit_drag: None,
             edit_union: None,
+            capture_pending: None,
+            capture_invalid: false,
             selection_anchor: None,
             border_width: crate::config::DEFAULT_BORDER_WIDTH,
         }
@@ -2464,8 +2626,8 @@ mod tests {
 
     #[test]
     fn overlay_pixel_dims_outside_selection() {
-        assert_eq!(overlay_pixel(9, 20, Some(SELECTED), 3), OVERLAY_OUTSIDE_MASK_BGRA);
-        assert_eq!(overlay_pixel(10, 19, Some(SELECTED), 3), OVERLAY_OUTSIDE_MASK_BGRA);
+        assert_eq!(overlay_pixel(6, 20, Some(SELECTED), 3), OVERLAY_OUTSIDE_MASK_BGRA);
+        assert_eq!(overlay_pixel(10, 16, Some(SELECTED), 3), OVERLAY_OUTSIDE_MASK_BGRA);
     }
 
     #[test]
@@ -2474,13 +2636,13 @@ mod tests {
     }
 
     #[test]
-    fn overlay_pixel_draws_dark_edge_border() {
-        assert_eq!(overlay_pixel(10, 20, Some(SELECTED), 3), OVERLAY_BORDER_DARK_BGRA);
+    fn overlay_pixel_keeps_selection_edge_clear() {
+        assert_eq!(overlay_pixel(10, 20, Some(SELECTED), 3), OVERLAY_SELECTED_TRANSPARENT_BGRA);
     }
 
     #[test]
     fn overlay_pixel_draws_white_adjacent_border() {
-        assert_eq!(overlay_pixel(11, 21, Some(SELECTED), 3), OVERLAY_BORDER_WHITE_BGRA);
+        assert_eq!(overlay_pixel(9, 19, Some(SELECTED), 3), OVERLAY_BORDER_WHITE_BGRA);
     }
 
     #[test]
@@ -2563,9 +2725,10 @@ mod tests {
 
         draw_overlay(&mut data, &cache, output_info, Some(selected), 3);
 
-        assert_eq!(pixel_at(&data, output.width as usize, 0, 0), [6, 11, 17, 255]);
-        assert_eq!(pixel_at(&data, output.width as usize, 2, 2), OVERLAY_BORDER_DARK_BGRA);
-        assert_eq!(pixel_at(&data, output.width as usize, 3, 3), OVERLAY_BORDER_WHITE_BGRA);
+        assert_eq!(pixel_at(&data, output.width as usize, 0, 0), OVERLAY_BORDER_WHITE_BGRA);
+        // The border is a closed outside ring, including the four corners.
+        assert_eq!(pixel_at(&data, output.width as usize, 1, 1), OVERLAY_BORDER_WHITE_BGRA);
+        assert_eq!(pixel_at(&data, output.width as usize, 2, 2), frozen_pixel);
         assert_eq!(pixel_at(&data, output.width as usize, 5, 5), frozen_pixel);
     }
 
@@ -2575,8 +2738,8 @@ mod tests {
         let previous = LogicalRect { x: 101, y: 51, width: 5, height: 5 };
         let current = LogicalRect { x: 103, y: 53, width: 3, height: 3 };
         let dirty = dirty_selected_region(
-            selected_local_intersection(output, previous),
-            selected_local_intersection(output, current),
+            selected_local_intersection(output, previous).map(|r| border_bounds(r, 3)),
+            selected_local_intersection(output, current).map(|r| border_bounds(r, 3)),
             output.width,
             output.height,
         )
@@ -2591,8 +2754,8 @@ mod tests {
         draw_overlay(&mut data, &cache, output_info, Some(previous), 3);
         draw_overlay_region(&mut data, &cache, output_info, Some(current), dirty, 3);
 
-        assert_eq!(pixel_at(&data, output.width as usize, 1, 1), [6, 11, 17, 255]);
-        assert_eq!(pixel_at(&data, output.width as usize, 3, 3), OVERLAY_BORDER_DARK_BGRA);
+        assert_eq!(pixel_at(&data, output.width as usize, 1, 1), OVERLAY_BORDER_WHITE_BGRA);
+        assert_eq!(pixel_at(&data, output.width as usize, 2, 2), OVERLAY_BORDER_WHITE_BGRA);
     }
 
     #[test]

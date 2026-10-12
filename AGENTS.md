@@ -2,8 +2,9 @@
 
 ## Project Identity And Purpose
 
-- Rust rebuild of a **niri-only Wayland screenshot tool**; binary name `screenshot`.
-- Rebuild of the original project at `/home/life/Work/screenshot-rs` (upstream: `xander-lin/screenshot-niri`). The `plain` branch of the original supports other wlroots compositors; this rebuild targets niri only.
+- Rust rebuild of a **Wayland screenshot tool**, originally targeting niri; binary name `screenshot`.
+- Upstream: `xander-lin/screenshot-niri`. The historical original-project path `/home/life/Work/screenshot-rs` is unavailable in this workspace.
+- Launch is compositor-agnostic: do not gate on Niri session hints. Users test compatibility with their compositor's advertised Wayland protocols.
 - Serves interactive screen capture on Wayland without external tools (no grim, no wl-copy, no shell-outs).
 
 ## Functional Goals And Scope
@@ -13,9 +14,9 @@
 - **Clipboard**: `wlr-data-control` serving `image/png` (default) or `file://` URI (`--url`), as a detached provider process.
 - **Output path policy**: temp dir default → `--file [PATH]` (Pictures/Screenshots) → `-o/--output PATH` → `--name NAME` → positional PATH (same as `--file PATH`).
 - **Config file** (`~/.config/screenshot/config`): `max_fps` (default frame-rate cap when `--fps` absent) and `border_width` (visible selection-border thickness); optional, non-fatal, dependency-free parsing.
-- Long-mode selections spanning outputs show a **red warning border**; releasing clamps to the largest single-output piece and enters edit mode.
+- Long-mode selections spanning outputs show a **red warning border**; releasing clamps to the click-anchor output (largest piece fallback) and enters edit mode.
 - Edit mode supports edge resize and whole-box move (interior drag); captures are inset 1 logical pixel inside the box so the overlay border is never captured.
-- Out of scope: non-niri compositors, X11, focus-grab extensions, diagnostics compatibility bins.
+- Out of scope: X11, focus-grab extensions, diagnostics compatibility bins. Cross-compositor compatibility is user-tested.
 
 ## Product Philosophy
 
@@ -32,18 +33,20 @@
 - Verification: `cargo test` (unit tests live alongside modules; stitch has extensive pure-logic tests), `cargo check`, manual niri testing for Wayland flows.
 - Long-capture performance protections must be preserved: configurable frame-rate cap (`--fps`, hardcoded default 30, range 1–240), damage-based capture after the first frame, near-duplicate frame skip (bypassed when the capture region changed), bounded capture channel backpressure, and capture pause during edit-mode edge drags.
 - Selection-box edit mode (E key) semantics must be preserved: edges have snap targets only in edit mode; edit mode blocks wheel scroll by holding pointer input; frames captured after a resize are stitched at their deterministic known position; only the settled rectangle after an edge-drag release is captured.
-- Overlay rendering must map the global-logical selection through the output's real logical rect and scale (see `selected_buffer_rect`); a pseudo `(0,0,buffer)` rect hides the box on offset/scaled outputs.
+- Overlay rendering maps through the output's real logical rect and actual overlay buffer dimensions (`selected_buffer_rect`), not `wl_output.scale`: overlay surfaces currently use buffer scale 1. Long screencopy requests use output-local logical coordinates; frozen-image crop rectangles use pixels.
+- Capture exclusion lasts until frame completion, including after edit release. Border visibility is continuous during edits: any pending frame exposed to changed geometry is permanently invalidated and discarded before dedup/stitching, even if the box returns to its old position. PrepareCapture commits on the selected output and synchronizes the UI connection before acknowledging the worker.
+- Live overlays share one renderer: cached dim mask/hole → stitched preview → selection border. The border is drawn last on every redraw and follows the current box, not the exclusion union. Frozen and live paths use the same closed outside-ring pixel rule. Frozen dirty-region damage includes the full configured border width.
 - Memory: overlay buffers are full-resolution RGBA per output (2 each) plus a base-pixels cache; footprint is resolution-driven, not fps-driven. Keep `OVERLAY_BUFFER_COUNT` minimal.
 
 ## Structure Map
 
-- `src/main.rs` → bin-only modules (`app`, `cli`, `clipboard`, `runtime`) + lib modules.
+- `src/main.rs` → bin-only modules (`app`, `cli`, `clipboard`) + lib modules.
 - `src/lib.rs` → exposes `geometry`, `image`, `stitch`, `trace`, `wayland::{screencopy, selection}` for tests.
-- `src/app.rs` → orchestration; normal flow and long flow; `LongCaptureWorker` (dedicated capture thread, 120 fps cap, prepare-capture-clean ack handshake).
+- `src/app.rs` → orchestration; normal flow and long flow; `LongCaptureWorker` (dedicated capture thread, configurable 30 fps default cap, prepare-capture-clean ack handshake).
 - `src/stitch.rs` + `src/stitch/` → full multi-stage matcher ported from the original (canvas exact placement, perceptual bands, fuzzy hash, fast-motion scan, fixed bands, previous-frame fallback).
 - `src/wayland/screencopy.rs` → wlr screencopy v3 client; one-shot frozen captures and persistent `CaptureSession` for long mode.
 - `src/wayland/selection.rs` → layer-shell overlay: frozen/dimmed selection UI, drag redraw, long-mode preview and status, pointer passthrough for capture.
-- `src/geometry.rs`, `src/image.rs`, `src/cli.rs`, `src/clipboard.rs`, `src/runtime.rs` → see `src/CONTRACT.md`.
+- `src/geometry.rs`, `src/image.rs`, `src/cli.rs`, `src/clipboard.rs` → see `src/CONTRACT.md`.
 
 ## Commands
 

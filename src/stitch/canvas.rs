@@ -57,7 +57,7 @@ pub fn image_from_stitched_frame(frame: &StitchedFrame) -> Result<Image, Box<dyn
             .unwrap_or((0, frame.width));
         for x in 0..frame.width as usize {
             let dst = dst_row + x * 4;
-            if covered.1 > covered.0 && (x < covered.0 as usize || x >= covered.1 as usize) {
+            if covered.1 <= covered.0 || x < covered.0 as usize || x >= covered.1 as usize {
                 // Never captured: keep RGB zeroed and fully transparent so the
                 // ragged corners of T/L-shaped stitches stay see-through.
                 continue;
@@ -191,7 +191,11 @@ fn append_frame_at_position_with_overlap_mode(
         // Union hull of the existing extent and the frame extent. Adjacent or
         // overlapping fills (the normal case) stay exact; a fully disjoint
         // fill over-covers the gap, which only affects never-captured corners.
-        row_coverage[out_y] = (start.min(frame_dst_x), end.max(frame_end));
+        row_coverage[out_y] = if start < end {
+            (start.min(frame_dst_x), end.max(frame_end))
+        } else {
+            (frame_dst_x, frame_end)
+        };
     }
     blit_rgb(
         &stitched.data,
@@ -215,17 +219,31 @@ fn append_frame_at_position_with_overlap_mode(
     );
     match overlap_write_mode {
         OverlapWriteMode::Preserve | OverlapWriteMode::Rows { .. } => {
-            blit_rgb_excluding_rect(
-                &frame.data,
-                frame.width,
-                frame.height,
-                frame.stride,
-                &mut data,
-                output_stride,
-                frame_dst_x,
-                frame_dst_y,
-                overlap_rect,
-            );
+            // Preserve captured pixels, not the entire canvas bounding box.
+            // Widening after a narrow scroll must fill previously transparent
+            // strips even though they lie inside that bounding box.
+            for y in 0..frame.height {
+                let dst_y = frame_dst_y + y;
+                let covered = dst_y.checked_sub(stitched_dst_y)
+                    .and_then(|row| stitched.row_coverage.get(row as usize))
+                    .copied().filter(|&(start, end)| start < end)
+                    .map(|(start, end)| (start + stitched_dst_x, end + stitched_dst_x));
+                let frame_end = frame_dst_x + frame.width;
+                let spans = match covered {
+                    Some((start, end)) => [
+                        (frame_dst_x, start.min(frame_end)),
+                        (end.max(frame_dst_x), frame_end),
+                    ],
+                    None => [(frame_dst_x, frame_end), (0, 0)],
+                };
+                for (start, end) in spans {
+                    if start >= end { continue; }
+                    let src = (y * frame.stride + (start - frame_dst_x) * 3) as usize;
+                    let dst = (dst_y * output_stride + start * 3) as usize;
+                    let len = ((end - start) * 3) as usize;
+                    data[dst..dst + len].copy_from_slice(&frame.data[src..src + len]);
+                }
+            }
         }
     }
     if let OverlapWriteMode::Rows { frame_y, rows } = overlap_write_mode {
@@ -399,33 +417,6 @@ fn blit_rgb(
         let src_start = y * stride as usize;
         let dst_start = (dst_y as usize + y) * dst_stride as usize + dst_x as usize * 3;
         dst[dst_start..dst_start + row_len].copy_from_slice(&src[src_start..src_start + row_len]);
-    }
-}
-
-fn blit_rgb_excluding_rect(
-    src: &[u8],
-    width: u32,
-    height: u32,
-    stride: u32,
-    dst: &mut [u8],
-    dst_stride: u32,
-    dst_x: u32,
-    dst_y: u32,
-    exclude: Option<(u32, u32, u32, u32)>,
-) {
-    for y in 0..height {
-        for x in 0..width {
-            let out_x = dst_x + x;
-            let out_y = dst_y + y;
-            if exclude.is_some_and(|(x0, y0, x1, y1)| {
-                out_x >= x0 && out_x < x1 && out_y >= y0 && out_y < y1
-            }) {
-                continue;
-            }
-            let src_start = y as usize * stride as usize + x as usize * 3;
-            let dst_start = out_y as usize * dst_stride as usize + out_x as usize * 3;
-            dst[dst_start..dst_start + 3].copy_from_slice(&src[src_start..src_start + 3]);
-        }
     }
 }
 

@@ -225,11 +225,14 @@ impl CaptureSession {
         Ok(Self { conn, event_queue, state })
     }
 
+    /// Capture an output-local logical rectangle. Returned dimensions are
+    /// compositor-provided buffer pixels; `None` means the stop flag was set.
     pub fn capture_region_frame_without_cursor(
         &mut self,
         region: CaptureOutputRegion,
         wait_for_damage: bool,
-    ) -> Result<Image, Box<dyn Error>> {
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<Option<Image>, Box<dyn Error>> {
         self.state.image = None;
         self.state.shm_image = None;
         self.state.wait_for_damage = wait_for_damage;
@@ -253,7 +256,38 @@ impl CaptureSession {
         self.conn.flush()?;
 
         while !self.state.done && !self.state.failed {
-            self.event_queue.blocking_dispatch(&mut self.state)?;
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(frame) = self.state.frame.take() {
+                    frame.destroy();
+                }
+                self.conn.flush()?;
+                return Ok(None);
+            }
+            self.event_queue.dispatch_pending(&mut self.state)?;
+            self.event_queue.flush()?;
+            if self.state.done || self.state.failed {
+                break;
+            }
+            let Some(guard) = self.event_queue.prepare_read() else { continue; };
+            let mut fd = libc::pollfd {
+                fd: guard.connection_fd().as_raw_fd(),
+                events: libc::POLLIN | libc::POLLERR | libc::POLLHUP,
+                revents: 0,
+            };
+            // Damage may never arrive on a static screen. Poll with a bounded
+            // wait so Enter/Esc can stop and join the worker without another redraw.
+            let ready = unsafe { libc::poll(&mut fd, 1, 20) };
+            if ready > 0 {
+                guard.read()?;
+            } else {
+                drop(guard);
+                if ready < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EINTR) {
+                        return Err(error.into());
+                    }
+                }
+            }
         }
         if let Some(frame) = self.state.frame.take() {
             frame.destroy();
@@ -261,7 +295,7 @@ impl CaptureSession {
         if self.state.failed {
             return Err("screencopy region capture failed".into());
         }
-        self.state.image.take().ok_or_else(|| "screencopy region completed without image".into())
+        self.state.image.take().map(Some).ok_or_else(|| "screencopy region completed without image".into())
     }
 }
 

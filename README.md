@@ -1,21 +1,17 @@
 # screenshot
 
-`screenshot` is a Wayland screenshot tool for **niri** with region selection and long/scroll screenshot support.
+`screenshot` is a Wayland screenshot tool with region selection and long/scroll screenshot support, originally developed for **niri**.
 
 - **Normal mode**: drag to select a region — the screen freezes and dims during selection.
 - **Long mode**: capture scrolling content by selecting a region, then scrolling — the tool stitches frames into one tall image.
 
 The binary is named `screenshot`.
 
-## Supported Compositor
+## Compositor Compatibility
 
-| Compositor |               |
-|-----------|---------------|
-| Niri      | ✅ |
-| Hyprland  | ❌ (use the `plain` branch) |
-| Sway      | ❌ (use the `plain` branch) |
+There is no compositor-name check: normal and long modes can be launched in any session. Compatibility is left to users to test in their environment.
 
-Uses niri-specific wlroots protocol extensions. The `plain` branch supports all wlroots compositors but without long screenshot mode.
+Capture uses `wlr-screencopy` v3, the overlay uses `wlr-layer-shell`, and clipboard serving uses `wlr-data-control`. A Wayland connection and the required protocols must be available; missing capabilities are reported at runtime.
 
 ## Install
 
@@ -108,14 +104,16 @@ border_width = 3
 ### Long/Scroll Screenshot (`--long`)
 
 1. Run `screenshot --long` — enter region selection.
-2. **Drag** to select the capture area on a single output. If the box spans two outputs its border turns **red** as a warning; releasing then clamps the box to the largest piece that fits one output and enters edit mode so you can keep adjusting. Back on a single output the border turns white again.
-3. The overlay dims except for the selected region. The tool starts capturing frames (inset one pixel inside the box so the border itself is never captured). While you drag an edge or move the box the border is temporarily hidden — the capture looks through the whole drag trajectory, which keeps border pixels out of the stitched result.
+2. **Drag** to select the capture area on a single output. If the box spans two outputs its border turns **red** as a warning; releasing then clamps the box to the output where the drag started and enters edit mode so you can keep adjusting. Back on a single output the border turns white again.
+3. The overlay dims except for the selected region. Capture is inset one logical pixel where the box is large enough. The closed border remains visible while selecting, resizing, and moving. Capture pauses during dragging; any unfinished frame exposed to a moved/resized border is discarded before stitching.
 4. **Scroll** the content within the selected region.
+   The selection border is always drawn above the stitched preview, with the same appearance before and after selection.
 5. Press **↑** / **↓** / **←** / **→** to hint the scroll direction for better stitching.
 6. Press **E** during capture to enter selection-box **editing mode**: the box edges can be dragged to resize it and the box interior can be dragged to move it; wheel events are blocked (the displayed content cannot scroll while editing). Resizing is stitched at the exact edited position, which enables:
    - capturing content that is narrower on top and wider on the bottom (T-shaped captures),
    - scrolling vertically first and horizontally afterwards (L-shaped captures, hint with **←** / **→**),
    - extending the bottom edge after scrolling so static content (headers/footers that repeat while scrolling and would break stitching) is captured once, perfectly attached below.
+   You can change width repeatedly (wide → narrow → wide). Previously captured pixels are preserved. Rows captured only at the narrower width retain transparent side notches unless you revisit and capture those missing areas; widening fills newly captured strips in the current viewport.
 7. Press **Enter** or **Space** to finish — the tool stitches all frames and saves.
 8. Press **Esc** to cancel.
 9. Long screenshots always use cursor-free capture frames; **H** applies only to normal screenshots. Long capture is capped at 30 fps by default (`--fps` or the config file's `max_fps` to change); frames are damage-driven, so slower machines and static content naturally capture less often.

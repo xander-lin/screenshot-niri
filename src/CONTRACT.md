@@ -26,27 +26,15 @@
 
 ## `app`
 
-- Responsibilities: orchestrate normal screenshot flow, run niri-only preflight, pass frozen output frames into selection, orchestrate long capture (fps-capped worker thread, region-tagged frames, PrepareCapture handshake that hands the capture region back to the worker from the same rectangle used for the clean overlay render), and drive offset-aware stitching.
+- Responsibilities: orchestrate normal screenshot flow, pass frozen output frames into selection, orchestrate long capture (fps-capped worker thread, region-tagged frames, PrepareCapture handshake using the exact clean-render rectangle), and drive offset-aware stitching. Launch without compositor-name/environment-hint gating.
 - Non-responsibilities: low-level protocol dispatch and PNG encoding internals.
 - Inputs: parsed `Args` (including `max_frame_rate`).
 - Outputs: saved PNG path and clipboard provider startup.
-- Dependencies: `cli`, `runtime`, `wayland::screencopy`, `wayland::selection`, `geometry`, `image`, `stitch`, and `clipboard`.
+- Dependencies: `cli`, `wayland::screencopy`, `wayland::selection`, `geometry`, `image`, `stitch`, and `clipboard`.
 - Forbidden dependencies: compositor adaptation branches and diagnostics bins.
-- Failure modes: unsupported multi-output long selection, non-niri runtime environment, cancelled selection, capture failure, write failure, and clipboard setup failure.
+- Failure modes: unsupported multi-output long selection, unavailable Wayland connection/protocols, cancelled selection, capture failure, write failure, and clipboard setup failure. Worker errors are propagated rather than silently saving a partial capture.
 - Verification method: integration/manual test under niri and `cargo check`.
-- Replacement contract: keep the same high-level sequence: preflight, freeze, select, composite, write, clipboard; long capture keeps the pacing cap, damage wait, and per-frame capture-region tagging. The capture region must stay same-source with the clean overlay render: the UI thread derives both from one rectangle inside the PrepareCapture handshake (skip the frame when an edit drag is active or the clean render cannot commit) — a worker-side region snapshot racing the overlay geometry was the root cause of white borders inside stitched captures.
-
-## `runtime`
-
-- Responsibilities: detect whether normal screenshot capture appears to be running inside niri.
-- Non-responsibilities: Wayland registry probing, compositor fallback selection, and clipboard-provider gating.
-- Inputs: `NIRI_SOCKET` and `XDG_CURRENT_DESKTOP`.
-- Outputs: success for niri-like sessions or a clear niri-only diagnostic.
-- Dependencies: standard library environment access.
-- Forbidden dependencies: Wayland protocol clients and non-niri compositor branches.
-- Failure modes: missing or empty niri session hints.
-- Verification method: pure unit tests for injected environment values, plus `cargo check`.
-- Replacement contract: keep normal screenshot preflight lightweight and side-effect-free apart from reading process env.
+- Replacement contract: preserve freeze, select, composite, write, clipboard; long capture keeps pacing, damage waits, and per-frame region tags. Use output-local logical coordinates for screencopy requests, with offsets converted to returned-frame pixels for stitching. PrepareCapture returns the exact rendered rectangle after synchronizing the selected output's commit; frame receipt releases its exclusion. Discard frames invalidated by edits before deduplication/stitching. Skip requests during active edit drags or unavailable buffers. Stop must interrupt damage waits. Compatibility is user-tested, not gated by `NIRI_SOCKET` or `XDG_CURRENT_DESKTOP`.
 
 ## `geometry`
 
@@ -82,7 +70,7 @@
 - Forbidden dependencies: Wayland protocol flow, runtime environment checks, filesystem access, clipboard state, and CLI modules.
 - Failure modes: unsupported formats, zero dimensions, short stride/data, width/stride/format mismatch, invalid overlap ranges, no overlap within the RGB threshold, geometry-frame overflow, and arithmetic overflow.
 - Verification method: unit tests for exact and thresholded overlap detection, canvas placement, mismatch rejection, geometry extension/widening/shrink/movement placement with coverage and transparency, near-duplicate handling, direction-filtered no-match preservation, empty finish, plus `cargo check`.
-- Replacement contract: keep stitching deterministic and side-effect-free; geometry-changed frames keep being placed at the offset-implied position with crop/band state reset for the new geometry rather than fuzzy-matched.
+- Replacement contract: keep stitching deterministic and side-effect-free; geometry-changed frames keep being placed at the offset-implied position with crop/band state reset for the new geometry rather than fuzzy-matched. Preserve covered pixels rather than the canvas bounding rectangle: later widening must fill recaptured strips inside that rectangle. Newly added narrow rows start coverage at their actual x offset, and empty rows export transparent. Wide/narrow/wide captures may retain transparent side notches where content was never captured.
 
 ## `clipboard`
 
@@ -100,22 +88,22 @@
 
 - Responsibilities: bind wlroots screencopy, capture outputs into SHM buffers, and expose frozen-output data.
 - Non-responsibilities: selection UI, PNG writing, and long capture.
-- Inputs: Wayland globals and requested output/global regions.
-- Outputs: captured output frames and region metadata.
+- Inputs: Wayland globals and requested output-local logical regions (distinct from pixel-space rectangles used to crop frozen images); persistent capture also accepts a stop flag.
+- Outputs: captured output frames and region metadata; persistent capture returns `None` on cancellation and errors on protocol failure.
 - Dependencies: `wayland-client`, `wayland-protocols-wlr`, `tempfile`, and `libc`.
 - Forbidden dependencies: non-wlr capture APIs and compositor adaptation branches.
 - Failure modes: missing globals, unsupported buffer format, failed SHM allocation, screencopy failure, and protocol cancellation.
 - Verification method: manual niri capture plus `cargo check`.
-- Replacement contract: provide frozen output frames suitable for selection-time compositing.
+- Replacement contract: provide frozen output frames suitable for selection-time compositing. Persistent damage waits must poll the stop flag with bounded latency so joining the worker does not require fresh screen damage.
 
 ## `wayland::selection`
 
-- Responsibilities: bind layer-shell/xdg-output, display frozen output frames with dimmed outside-selection mask and visible border, redraw dirty overlay regions during drag, return a drag-selected viewport, and provide selection-box edit mode (E key) with per-edge snap targets, output-clamped edge drags, pointer-input grabbing (wheel blocking) during long-capture editing, long-mode preview and status, horizontal/vertical direction hints, and live selection-rect/output-info accessors for the capture loop. During an edit drag the overlay hole becomes the union of the drag trajectory with the border suppressed, so in-flight capture regions (derived from the pre-drag rectangle) always look through transparent pixels.
+- Responsibilities: bind layer-shell/xdg-output, display frozen output frames with dimmed outside-selection mask and visible border, redraw dirty overlay regions during drag, return a drag-selected viewport, and provide selection-box edit mode (E key) with per-edge snap targets, output-clamped edge drags, pointer-input grabbing (wheel blocking) during long-capture editing, long-mode preview and status, horizontal/vertical direction hints, and live selection-rect/output-info accessors for the capture loop. During edits the preview exclusion covers the drag trajectory; the visible border follows the current box. Pending captures are invalidated on geometry change.
 - Non-responsibilities: screencopy, PNG writing, clipboard, and capture-region recomputation policy.
 - Inputs: frozen captured output frames, Wayland pointer/keyboard events, and output logical geometry.
 - Outputs: selected viewport or cancellation; long-session status, direction hints, live selection rect, and output infos.
 - Dependencies: `wayland-client`, `wayland-protocols`, `wayland-protocols-wlr`, `tempfile`, and `libc`.
-- Forbidden dependencies: focus-grab extensions and non-niri compositor branches.
+- Forbidden dependencies: focus-grab extensions and compositor-name checks.
 - Failure modes: missing layer-shell/compositor/shm/seat/output globals, missing frozen output frame, unsupported frozen frame format, no pointer, cancellation, or empty selection.
 - Verification method: unit tests for overlay pixels/dirty regions/edge hit-testing/edge clamping, manual niri drag-selection and edit-mode test, and `cargo check`.
-- Replacement contract: return geometry-only selection data usable by screencopy compositing; keep edit-mode edge semantics (snap targets exist only in edit mode; edit mode blocks wheel propagation by holding pointer input; Enter/Space confirms/finishes from edit mode). All overlay render paths must map the selection through the output's real logical rect and scale, and the dim/base cache must be keyed by the rendered hole rect, border color, and border visibility — not just the buffer size. `prepare_capture_clean` reports whether the clean state was actually committed; a capture must never start against an unconfirmed overlay.
+- Replacement contract: return geometry-only selection data usable by screencopy compositing; preserve edit-mode input semantics. Map through the real logical output rect and actual overlay dimensions. Cache only dim/hole; composite preview then border every time. Frozen/live borders share one closed outside-ring pixel rule, including corners and configured thickness. Frozen damage includes the ring; edit borders follow the current rectangle, not the larger exclusion hole. `prepare_capture_clean` commits on the selected output and roundtrips before acknowledgment. `complete_capture` returns false for any frame exposed to a geometry change (sticky even after moving back); the app must discard it before stitching. Preview remains excluded from the pending region until completion.

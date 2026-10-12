@@ -3915,6 +3915,43 @@ mod tests {
     }
 
     #[test]
+    fn wide_narrow_wide_scroll_preserves_notches_and_fills_recaptured_strips() {
+        let world = textured_frame(80, 320);
+        let mut stitcher = RawStitcher::new();
+        let wide = crop_frame(&world, 0, 0, 80, 80);
+        let origin = FrameScreenOffset { x: 100, y: 100 };
+        let narrow_origin = FrameScreenOffset { x: 120, y: 100 };
+        assert!(matches!(stitcher.push_frame_with_offset(&wide, &wide, None, origin).unwrap(), PushResult::Initialized));
+        let narrow = crop_frame(&world, 20, 0, 40, 80);
+        assert!(matches!(stitcher.push_frame_with_offset(&narrow, &narrow, None, narrow_origin).unwrap(), PushResult::Accepted { .. }));
+        for y in (20..=120).step_by(20) {
+            let next = crop_frame(&world, 20, y, 40, 80);
+            assert!(matches!(stitcher.push_frame_with_offset(&next, &next, Some(LongDirection::Down), narrow_origin).unwrap(), PushResult::Accepted { .. }));
+        }
+        let widened = crop_frame(&world, 0, 120, 80, 80);
+        assert!(matches!(stitcher.push_frame_with_offset(&widened, &widened, None, origin).unwrap(), PushResult::Accepted { .. }));
+        let stitched = stitcher.stitched().unwrap();
+        assert_eq!((stitched.width, stitched.height), (80, 200));
+        let image = image_from_stitched_frame(stitched).unwrap();
+        for y in 0..200 {
+            for x in 0..80 {
+                let expected_covered = y < 80 || y >= 120 || (20..60).contains(&x);
+                let offset = ((y * 80 + x) * 4) as usize;
+                assert_eq!(image.data[offset + 3], if expected_covered { 255 } else { 0 }, "coverage at {x},{y}");
+                if expected_covered {
+                    let source = ((y * world.width + x) * 3) as usize;
+                    assert_eq!(&image.data[offset..offset + 3], &[world.data[source + 2], world.data[source + 1], world.data[source]], "pixels at {x},{y}");
+                }
+            }
+        }
+        // Shrink and expand once more without scrolling: earlier pixels survive.
+        let narrow = crop_frame(&world, 20, 120, 40, 80);
+        stitcher.push_frame_with_offset(&narrow, &narrow, None, narrow_origin).unwrap();
+        stitcher.push_frame_with_offset(&widened, &widened, None, origin).unwrap();
+        assert_eq!(image_from_stitched_frame(stitcher.stitched().unwrap()).unwrap().data, image.data);
+    }
+
+    #[test]
     fn geometry_offset_movement_translates_the_frame() {
         let mut stitcher = RawStitcher::new();
         let first = frame(4, 4, 90);
