@@ -41,10 +41,13 @@ const KEY_LEFT: u32 = 105;
 const KEY_RIGHT: u32 = 106;
 const KEY_DIGIT_FIRST: u32 = 2;
 const KEY_DIGIT_LAST: u32 = 10;
-/// Two full-resolution buffers per overlay suffice for the 30 fps preview
-/// cadence; each extra buffer costs one full-screen RGBA allocation per
-/// output for the whole session.
-const OVERLAY_BUFFER_COUNT: usize = 2;
+/// Three full-resolution buffers per overlay: one held on-screen by the
+/// compositor, one committed and awaiting display, one free to keep the
+/// commit cycle alive. With only two, a compositor whose `wl_buffer.release`
+/// lags more than one frame (observed on multi-output niri where the frame
+/// pace spans two outputs) starves both buffers, and the stall becomes
+/// self-sustaining: no free buffer → no commit → no frame swap → no release.
+const OVERLAY_BUFFER_COUNT: usize = 3;
 /// Logical-pixel snap range around each selection edge in edit mode.
 const EDGE_SNAP_RANGE: i32 = 8;
 /// Smallest selection kept while dragging an edge.
@@ -132,6 +135,8 @@ struct OverlayBuffer {
     available: bool,
     initialized: bool,
     last_selected: Option<LogicalRect>,
+    /// UiState::live_state_seq value this buffer was last committed with.
+    live_seq: u64,
 }
 
 impl Drop for OverlayBuffer {
@@ -236,6 +241,13 @@ struct UiState {
     selection_anchor: Option<(i32, i32)>,
     /// Visible selection-border thickness in logical pixels (configurable).
     border_width: i32,
+    /// Bumped whenever the live overlay's non-rect visual inputs change
+    /// (stitched preview updates). Buffers record the seq they were last
+    /// committed with; a buffer whose seq and rect already match the current
+    /// state needs no new commit. This keeps the commit-on-change contract
+    /// from v0.1.0: steady-state capture frames issue zero overlay commits,
+    /// so capture throughput never depends on compositor release timing.
+    live_state_seq: u64,
 }
 
 impl UiState {
@@ -290,6 +302,7 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
         capture_invalid: false,
         selection_anchor: None,
         border_width: crate::config::DEFAULT_BORDER_WIDTH,
+        live_state_seq: 1,
     };
 
     conn.display().get_registry(&qh, ());
@@ -625,6 +638,7 @@ impl SelectionSession {
             capture_invalid: false,
             selection_anchor: None,
             border_width: border_width.clamp(crate::config::BORDER_WIDTH_MIN, crate::config::BORDER_WIDTH_MAX),
+            live_state_seq: 1,
         };
 
         conn.display().get_registry(&qh, ());
@@ -726,8 +740,76 @@ impl SelectionSession {
         }
         set_overlay_keyboard_exclusive(&mut self.state);
         set_overlay_pointer_passthrough(&mut self.state, &qh)?;
+        // The frozen→live transition must reach the screen exactly once. A
+        // compositor that never releases the buffers it holds (observed under
+        // sustained commit pressure on multi-output niri) would starve every
+        // later commit, so recreate starved overlays' buffers once here.
+        // Destroying a wl_buffer the compositor still holds is legal — it
+        // keeps rendering the old storage while we hand it fresh pools.
+        let starved: Vec<u32> = self
+            .state
+            .overlays
+            .iter()
+            .filter(|overlay| overlay.render_cache.is_none())
+            .filter(|overlay| !overlay.buffers.is_empty() && !overlay.buffers.iter().any(|buffer| buffer.available))
+            .map(|overlay| overlay.output_name)
+            .collect();
+        if !starved.is_empty() {
+            if let Some(shm) = self.state.shm.clone() {
+                let qh = self.event_queue.handle();
+                for name in starved {
+                    let Some((width, height)) = self
+                        .state
+                        .overlays
+                        .iter()
+                        .find(|overlay| overlay.output_name == name)
+                        .map(|overlay| (overlay.width, overlay.height))
+                    else {
+                        continue;
+                    };
+                    if width <= 0 || height <= 0 {
+                        continue;
+                    }
+                    match create_overlay_buffers(&shm, name, width, height, &qh) {
+                        Ok(buffers) => {
+                            if let Some(overlay) =
+                                self.state.overlays.iter_mut().find(|overlay| overlay.output_name == name)
+                            {
+                                overlay.buffers = buffers;
+                                crate::trace_log!("transition: recreated starved buffers output={}", name);
+                            }
+                        }
+                        Err(err) => {
+                            // Without fresh buffers this output's live view
+                            // cannot display; capture still works from the
+                            // frozen frame, so log and continue.
+                            crate::trace_log!("transition: buffer recreate failed output={} err={}", name, err);
+                        }
+                    }
+                }
+                let _ = render_overlays_full_dim(&mut self.state);
+            }
+        }
+        #[cfg(feature = "trace-logs")]
+        for overlay in &self.state.overlays {
+            crate::trace_log!(
+                "long-start: output={} cache={} buffers={} available={}",
+                overlay.output_name,
+                overlay.render_cache.is_some(),
+                overlay.buffers.len(),
+                overlay.buffers.iter().filter(|b| b.available).count(),
+            );
+        }
         self.event_queue.dispatch_pending(&mut self.state)?;
-        self.conn.flush()?;
+        if let Err(err) = self.conn.flush() {
+            // EAGAIN only means the socket accepted partial data; the rest
+            // goes out with the next dispatch. Only real I/O errors are fatal.
+            match err {
+                wayland_client::backend::WaylandError::Io(io)
+                    if io.kind() == std::io::ErrorKind::WouldBlock => {}
+                other => return Err(other.into()),
+            }
+        }
         Ok(())
     }
 
@@ -751,6 +833,9 @@ impl SelectionSession {
 
     pub fn update_long_capture_preview(&mut self, snapshot: LongPreviewSnapshot) -> Result<(), Box<dyn Error>> {
         self.state.long_preview = Some(snapshot);
+        // New preview content must repaint the overlay even when the selection
+        // rectangle is unchanged; buffers recorded the previous seq.
+        self.state.live_state_seq = self.state.live_state_seq.wrapping_add(1);
         queue_render(&mut self.state, true);
         self.event_queue.dispatch_pending(&mut self.state)?;
         self.conn.flush()?;
@@ -814,30 +899,58 @@ impl SelectionSession {
     /// connection before the worker requests capture on its own connection.
     /// Return the exact selection used. Subsequent edits invalidate that frame.
     pub fn prepare_capture_clean(&mut self) -> Result<Option<LogicalRect>, Box<dyn Error>> {
-        for _ in 0..6 {
+        for attempt in 0..6 {
             self.event_queue.dispatch_pending(&mut self.state)?;
-            if self.state.edit_drag.is_some() || self.long_status() != LongSessionStatus::Running {
+            if self.state.edit_drag.is_some() {
+                crate::trace_log!("prepare: skip edit_drag active");
                 return Ok(None);
             }
-            let Some(rect) = self.state.drag.selected_rect() else { return Ok(None); };
+            if self.long_status() != LongSessionStatus::Running {
+                crate::trace_log!("prepare: skip status={:?}", self.long_status());
+                return Ok(None);
+            }
+            let Some(rect) = self.state.drag.selected_rect() else {
+                crate::trace_log!("prepare: skip no selected_rect");
+                return Ok(None);
+            };
             let viewport = SelectedViewport::from_outputs(rect, &self.state.output_infos())?;
             if viewport.regions.len() != 1 {
+                crate::trace_log!(
+                    "prepare: skip spanning rect={:?} regions={} outputs={:?}",
+                    rect,
+                    viewport.regions.len(),
+                    self.state.output_infos().iter().map(|o| (o.global_name, o.logical)).collect::<Vec<_>>()
+                );
                 return Ok(None);
             }
             let output_name = viewport.regions[0].output_global_name;
             self.state.capture_pending = Some(rect);
             self.state.capture_invalid = false;
-            if render_live_overlays(&mut self.state, Some(output_name)) > 0 {
+            {
+                let target = self.state.overlays.iter().find(|o| o.output_name == output_name);
+                crate::trace_log!(
+                    "prepare: target output={} cache={} buffers={} available={}",
+                    output_name,
+                    target.map_or(false, |o| o.render_cache.is_some()),
+                    target.map_or(0, |o| o.buffers.len()),
+                    target.map_or(0, |o| o.buffers.iter().filter(|b| b.available).count()),
+                );
+            }
+            let rendered = render_live_overlays(&mut self.state, Some(output_name));
+            if rendered > 0 {
                 // flush alone does not order requests on different connections.
                 // Events dispatched here may edit the box; invalidation is
                 // sticky until completion, even if it moves back again.
                 self.event_queue.roundtrip(&mut self.state)?;
+                crate::trace_log!("prepare: ack capture output={} rect={:?}", output_name, rect);
                 return Ok(Some(rect));
             }
             self.state.capture_pending = None;
             // All buffers busy; wait for a wl_buffer.release and retry.
+            crate::trace_log!("prepare: no buffer rendered={} attempt={}", rendered, attempt);
             self.dispatch_poll(4)?;
         }
+        crate::trace_log!("prepare: giving up after 6 attempts");
         Ok(None)
     }
 
@@ -912,7 +1025,13 @@ fn render_live_overlays(state: &mut UiState, output_name: Option<u32>) -> usize 
     let border_color = border_color_for_state(state, state.drag.current_rect());
     let rect = ui_render_selection(state);
     let border_rect = ui_render_border_rect(state);
-    let mut committed = 0;
+    let live_seq = state.live_state_seq;
+    // "Satisfied" overlays are either freshly committed or already display
+    // exactly the requested state. Returning satisfied (not merely committed)
+    // lets steady-state prepare calls ack without touching the compositor —
+    // the commit-on-change contract that keeps capture throughput independent
+    // of compositor buffer-release timing.
+    let mut satisfied = 0;
     for i in 0..state.overlays.len() {
         let overlay = &mut state.overlays[i];
         if output_name.is_some_and(|name| overlay.output_name != name) {
@@ -934,6 +1053,14 @@ fn render_live_overlays(state: &mut UiState, output_name: Option<u32>) -> usize 
         // our surfaces use buffer scale 1 even on a scaled output.
         let selection_local = rect.and_then(|r| selected_buffer_rect(output.info, r, overlay.width, overlay.height));
         let border_local = border_rect.and_then(|r| selected_buffer_rect(output.info, r, overlay.width, overlay.height));
+        if buffer.initialized
+            && buffer.last_selected == selection_local
+            && buffer.live_seq == live_seq
+        {
+            // This buffer already displays exactly the requested state.
+            satisfied += 1;
+            continue;
+        }
 
         let cache_key = (overlay.width, overlay.height, selection_local);
         let rebuild = overlay.base_key != Some(cache_key)
@@ -952,10 +1079,14 @@ fn render_live_overlays(state: &mut UiState, output_name: Option<u32>) -> usize 
         overlay.surface.attach(Some(&buffer.buffer), 0, 0);
         overlay.surface.damage_buffer(0, 0, overlay.width, overlay.height);
         overlay.surface.commit();
+        crate::trace_log!("render: committed canvas output={} (buffer freed the previous one on niri side)", overlay.output_name);
         buffer.available = false;
-        committed += 1;
+        buffer.initialized = true;
+        buffer.last_selected = selection_local;
+        buffer.live_seq = live_seq;
+        satisfied += 1;
     }
-    committed
+    satisfied
 }
 
 fn draw_selection_border(data: &mut [u8], _width: i32, _height: i32, x: i32, y: i32, w: i32, h: i32, thickness: i32, border: [u8; 4]) {
@@ -1677,7 +1808,7 @@ fn create_overlay_buffer(
     }
     let pool = shm.create_pool(fd.as_fd(), size as i32, qh, ());
     let buffer = pool.create_buffer(0, width, height, stride, Format::Argb8888, qh, id);
-    Ok(OverlayBuffer { size, data: data.cast(), _fd: fd, pool, buffer, available: true, initialized: false, last_selected: None })
+    Ok(OverlayBuffer { size, data: data.cast(), _fd: fd, pool, buffer, available: true, initialized: false, last_selected: None, live_seq: 0 })
 }
 
 impl Dispatch<WlRegistry, ()> for UiState {
@@ -1885,6 +2016,7 @@ impl Dispatch<ZwlrLayerSurfaceV1, u32> for UiState {
     ) {
         if let zwlr_layer_surface_v1::Event::Configure { serial, width, height } = event {
             layer_surface.ack_configure(serial);
+            crate::trace_log!("configure: output={} size={}x{}", name, width, height);
             let Some(shm) = state.shm.clone() else {
                 state.drag = DragState::Cancelled;
                 return;
@@ -1909,8 +2041,14 @@ impl Dispatch<ZwlrLayerSurfaceV1, u32> for UiState {
                 overlay.render_cache = Some(build_overlay_render_cache(configured_width, configured_height, output.info, frozen, state.border_width));
             }
             match create_overlay_buffers(&shm, *name, overlay.width, overlay.height, qh) {
-                Ok(buffers) => overlay.buffers = buffers,
-                Err(_) => state.drag = DragState::Cancelled,
+                Ok(buffers) => {
+                    crate::trace_log!("configure: buffers created output={} count={}", name, buffers.len());
+                    overlay.buffers = buffers;
+                }
+                Err(err) => {
+                    crate::trace_log!("configure: buffers FAILED output={} err={}", name, err);
+                    state.drag = DragState::Cancelled;
+                }
             }
             render_overlays(state);
         }
@@ -1919,6 +2057,7 @@ impl Dispatch<ZwlrLayerSurfaceV1, u32> for UiState {
 
 impl Dispatch<WlBuffer, BufferId> for UiState {
     fn event(state: &mut Self, _: &WlBuffer, _: wayland_client::protocol::wl_buffer::Event, id: &BufferId, _: &Connection, _: &QueueHandle<Self>) {
+        crate::trace_log!("wl_buffer: release received output={} index={}", id.output_name, id.index);
         if let Some(buffer) = state
             .overlays
             .iter_mut()
@@ -2506,6 +2645,7 @@ mod tests {
             capture_invalid: false,
             selection_anchor: None,
             border_width: crate::config::DEFAULT_BORDER_WIDTH,
+            live_state_seq: 1,
         }
     }
 

@@ -225,6 +225,7 @@ impl LongCaptureWorker {
                     match ack_rx.recv_timeout(Duration::from_millis(10)) {
                         Ok(PrepareAck::Capture(region)) => break 'ack region,
                         Ok(PrepareAck::Skip) => {
+                            crate::trace_log!("worker: prepare skipped, retrying");
                             std::thread::sleep(Duration::from_millis(8));
                             continue 'outer;
                         }
@@ -234,11 +235,15 @@ impl LongCaptureWorker {
                 };
                 match session.capture_region_frame_without_cursor(region, true, &thread_stop) {
                     Ok(Some(image)) => {
+                        crate::trace_log!("worker: frame captured index={} {}x{}", index, image.width, image.height);
                         if sender.send(CaptureMessage::Frame { image, region }).is_err() {
                             return;
                         }
                     }
-                    Ok(None) => break,
+                    Ok(None) => {
+                        crate::trace_log!("worker: capture cancelled (None) at index={}", index);
+                        break;
+                    }
                     Err(err) => {
                         let _ = sender.send(CaptureMessage::Error(err.to_string()));
                         return;
@@ -339,9 +344,11 @@ fn run_long_capture(
             }
             Ok(CaptureMessage::Frame { image, region }) => {
                 if !selection_session.complete_capture() {
+                    crate::trace_log!("ui: frame rejected by complete_capture (sticky invalid)");
                     continue;
                 }
                 if should_skip_duplicate_frame(prev_raw.as_ref().map(|(r, i)| (*r, i)), region, &image) {
+                    crate::trace_log!("ui: frame skipped as duplicate");
                     continue;
                 }
                 prev_raw = Some((region, image));
@@ -366,8 +373,14 @@ fn run_long_capture(
                 };
                 let offset = frame_screen_offset(region, current_frame);
                 let outcome = match stitcher.push_frame_with_offset(&compose, &analysis, direction, offset) {
-                    Ok(o) => o,
-                    Err(_) => continue,
+                    Ok(o) => {
+                        crate::trace_log!("ui: pushed frame offset=({},{}) outcome={:?}", offset.x, offset.y, o);
+                        o
+                    }
+                    Err(err) => {
+                        crate::trace_log!("ui: push_frame_with_offset errored: {}", err);
+                        continue;
+                    }
                 };
                 if matches!(outcome, PushResult::Initialized | PushResult::Accepted { .. }) {
                     if let Some(s) = stitcher.stitched() {

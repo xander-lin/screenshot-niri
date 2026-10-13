@@ -36,7 +36,9 @@
 - Overlay rendering maps through the output's real logical rect and actual overlay buffer dimensions (`selected_buffer_rect`), not `wl_output.scale`: overlay surfaces currently use buffer scale 1. Long screencopy requests use output-local logical coordinates; frozen-image crop rectangles use pixels.
 - Capture exclusion lasts until frame completion, including after edit release. Border visibility is continuous during edits: any pending frame exposed to changed geometry is permanently invalidated and discarded before dedup/stitching, even if the box returns to its old position. PrepareCapture commits on the selected output and synchronizes the UI connection before acknowledging the worker.
 - Live overlays share one renderer: cached dim mask/hole → stitched preview → selection border. The border is drawn last on every redraw and follows the current box, not the exclusion union. Frozen and live paths use the same closed outside-ring pixel rule. Frozen dirty-region damage includes the full configured border width.
-- Memory: overlay buffers are full-resolution RGBA per output (2 each) plus a base-pixels cache; footprint is resolution-driven, not fps-driven. Keep `OVERLAY_BUFFER_COUNT` minimal.
+- Memory: overlay buffers are full-resolution RGBA per output (3 each — compositor in-flight upper bound current+pending, plus one spare; two would deadlock when release turnaround lags) plus a base-pixels cache; footprint is resolution-driven, not fps-driven.
+- Overlay presentation follows the commit-on-change contract: a buffer already showing the current rect and preview seq is never re-committed, so steady-state long capture issues zero commits and capture throughput never depends on compositor release timing. Never reintroduce unconditional per-frame commits.
+- The frozen→live transition must reach the screen exactly once: if every buffer is still held at that point, the transition recreates the starved output's buffers one-shot (destroying compositor-held wl_buffers is legal).
 
 ## Structure Map
 
@@ -46,6 +48,7 @@
 - `src/stitch.rs` + `src/stitch/` → full multi-stage matcher ported from the original (canvas exact placement, perceptual bands, fuzzy hash, fast-motion scan, fixed bands, previous-frame fallback).
 - `src/wayland/screencopy.rs` → wlr screencopy v3 client; one-shot frozen captures and persistent `CaptureSession` for long mode.
 - `src/wayland/selection.rs` → layer-shell overlay: frozen/dimmed selection UI, drag redraw, long-mode preview and status, pointer passthrough for capture.
+- `docs/hyprland-findings.md` → Hyprland 兼容性问题调研（三个问题的触发条件、上游源码证据、版本时间线、可做的规避、待实测清单）。
 - `src/geometry.rs`, `src/image.rs`, `src/cli.rs`, `src/clipboard.rs` → see Module Contracts below.
 
 ## Module Contracts
