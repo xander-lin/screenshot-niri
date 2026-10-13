@@ -102,13 +102,13 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
 - **Correction**: Re-read the release source option table line by line; re-scoped that problem to "requires the user to have enabled a hide-related option", and documented the corrected attribution.
 - **Prevention**: Any assertion about an external dependency's behavior (default values, version, exact semantics) MUST cite a source file + line, or an official record. Mark unverified claims explicitly as unverified and never use them as a premise for reasoning or fixes.
 
-### 13. 长截图死锁：prepare 弃帧 + 事件流期间的 flush/read 饥饿（客户端缺陷，已修复）
+### 13. 长截图死锁：全输出捆绑的渲染欠账在多输出下结构性无法清账（客户端缺陷，已修复）
 
-- **Context**: 双输出机器上 `--long` 每次报 "long capture produced no frames"；同源码单输出机器正常、v0.1.0 双输出正常。多轮 trace 日志 + 独立压力客户端（`/tmp/opencode/wl-stress`）逐步排查。
-- **已证事实**: ① Smithay 在 commit 处理时即时发送 `wl_buffer.release`（`InnerBuffer::drop`），niri 无辜；② 压力客户端实测：2 画布 + 60fps 无条件提交 + 双输出各一 surface（728 提交/727 归还）完全不饿——"提交节奏/缓冲余量不足"的理论被推翻，60fps 也不可能卡死；③ 被选中输出的拖拽结束瞬间，全部画布处于"已提交、release 在途"的瞬态（三次运行 long-start 均为 available=0，仅选中输出），属正常现象。
-- **Root cause**: 旧 prepare 在"此刻无空闲画布、干净渲染无法提交"时**直接弃帧**（ack Skip），而恢复依赖下一个 dispatch 周期读到 release；`dispatch_poll` 的早退路径（`dispatch_pending>0` 即返回，不 flush 不读 socket）在事件流期间会推迟 release 的读取，叠加弃帧设计后，整个滚动期间恢复机制拿不到执行机会，用户滚完立即按 Enter，会话在恢复发生前就结束了——表现为"永久卡死"。
-- **Correction**: commit-on-change（buffer 已显示当前 rect+preview seq 则 prepare 直接 ack，不再要求"必须先提交成功"）使采集与 release 时序彻底解耦；缓冲恢复 3 块；删除了最初误加的"饥饿重建画布"兜底（被实测证明不必要——release 本来就会来）；`flush()` EAGAIN 不再致命。
-- **Prevention**: Wayland 渲染提交必须与内容变化挂钩；弃帧/重试逻辑必须保证恢复路径在每个循环都真正执行（flush + read），不得因事件流早退而跳过；排查时用最小压力客户端建立"健康基线"，再逐步逼近应用的完整模式做差分。
+- **Context**: 双输出机器上 `--long` 每次报 "long capture produced no frames"，且滚完干等几分钟也永不恢复；同源码单输出机器正常、v0.1.0 双输出正常。排查手段：多轮 trace 日志（prepare 门槛、commit/release 两端对账、pending_render 状态）+ 独立压力客户端（`/tmp/opencode/wl-stress`）建立健康基线做差分。
+- **已证事实**: ① Smithay 在 commit 处理时即时发送 `wl_buffer.release`（`InnerBuffer::drop`），niri 无辜；② 压力客户端：2 画布 + 60fps 无条件提交 + 相同内容 + 双输出各一 surface（728 提交/727 归还）完全不饿——提交节奏、缓冲数量、内容去重、输出数量均非独立诱因；③ 被选中输出的拖拽结束瞬间存在"全部画布已提交、release 在途"的正常瞬态（每次运行 long-start 均为选中输出 available=0）；④ 卡死期间 release 仍在持续到达（单次会话 15046 次），但可用画布恒为 0——深度日志抓到乒乓闭环：`pending_render=Some(false)` 永久滞留，每次 release 触发 `flush_pending_render` 立即重提交刚释放的画布（内容与屏幕相同的无效提交），`committed=1/2 -> pending=Some` 无限重复。
+- **Root cause**: 渲染欠账的清账条件写死为"单次 flush 内提交全部 overlay"（`committed >= overlays.len()`），而欠账的触发只需一次部分提交（拖拽期间另一输出的画布恰在 niri 手里，双输出下常态）。两者复合：`Some` 一旦记上，清账在乒乓下结构性不可满足 → prepare 永远抢不到画布 → 永久死锁（干等也不恢复，用户观察正确）。单输出机器 `len=1`，任何成功渲染都满足清账 → 缺陷结构性不可见。8176f0e 砍缓冲 3→2 只是加重了瞬态频率，不是根因；此前"提交节奏/缓冲余量/niri 不归还"三个归因均被实验逐一推翻。
+- **Correction**: ① commit-on-change：buffer 已显示当前 rect+preview seq 则跳过提交、计入"已满足"，prepare 直接 ack——采集与提交/release 彻底解耦；② 渲染范围限定（`UiState::render_scope`）：长截图转换起渲染与欠账只统计选中输出的 overlay，"长截图=单屏"成为结构事实而非补丁，乒乓断粮；③ 缓冲恢复 3 块（吸收提交突发）；移除误加的"饥饿重建画布"兜底（实测不必要）；`flush()` EAGAIN 不再致命。
+- **Prevention**: 记账单位必须与资源所有权一致——画布按输出独立周转，欠账就不得捆绑全部输出做 all-or-nothing 清账；"部分提交"产生的债务必须有可达成的清账条件；用最小压力客户端建立健康基线，再逐项逼近应用模式做差分定位；release 接收与 commit 发送两端同时打点对账，不要单边推断。
 
 ---
 

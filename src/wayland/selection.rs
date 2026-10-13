@@ -248,6 +248,12 @@ struct UiState {
     /// from v0.1.0: steady-state capture frames issue zero overlay commits,
     /// so capture throughput never depends on compositor release timing.
     live_state_seq: u64,
+    /// Long-capture render scope: when set, overlay rendering and the
+    /// pending-render debt count only this output's overlay. Long capture
+    /// captures a single output; the other outputs' overlays are static
+    /// frozen images whose canvases turn over independently and must not
+    /// gate the selected output's rendering.
+    render_scope: Option<u32>,
 }
 
 impl UiState {
@@ -303,6 +309,7 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
         selection_anchor: None,
         border_width: crate::config::DEFAULT_BORDER_WIDTH,
         live_state_seq: 1,
+        render_scope: None,
     };
 
     conn.display().get_registry(&qh, ());
@@ -639,6 +646,7 @@ impl SelectionSession {
             selection_anchor: None,
             border_width: border_width.clamp(crate::config::BORDER_WIDTH_MIN, crate::config::BORDER_WIDTH_MAX),
             live_state_seq: 1,
+        render_scope: None,
         };
 
         conn.display().get_registry(&qh, ());
@@ -721,6 +729,9 @@ impl SelectionSession {
         self.state.edit_union = None;
         self.state.capture_pending = None;
         self.state.capture_invalid = false;
+        // Long capture is single-screen: from here on, rendering and the
+        // pending-render debt are scoped to the selected output only.
+        self.state.render_scope = Some(viewport.regions[0].output_global_name);
         // After L promotion, future layer configure events must not rebuild
         // a frozen render cache over the live capture hole.
         self.state.frozen_outputs.clear();
@@ -730,10 +741,12 @@ impl SelectionSession {
             overlay.base_pixels = None;
             overlay.base_key = None;
         }
-        // Retry until at least one overlay is rendered (buffer available)
+        // Retry until at least one overlay is rendered (buffer available).
+        // Scoped to the selected output: long capture is single-screen.
+        let scope = self.state.render_scope;
         for _ in 0..50 {
             self.event_queue.dispatch_pending(&mut self.state)?;
-            if render_overlays_full_dim(&mut self.state) > 0 {
+            if render_live_overlays(&mut self.state, scope) > 0 {
                 break;
             }
             self.dispatch_poll(10)?;
@@ -1323,22 +1336,53 @@ fn toggle_frozen_frame(state: &mut UiState) {
 }
 
 fn queue_render(state: &mut UiState, full: bool) {
-    let committed = if full {
-        render_overlays_full_dim(state)
-    } else {
-        render_overlays(state)
+    // Long capture is single-screen: scope the render (and the pending debt)
+    // to the selected output. The other outputs' overlays are static frozen
+    // images; counting them here would make the debt clearable only when
+    // every output's canvas turns over in one pass, which per-output release
+    // timing never guarantees.
+    let (committed, expected) = match state.render_scope {
+        Some(name) => (
+            render_live_overlays(state, Some(name)),
+            state.overlays.iter().filter(|o| o.output_name == name).count(),
+        ),
+        None => {
+            let committed = if full {
+                render_overlays_full_dim(state)
+            } else {
+                render_overlays(state)
+            };
+            (committed, state.overlays.len())
+        }
     };
-    state.pending_render = if committed < state.overlays.len() { Some(full) } else { None };
+    state.pending_render = if committed < expected { Some(full) } else { None };
 }
 
 fn flush_pending_render(state: &mut UiState) {
     let Some(full) = state.pending_render else { return; };
-    let committed = if full {
-        render_overlays_full_dim(state)
-    } else {
-        render_overlays(state)
+    let (committed, expected) = match state.render_scope {
+        Some(name) => (
+            render_live_overlays(state, Some(name)),
+            state.overlays.iter().filter(|o| o.output_name == name).count(),
+        ),
+        None => {
+            let committed = if full {
+                render_overlays_full_dim(state)
+            } else {
+                render_overlays(state)
+            };
+            (committed, state.overlays.len())
+        }
     };
-    if committed >= state.overlays.len() {
+    crate::trace_log!(
+        "flush_pending: full={} committed={}/{} (scope={:?}) -> pending={}",
+        full,
+        committed,
+        expected,
+        state.render_scope,
+        if committed >= expected { "None" } else { "Some" }
+    );
+    if committed >= expected {
         state.pending_render = None;
     }
 }
@@ -2596,6 +2640,7 @@ mod tests {
             selection_anchor: None,
             border_width: crate::config::DEFAULT_BORDER_WIDTH,
             live_state_seq: 1,
+        render_scope: None,
         }
     }
 
