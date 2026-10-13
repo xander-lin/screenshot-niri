@@ -740,56 +740,6 @@ impl SelectionSession {
         }
         set_overlay_keyboard_exclusive(&mut self.state);
         set_overlay_pointer_passthrough(&mut self.state, &qh)?;
-        // The frozen→live transition must reach the screen exactly once. A
-        // compositor that never releases the buffers it holds (observed under
-        // sustained commit pressure on multi-output niri) would starve every
-        // later commit, so recreate starved overlays' buffers once here.
-        // Destroying a wl_buffer the compositor still holds is legal — it
-        // keeps rendering the old storage while we hand it fresh pools.
-        let starved: Vec<u32> = self
-            .state
-            .overlays
-            .iter()
-            .filter(|overlay| overlay.render_cache.is_none())
-            .filter(|overlay| !overlay.buffers.is_empty() && !overlay.buffers.iter().any(|buffer| buffer.available))
-            .map(|overlay| overlay.output_name)
-            .collect();
-        if !starved.is_empty() {
-            if let Some(shm) = self.state.shm.clone() {
-                let qh = self.event_queue.handle();
-                for name in starved {
-                    let Some((width, height)) = self
-                        .state
-                        .overlays
-                        .iter()
-                        .find(|overlay| overlay.output_name == name)
-                        .map(|overlay| (overlay.width, overlay.height))
-                    else {
-                        continue;
-                    };
-                    if width <= 0 || height <= 0 {
-                        continue;
-                    }
-                    match create_overlay_buffers(&shm, name, width, height, &qh) {
-                        Ok(buffers) => {
-                            if let Some(overlay) =
-                                self.state.overlays.iter_mut().find(|overlay| overlay.output_name == name)
-                            {
-                                overlay.buffers = buffers;
-                                crate::trace_log!("transition: recreated starved buffers output={}", name);
-                            }
-                        }
-                        Err(err) => {
-                            // Without fresh buffers this output's live view
-                            // cannot display; capture still works from the
-                            // frozen frame, so log and continue.
-                            crate::trace_log!("transition: buffer recreate failed output={} err={}", name, err);
-                        }
-                    }
-                }
-                let _ = render_overlays_full_dim(&mut self.state);
-            }
-        }
         #[cfg(feature = "trace-logs")]
         for overlay in &self.state.overlays {
             crate::trace_log!(

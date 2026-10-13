@@ -102,13 +102,13 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
 - **Correction**: Re-read the release source option table line by line; re-scoped that problem to "requires the user to have enabled a hide-related option", and documented the corrected attribution.
 - **Prevention**: Any assertion about an external dependency's behavior (default values, version, exact semantics) MUST cite a source file + line, or an official record. Mark unverified claims explicitly as unverified and never use them as a premise for reasoning or fixes.
 
-### 13. 长截图死锁：无条件逐帧提交 + 双缓冲零余量（客户端缺陷，与合成器无关）
+### 13. 长截图死锁：prepare 弃帧 + 事件流期间的 flush/read 饥饿（客户端缺陷，已修复）
 
-- **Context**: 双输出机器上 `--long` 每次都报 "long capture produced no frames"；同一份二进制在单输出机器正常；v0.1.0 在双输出机器正常。trace 日志显示 overlay 缓冲 `available=0` 贯穿整个会话、零 `wl_buffer.release`。
-- **Root cause**: 客户端两处缺陷叠加。① 8176f0e 把 live overlay 提交改成每帧无条件（跟随 30fps 采集），丢掉了 v0.1.0 渲染路径的 damage-skip（无变化不提交）；② 同批把 `OVERLAY_BUFFER_COUNT` 从 3 砍到 2，零余量。合成器常规持有 current+pending 两块，2 块被扣后客户端无画布可提交；而 prepare 的干净渲染门槛使"提交失败→跳帧"→无新提交→合成器无 release→永久无画布，形成自锁。Smithay 源码证实 release 在 commit 处理时即时发送（`InnerBuffer::drop`），合成器无辜。
-- **为什么单屏/旧版能活**: 单输出 release 周转快，2 块在时序上勉强够；v0.1.0 双屏能活是因为 damage-skip 压低了提交频率 + 长截图走全新 surface（起点必有空闲画布）。
-- **Correction**: 恢复 3 缓冲（current+pending+1 spare，是协议 in-flight 上界的下界论证，非经验值）；`render_live_overlays` 恢复 commit-on-change（buffer 已显示当前 rect+preview seq 则跳过提交，稳态零提交）；转换点无空闲画布时一次性重建缓冲兜底；`flush()` 的 EAGAIN 不再致命。
-- **Prevention**: Wayland 客户端渲染路径的提交必须与内容变化挂钩，禁止周期性无条件提交；调整缓冲池必须论证"合成器最大 in-flight 持有数 + 1"；排查此类问题时第一时间给 release 接收和 commit 发送两端加 trace 对账，不要先假设合成器行为。
+- **Context**: 双输出机器上 `--long` 每次报 "long capture produced no frames"；同源码单输出机器正常、v0.1.0 双输出正常。多轮 trace 日志 + 独立压力客户端（`/tmp/opencode/wl-stress`）逐步排查。
+- **已证事实**: ① Smithay 在 commit 处理时即时发送 `wl_buffer.release`（`InnerBuffer::drop`），niri 无辜；② 压力客户端实测：2 画布 + 60fps 无条件提交 + 双输出各一 surface（728 提交/727 归还）完全不饿——"提交节奏/缓冲余量不足"的理论被推翻，60fps 也不可能卡死；③ 被选中输出的拖拽结束瞬间，全部画布处于"已提交、release 在途"的瞬态（三次运行 long-start 均为 available=0，仅选中输出），属正常现象。
+- **Root cause**: 旧 prepare 在"此刻无空闲画布、干净渲染无法提交"时**直接弃帧**（ack Skip），而恢复依赖下一个 dispatch 周期读到 release；`dispatch_poll` 的早退路径（`dispatch_pending>0` 即返回，不 flush 不读 socket）在事件流期间会推迟 release 的读取，叠加弃帧设计后，整个滚动期间恢复机制拿不到执行机会，用户滚完立即按 Enter，会话在恢复发生前就结束了——表现为"永久卡死"。
+- **Correction**: commit-on-change（buffer 已显示当前 rect+preview seq 则 prepare 直接 ack，不再要求"必须先提交成功"）使采集与 release 时序彻底解耦；缓冲恢复 3 块；删除了最初误加的"饥饿重建画布"兜底（被实测证明不必要——release 本来就会来）；`flush()` EAGAIN 不再致命。
+- **Prevention**: Wayland 渲染提交必须与内容变化挂钩；弃帧/重试逻辑必须保证恢复路径在每个循环都真正执行（flush + read），不得因事件流早退而跳过；排查时用最小压力客户端建立"健康基线"，再逐步逼近应用的完整模式做差分。
 
 ---
 
