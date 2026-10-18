@@ -1,0 +1,148 @@
+{
+  "selection": {
+    "x": 2016,
+    "y": 497,
+    "width": 646,
+    "height": 256
+  },
+  "region": {
+    "output": 45,
+    "x": 97,
+    "y": 498,
+    "width": 644,
+    "height": 254
+  },
+  "fps": 30,
+  "outputs": [
+    {
+      "name": 45,
+      "x": 1920,
+      "y": 0,
+      "width": 1920,
+      "height": 1080,
+      "scale": 1
+    }
+  ],
+  "frames": [
+    {
+      "file": "frame-0000.png",
+      "width": 644,
+      "height": 254,
+      "at_ms": 0,
+      "capture_ms": 1,
+      "direction": "vertical",
+      "offset_x": 97,
+      "offset_y": 498
+    },
+    {
+      "file": "frame-0001.png",
+      "width": 644,
+      "height": 254,
+      "at_ms": 33,
+      "capture_ms": 1,
+      "direction": "vertical",
+      "offset_x": 97,
+      "offset_y": 498
+    },
+    {
+      "file": "frame-0002.png",
+      "width": 644,
+      "height": 254,
+      "at_ms": 66,
+      "capture_ms": 1,
+      "direction": "vertical",
+      "offset_x": 97,
+      "offset_y": 498
+    },
+    {
+      "file": "frame-0003.png",
+      "width": 644,
+      "height": 254,
+      "at_ms": 99,
+      "capture_ms": 1,
+      "direction": "vertical",
+      "offset_x": 97,
+      "offset_y": 498
+    },
+    {
+      "file": "frame-0004.png",
+      "width": 644,
+      "height": 254,
+      "at_ms": 132,
+      "capture_ms": 1,
+      "direction": "vertical",
+      "offset_x": 97,
+      "offset_y": 498
+    },
+    {
+      "file": "frame-0005.png",
+      "width": 644,
+      "height": 254,
+      "at_ms": 165,
+      "capture_ms": 1,
+      "direction": "vertical",
+      "offset_x": 97,
+      "offset_y": 498
+    },
+    {
+      "file": "frame-0006.png",
+      "width": 644,
+      "height": 254,
+      "at_ms": 198,
+      "capture_ms": 1,
+      "direction": "vertical",
+      "offset_x": 97,
+      "offset_y": 498
+    },
+    {
+      "file": "frame-0007.png",
+      "width": 644,
+      "height": 254,
+      "at_ms": 231,
+      "capture_ms": 1,
+      "direction": "vertical",
+      "offset_x": 97,
+      "offset_y": 498
+    },
+    {
+      "file": "frame-0008.png",
+      "width": 644,
+      "height": 254,
+      "at_ms": 264,
+      "capture_ms": 1,
+      "direction": "vertical",
+      "offset_x": 97,
+      "offset_y": 498
+    },
+    {
+      "file": "frame-0009.png",
+      "width": 644,
+      "height": 254,
+      "at_ms": 297,
+      "capture_ms": 1,
+      "direction": "vertical",
+      "offset_x": 97,
+      "offset_y": 498
+    },
+    {
+      "file": "frame-0010.png",
+      "width": 644,
+      "height": 254,
+      "at_ms": 330,
+      "capture_ms": 1,
+      "direction": "vertical",
+      "offset_x": 97,
+      "offset_y": 498
+    },
+    {
+      "file": "frame-0011.png",
+      "width": 644,
+      "height": 254,
+      "at_ms": 363,
+      "capture_ms": 1,
+      "direction": "vertical",
+      "offset_x": 97,
+      "offset_y": 498
+    }
+  ]
+}

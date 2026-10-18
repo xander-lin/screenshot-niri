@@ -218,44 +218,60 @@ fn run() -> Result<(), Box<dyn Error>> {
     // onto the canvas it was placed in and measure how well it fits.
     if !placements.is_empty() {
         if let Some(stitched) = stitcher.stitched() {
-            let mut bad: Vec<(usize, i32, f64)> = Vec::new();
-            // Logical rows and pixel rows differ by the canvas origin once the
-            // canvas has prepended rows, so map through it before indexing.
+            let started = std::time::Instant::now();
+            let canvas = CanvasLuma::new(stitched);
             let origin = stitcher.canvas_origin();
-            for &(i, top) in &placements {
-                let image = load_image(&frames[i].path)?;
-                let cost = reprojection_cost(stitched, &image, top - origin);
-                let best = best_reprojection_cost(stitched, &image);
-                if cost > REPROJECTION_MAX_COST && cost > best + REPROJECTION_MARGIN {
-                    bad.push((i, top, cost));
+
+            // Load every accepted frame once and convert it to luminance once;
+            // both checks below reuse the same buffers.
+            let loaded: Vec<(usize, i32, Image, Vec<u8>)> = placements
+                .iter()
+                .map(|&(i, logical)| {
+                    let image = load_image(&frames[i].path)?;
+                    let lum = luminance(&image);
+                    Ok((i, logical - origin, image, lum))
+                })
+                .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+
+            // One search per frame answers both questions: where the stitcher
+            // put it, and where it best fits anywhere.
+            let searched: Vec<(usize, Located)> = loaded
+                .iter()
+                .map(|(i, claimed, image, lum)| {
+                    (*i, locate_in_canvas(&canvas, image, lum, *claimed))
+                })
+                .collect();
+
+            // Check 1: does the frame's pixels match the canvas where the
+            // stitcher put it? Blurred transition frames fit poorly *everywhere*
+            // (their content is smeared), so a placement is only judged against
+            // the frame's own floor — otherwise every blurred frame is a false
+            // accusation.
+            let mut bad: Vec<(usize, i32, f64)> = Vec::new();
+            for (i, located) in &searched {
+                if located.claimed_cost > REPROJECTION_MAX_COST
+                    && located.claimed_cost > located.floor + REPROJECTION_MARGIN
+                {
+                    bad.push((*i, located.claimed, located.claimed_cost));
                 }
             }
-            // A placement is wrong only when its pixels do not match the
-            // canvas there. Blurred transition frames fit poorly everywhere, so
-            // the threshold is compared against the frame's own best possible
-            // fit: a frame that is blurry is not thereby misplaced.
             misplaced = bad.len() as u32;
-            println!("\nreprojection check: {} accepted frames", placements.len());
+
+            // Check 2: where did each frame *actually* end up? A blurred frame
+            // fits badly everywhere, so its own fit cannot judge it — but its
+            // neighbours can. A frame whose found row sits far from the rows
+            // around it was placed on a repeated-looking patch of canvas.
+            let located: Vec<(usize, i32, f64)> = searched
+                .iter()
+                .map(|(i, l)| (*i, l.row, l.cost))
+                .collect();
+            let jumps = find_isolation(&located);
+
+            println!("\nreprojection check: {} accepted frames ({:?})", placements.len(), started.elapsed());
             println!("  placements whose pixels do not fit the canvas: {}", bad.len());
             for (i, top, cost) in bad.iter().take(20) {
                 println!("    frame {i} at logical row {top}: mean |diff| = {cost:.2}");
             }
-
-            // Where each accepted frame *actually* ended up in the canvas,
-            // found by search rather than by asking the stitcher. A blurred
-            // frame fits badly everywhere, so its own fit cannot judge it — but
-            // its neighbours can. A frame whose found row sits far from the
-            // rows around it was placed on a repeated-looking patch of canvas,
-            // which is the silent misplacement the gates are meant to prevent.
-            let origin = stitcher.canvas_origin();
-            let mut located: Vec<(usize, i32, f64)> = Vec::new();
-            for &(i, logical) in &placements {
-                let image = load_image(&frames[i].path)?;
-                let claimed = logical - origin;
-                let (row, cost) = locate_in_canvas(stitched, &image, claimed);
-                located.push((i, row, cost));
-            }
-            let jumps = find_isolation(&located);
             println!("  placements far from their neighbours: {}", jumps.len());
             for (i, row, claimed, gap) in jumps.iter().take(20) {
                 println!(
@@ -298,6 +314,38 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Number of worker threads used by the exhaustive searches.
+///
+/// These are the only two places in this tool that do real work per candidate
+/// row, and both are embarrassingly parallel: every candidate is scored
+/// independently and the results are combined at the end. The searches are
+/// deterministic regardless of the thread count, so the output does not depend
+/// on how many cores happen to be available.
+fn worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 32)
+}
+
+/// Splits `lo..=hi` into one contiguous range per worker.
+fn split_range(lo: i32, hi: i32, parts: usize) -> Vec<(i32, i32)> {
+    if hi < lo {
+        return Vec::new();
+    }
+    let total = (hi - lo + 1) as usize;
+    let parts = parts.min(total).max(1);
+    let chunk = total.div_ceil(parts);
+    let mut out = Vec::new();
+    let mut start = lo;
+    while start <= hi {
+        let end = (start + chunk as i32 - 1).min(hi);
+        out.push((start, end));
+        start = end + 1;
+    }
+    out
+}
+
 /// What the exhaustive search concluded about one frame pair.
 struct Oracle {
     /// Smallest-magnitude displacement that matches as well as the best one.
@@ -335,44 +383,36 @@ fn oracle_delta(previous: &Image, current: &Image) -> Option<Oracle> {
         return None;
     }
 
-    let mut scored: Vec<(f64, i32)> = Vec::new();
-    for delta in -max_delta..=max_delta {
-        let (cur_start, prev_start, rows) = if delta >= 0 {
-            (0u32, delta as u32, height - delta as u32)
-        } else {
-            ((-delta) as u32, 0u32, height - (-delta) as u32)
-        };
-        if rows < min_overlap {
-            continue;
-        }
-        let mut sum = 0u64;
-        let mut count = 0u64;
-        let mut y = 0u32;
-        while y < rows {
-            let a = ((prev_start + y) * width) as usize;
-            let b = ((cur_start + y) * width) as usize;
-            let mut x = 0u32;
-            while x < width {
-                let pa = prev[a + x as usize];
-                let pb = cur[b + x as usize];
-                sum += u64::from(pa.abs_diff(pb));
-                count += 1;
-                x += ORACLE_STEP;
-            }
-            y += ORACLE_STEP;
-        }
-        if count == 0 {
-            continue;
-        }
-        scored.push((sum as f64 / count as f64, delta));
-    }
+    let parts = split_range(-max_delta, max_delta, worker_count());
+    let mut scored: Vec<(f64, i32)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = parts
+            .iter()
+            .map(|&(lo, hi)| {
+                let prev = &prev;
+                let cur = &cur;
+                scope.spawn(move || {
+                    let mut local: Vec<(f64, i32)> = Vec::new();
+                    for delta in lo..=hi {
+                        if let Some(entry) =
+                            oracle_score(prev, cur, width, height, min_overlap, delta)
+                        {
+                            local.push(entry);
+                        }
+                    }
+                    local
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("oracle worker panicked"))
+            .collect()
+    });
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
     if scored.is_empty() {
         return None;
     }
-
-    let best_cost = scored.iter().map(|(c, _)| *c).fold(f64::INFINITY, f64::min);
-    // Two offsets are the same answer when their costs differ by less than the
-    // sampling noise of the metric itself.
+    let best_cost = scored[0].0;
     let tolerance = best_cost * 0.02 + 0.5;
     let mut tied: Vec<i32> = scored
         .iter()
@@ -380,7 +420,6 @@ fn oracle_delta(previous: &Image, current: &Image) -> Option<Oracle> {
         .map(|(_, d)| *d)
         .collect();
     tied.sort_unstable();
-    // Adjacent offsets are the same peak, not a second answer.
     let mut distinct: Vec<i32> = Vec::new();
     for delta in tied {
         if distinct.last().map_or(true, |last| (delta - last).abs() > ORACLE_ADJACENT) {
@@ -391,11 +430,45 @@ fn oracle_delta(previous: &Image, current: &Image) -> Option<Oracle> {
         .iter()
         .min_by_key(|delta| delta.abs())
         .expect("at least one candidate survived the filter");
-    Some(Oracle {
-        delta: chosen,
-        ambiguous: distinct.len() > 1,
-        cost: best_cost,
-    })
+    return Some(Oracle { delta: chosen, ambiguous: distinct.len() > 1, cost: best_cost });
+
+}
+
+/// Scores one displacement candidate for the oracle.
+fn oracle_score(
+    prev: &[u8],
+    cur: &[u8],
+    width: u32,
+    height: u32,
+    min_overlap: u32,
+    delta: i32,
+) -> Option<(f64, i32)> {
+    let (cur_start, prev_start, rows) = if delta >= 0 {
+        (0u32, delta as u32, height.checked_sub(delta as u32)?)
+    } else {
+        ((-delta) as u32, 0u32, height.checked_sub((-delta) as u32)?)
+    };
+    if rows < min_overlap {
+        return None;
+    }
+    let mut sum = 0u64;
+    let mut count = 0u64;
+    let mut y = 0u32;
+    while y < rows {
+        let a = ((prev_start + y) * width) as usize;
+        let b = ((cur_start + y) * width) as usize;
+        let mut x = 0u32;
+        while x < width {
+            sum += u64::from(prev[a + x as usize].abs_diff(cur[b + x as usize]));
+            count += 1;
+            x += ORACLE_STEP;
+        }
+        y += ORACLE_STEP;
+    }
+    if count == 0 {
+        return None;
+    }
+    Some((sum as f64 / count as f64, delta))
 }
 
 /// One luminance byte per pixel, so the oracle search touches a quarter of the
@@ -502,29 +575,26 @@ fn field(line: &str, name: &str) -> Option<String> {
 /// stitcher put them, the placement is wrong regardless of how the delta was
 /// derived.
 fn reprojection_cost(
-    stitched: &screenshot_rs_rebuild::stitch::StitchedFrame,
+    canvas: &CanvasLuma,
     frame: &Image,
+    frame_lum: &[u8],
     top: i32,
 ) -> f64 {
-    let width = frame.width.min(stitched.width);
-    let frame_lum = luminance(frame);
-    let mut sum = 0f64;
+    let width = frame.width.min(canvas.width);
+    let mut sum = 0u64;
     let mut count = 0u64;
     for row in 0..frame.height {
         let canvas_row = top + row as i32;
-        if canvas_row < 0 || canvas_row >= stitched.height as i32 {
+        if canvas_row < 0 || canvas_row >= canvas.height as i32 {
             continue;
         }
-        let canvas_off = canvas_row as usize * stitched.stride as usize;
+        let canvas_off = canvas_row as usize * canvas.width as usize;
         let frame_off = row as usize * frame.width as usize;
         let mut x = 0u32;
         while x < width {
-            let c = canvas_off + x as usize * 3;
-            let canvas_lum = (u32::from(stitched.data[c]) * 77
-                + u32::from(stitched.data[c + 1]) * 150
-                + u32::from(stitched.data[c + 2]) * 29)
-                >> 8;
-            sum += f64::from(canvas_lum.abs_diff(u32::from(frame_lum[frame_off + x as usize])));
+            sum += u64::from(
+                canvas.data[canvas_off + x as usize].abs_diff(frame_lum[frame_off + x as usize]),
+            );
             count += 1;
             x += 4;
         }
@@ -532,29 +602,103 @@ fn reprojection_cost(
     if count == 0 {
         return 0.0;
     }
-    sum / count as f64
+    sum as f64 / count as f64
+}
+
+/// Canvas luminance, converted once instead of once per candidate row.
+struct CanvasLuma {
+    width: u32,
+    height: u32,
+    data: Vec<u8>,
+}
+
+impl CanvasLuma {
+    fn new(stitched: &screenshot_rs_rebuild::stitch::StitchedFrame) -> Self {
+        let mut data = Vec::with_capacity(stitched.width as usize * stitched.height as usize);
+        for y in 0..stitched.height as usize {
+            let row = y * stitched.stride as usize;
+            for x in 0..stitched.width as usize {
+                let c = row + x * 3;
+                data.push(
+                    ((u32::from(stitched.data[c]) * 77
+                        + u32::from(stitched.data[c + 1]) * 150
+                        + u32::from(stitched.data[c + 2]) * 29)
+                        >> 8) as u8,
+                );
+            }
+        }
+        Self { width: stitched.width, height: stitched.height, data }
+    }
 }
 
 /// Where the frame really sits in the canvas, and how well it fits there.
 ///
 /// Searches the whole canvas rather than trusting the claimed row, so a frame
 /// placed on the wrong copy of repeated content is visible.
-fn locate_in_canvas(
-    stitched: &screenshot_rs_rebuild::stitch::StitchedFrame,
-    frame: &Image,
+/// Result of searching the whole canvas for one frame.
+struct Located {
+    /// Row the stitcher claimed, in canvas pixels.
     claimed: i32,
-) -> (i32, f64) {
-    let claimed_cost = reprojection_cost(stitched, frame, claimed);
-    let mut best = (claimed, claimed_cost);
-    let mut top = 0i32;
-    while top + frame.height as i32 <= stitched.height as i32 {
-        let cost = reprojection_cost(stitched, frame, top);
-        if cost + LOCATE_MARGIN < best.1 {
-            best = (top, cost);
-        }
-        top += 1;
+    /// Fit at that row.
+    claimed_cost: f64,
+    /// Row this frame is taken to sit at: the claimed row, unless another row
+    /// fits clearly better. A blurred frame's argmin wanders by a few hundred
+    /// rows on noise alone, so only a decisive improvement overrides.
+    row: i32,
+    /// Fit at `row`.
+    cost: f64,
+    /// Best fit anywhere, used as the frame's own floor. Blurred frames fit
+    /// poorly everywhere, so this is what distinguishes "blurry" from
+    /// "misplaced".
+    floor: f64,
+}
+
+fn locate_in_canvas(
+    canvas: &CanvasLuma,
+    frame: &Image,
+    frame_lum: &[u8],
+    claimed: i32,
+) -> Located {
+    let claimed_cost = reprojection_cost(canvas, frame, frame_lum, claimed);
+    let last = canvas.height as i32 - frame.height as i32;
+    if last < 0 {
+        return Located {
+            claimed,
+            claimed_cost,
+            row: claimed,
+            cost: claimed_cost,
+            floor: claimed_cost,
+        };
     }
-    best
+    let parts = split_range(0, last, worker_count());
+    let found = std::thread::scope(|scope| {
+        let handles: Vec<_> = parts
+            .iter()
+            .map(|&(lo, hi)| {
+                scope.spawn(move || {
+                    let mut local: Option<(i32, f64)> = None;
+                    for top in lo..=hi {
+                        let cost = reprojection_cost(canvas, frame, frame_lum, top);
+                        if local.map_or(true, |(_, c)| cost < c) {
+                            local = Some((top, cost));
+                        }
+                    }
+                    local
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().expect("locate worker panicked"))
+            .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
+    });
+    let (best_row, best_cost) = found.unwrap_or((claimed, claimed_cost));
+    let (row, cost) = if best_cost + LOCATE_MARGIN < claimed_cost {
+        (best_row, best_cost)
+    } else {
+        (claimed, claimed_cost)
+    };
+    Located { claimed, claimed_cost, row, cost, floor: best_cost }
 }
 
 /// Placements that sit far from the rows their neighbours occupy.
@@ -600,35 +744,11 @@ const ISOLATION_MAX_GAP: i32 = 300;
 /// How much better a different row must fit before it overrides the claimed
 /// one when locating a frame.
 const LOCATE_MARGIN: f64 = 1.0;
-
-/// Best fit this frame achieves anywhere on the canvas.
-///
-/// Blurred frames never fit tightly; comparing a placement against the frame's
-/// own floor keeps the check about *where* it went rather than how sharp it is.
-fn best_reprojection_cost(
-    stitched: &screenshot_rs_rebuild::stitch::StitchedFrame,
-    frame: &Image,
-) -> f64 {
-    let mut best = f64::INFINITY;
-    let step = 2i32;
-    let mut top = 0i32;
-    while top + frame.height as i32 <= stitched.height as i32 {
-        let cost = reprojection_cost(stitched, frame, top);
-        if cost < best {
-            best = cost;
-        }
-        top += step;
-    }
-    best
-}
-
 /// Above this, the frame's pixels do not match the canvas where it was put.
-///
-/// Blurred transition frames (a scroll animation caught mid-flight) fit at
-/// roughly 4-9 everywhere, so the check compares each frame against its own
-/// best achievable fit instead of this constant alone.
 const REPROJECTION_MAX_COST: f64 = 2.0;
-/// A placement is wrong when it is this much worse than the frame's best fit.
+/// A placement is only wrong when it is this much worse than the frame's own
+/// best fit anywhere. Blurred frames never fit tightly; comparing against their
+/// own floor keeps the check about *where* the frame went, not how sharp it is.
 const REPROJECTION_MARGIN: f64 = 2.0;
 
 /// Converts the stitched RGB canvas into the BGRA layout `write_png` expects.

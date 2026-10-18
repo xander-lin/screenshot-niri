@@ -7,3 +7,6 @@
 perf.data*
 *.pkg.tar.*
 *.tar.gz
+
+# Real-frame corpora: 50 MB of PNGs, kept on disk only. See testdata/frames/README.md
+testdata/frames/**/*.png

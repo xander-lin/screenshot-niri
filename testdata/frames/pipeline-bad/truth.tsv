@@ -1,0 +1,11 @@
+# per-frame ground truth from exhaustive pixel search between consecutive frames
+# frame_size=900x600  frames=8  total_displacement=-1910
+# index	delta_px	match_cost	cumulative_px
+0	0	0.0000	0.0
+1	-260	0.0000	-260
+2	-300	0.0000	-560
+3	-280	0.0000	-840
+4	-250	0.0000	-1090
+5	-270	0.0000	-1360
+6	-270	0.0000	-1630
+7	-280	0.0000	-1910
