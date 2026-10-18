@@ -167,6 +167,18 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
 
 ---
 
+- **Mistake**：在 headless Chrome 的 CDP 截图语料上把门限从 `sep 0.80 / bm 0.10` 标定到 `0.45 / 0.28`，并宣称「97 接受 / 0 拒绝」。用户真机实测是「一点都不能工作」。
+- **Root cause**：CDP `Page.captureScreenshot` 拿的是浏览器自渲染结果，**不经过 niri 合成器**，也没有 overlay 干净渲染握手和 `zwlr_screencopy_manager_v1`。它和工具实际消费的帧不是同一种东西，所以在那上面标定出来的门限没有意义——教训 19 说的是「合成语料不能定阈值」，而 CDP 截图**仍然是一种合成语料**，只是更逼真。
+- **Correction**：做了 `capture-frames`（只抓真实帧）和 `replay-frames`（离线回放 + 逐像素真值 + 回投影验证）。真实语料 462 帧暴露两个致命 bug：前插时引擎坐标系被破坏（`pos`/`write`/`delta` 用了像素行而非逻辑行，且 `shift_down` 把逻辑区间也平移了，导致新帧内容根本没写进画布）、拒绝后位移守卫不放宽导致永久停摆。修复后 2 接受/405 no-match → **204 接受/0 no-match/0 像素级错位**。见 `docs/edge-stitch-design.md` §13。
+- **Prevention**：
+  1. **「合成」的判据是「是否经过被测路径」，不是「是否像真的」。** 任何用来定阈值的语料，必须先确认它和产品实际输入同源（同一 API、同一合成器、同一握手）。做不到就用产品自己的抓取路径去取。
+  2. **给非平凡子系统写「能失败」的回归测试，覆盖每一条几何分支。** 前插 bug 活了很久，因为 `engine.rs` 的测试全部只覆盖「向下增长」的画布，`prepend` 路径一行测试都没有。新增测试必须在修复前失败。
+  3. **验证判据要独立于被测逻辑。** 用「帧像素是否与画布吻合」和「帧在画布中的位置是否与邻居连续」判断错位，而不是用拼接器自己给出的 `delta` 去比对——后者会把「拒绝期间漏掉位移、恢复时一次补齐」误报成错位（这次两帧就是这样被误报的）。
+
+---
+
+---
+
 ## Verification Memory
 
 - **2026-10-13 local install**: HEAD `ca24865` packaged from an isolated directory (`git archive` tarball + local-source PKGBUILD, pkgrel 11) and installed via `pacman -U`; makepkg `check()` passed with 133 lib + 153 bin tests (2 profiling tests ignored, as before). GitHub `origin/niri` still at `a8eb251` — the repo PKGBUILD (git source) would build outdated code until pushed.

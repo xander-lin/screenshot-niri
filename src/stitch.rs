@@ -430,6 +430,16 @@ pub struct RawStitcher {
     engine: Box<dyn PlacementEngine>,
     /// Why the last frame was refused, for the overlay and the trace.
     last_reject_reason: Option<RejectReason>,
+    /// Canvas row of the last accepted placement, in the engine's logical
+    /// coordinates. Diagnostic only: it is what the placement was verified
+    /// against, independent of how the pixel canvas re-based itself.
+    last_engine_top: Option<i32>,
+    /// Logical row that pixel-canvas row 0 currently corresponds to.
+    ///
+    /// The pixel canvas grows upward by prepending rows, so a frame's logical
+    /// row and its pixel row differ by this origin. Diagnostics need it to map
+    /// one onto the other; without it every prepended frame looks misplaced.
+    canvas_origin: i32,
     /// Consecutive refusals, reset by any accepted frame.
     ///
     /// Drives the difference between `Pending` (a single unplaceable frame,
@@ -459,6 +469,8 @@ impl RawStitcher {
             last_screen_offset: None,
             engine: new_placement_engine(),
             last_reject_reason: None,
+            last_engine_top: None,
+            canvas_origin: 0,
             consecutive_refusals: 0,
         }
     }
@@ -786,6 +798,8 @@ impl RawStitcher {
                 None,
                 recovery.match_info.direction,
             );
+            self.last_engine_top = Some(candidate_rect.y);
+            self.canvas_origin = candidate_rect.y - new_rect.y;
             self.engine
                 .commit(new_rect, candidate_rect.y, &active_compose_frame);
             return Ok(PushResult::Accepted {
@@ -808,6 +822,8 @@ impl RawStitcher {
                 None,
                 match_info.direction,
             );
+            self.last_engine_top = Some(candidate_rect.y);
+            self.canvas_origin = candidate_rect.y - applied.y;
             self.engine
                 .commit(applied, candidate_rect.y, &active_compose_frame);
             return Ok(PushResult::Accepted { match_info });
@@ -835,6 +851,8 @@ impl RawStitcher {
                 None,
                 recovery.match_info.direction,
             );
+            self.last_engine_top = Some(candidate_rect.y);
+            self.canvas_origin = candidate_rect.y - new_rect.y;
             self.engine
                 .commit(new_rect, candidate_rect.y, &active_compose_frame);
             return Ok(PushResult::Accepted {
@@ -1259,6 +1277,16 @@ impl RawStitcher {
 
     pub fn finish(self) -> Option<StitchedFrame> {
         self.stitched
+    }
+
+    /// Canvas row of the most recent accepted placement, in logical coordinates.
+    pub fn last_engine_top(&self) -> Option<i32> {
+        self.last_engine_top
+    }
+
+    /// Logical row that pixel-canvas row 0 corresponds to.
+    pub fn canvas_origin(&self) -> i32 {
+        self.canvas_origin
     }
 
     pub fn stitched(&self) -> Option<&StitchedFrame> {

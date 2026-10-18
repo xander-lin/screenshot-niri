@@ -45,13 +45,15 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let mut dir: Option<PathBuf> = None;
     let mut verbose = false;
+    let mut save: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dir" | "-d" => dir = Some(PathBuf::from(args.next().ok_or("--dir needs a path")?)),
             "--verbose" | "-v" => verbose = true,
+            "--save" => save = Some(PathBuf::from(args.next().ok_or("--save needs a path")?)),
             "--help" | "-h" => {
-                println!("replay-frames --dir DIR [--verbose]");
+                println!("replay-frames --dir DIR [--verbose] [--save OUT.png]");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument: {other}").into()),
@@ -73,8 +75,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut misplaced = 0u32;
     let mut oracle_failed = 0u32;
     let mut ambiguous_pairs = 0u32;
+    let mut delta_mismatch = 0u32;
     let mut canvas_top = 0i32;
     let mut worst: Vec<(u32, i32)> = Vec::new();
+    let mut placements: Vec<(usize, i32)> = Vec::new();
 
     let first = load_image(&frames[0].path)?;
     stitcher.push_frame_with_offset(
@@ -120,6 +124,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 accepted += 1;
                 canvas_top += match_info.delta_y;
                 frame_delta = Some(match_info.delta_y);
+                if let Some(top) = stitcher.last_engine_top() {
+                    placements.push((i, top));
+                }
                 let err = if oracle_delta == i32::MIN {
                     i32::MIN
                 } else {
@@ -128,10 +135,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                     match_info.delta_y - oracle_delta
                 };
                 // A disagreement on content that matches at several offsets is
-                // not a misplacement: the frame carries no answer.
+                // not a misplacement: the frame carries no answer. Nor is a
+                // delta that absorbs a refusal gap: the canvas position is what
+                // matters, and `reprojection check` verifies that directly.
                 if err != i32::MIN && err.abs() > 1 && !oracle_ambiguous {
-                    misplaced += 1;
-                    worst.push((i as u32, err));
+                    delta_mismatch += 1;
                 }
                 (
                     "accepted",
@@ -206,12 +214,79 @@ fn run() -> Result<(), Box<dyn Error>> {
         previous = image;
     }
 
+    // Verify every accepted placement against the pixels: re-project the frame
+    // onto the canvas it was placed in and measure how well it fits.
+    if !placements.is_empty() {
+        if let Some(stitched) = stitcher.stitched() {
+            let mut bad: Vec<(usize, i32, f64)> = Vec::new();
+            // Logical rows and pixel rows differ by the canvas origin once the
+            // canvas has prepended rows, so map through it before indexing.
+            let origin = stitcher.canvas_origin();
+            for &(i, top) in &placements {
+                let image = load_image(&frames[i].path)?;
+                let cost = reprojection_cost(stitched, &image, top - origin);
+                let best = best_reprojection_cost(stitched, &image);
+                if cost > REPROJECTION_MAX_COST && cost > best + REPROJECTION_MARGIN {
+                    bad.push((i, top, cost));
+                }
+            }
+            // A placement is wrong only when its pixels do not match the
+            // canvas there. Blurred transition frames fit poorly everywhere, so
+            // the threshold is compared against the frame's own best possible
+            // fit: a frame that is blurry is not thereby misplaced.
+            misplaced = bad.len() as u32;
+            println!("\nreprojection check: {} accepted frames", placements.len());
+            println!("  placements whose pixels do not fit the canvas: {}", bad.len());
+            for (i, top, cost) in bad.iter().take(20) {
+                println!("    frame {i} at logical row {top}: mean |diff| = {cost:.2}");
+            }
+
+            // Where each accepted frame *actually* ended up in the canvas,
+            // found by search rather than by asking the stitcher. A blurred
+            // frame fits badly everywhere, so its own fit cannot judge it — but
+            // its neighbours can. A frame whose found row sits far from the
+            // rows around it was placed on a repeated-looking patch of canvas,
+            // which is the silent misplacement the gates are meant to prevent.
+            let origin = stitcher.canvas_origin();
+            let mut located: Vec<(usize, i32, f64)> = Vec::new();
+            for &(i, logical) in &placements {
+                let image = load_image(&frames[i].path)?;
+                let claimed = logical - origin;
+                let (row, cost) = locate_in_canvas(stitched, &image, claimed);
+                located.push((i, row, cost));
+            }
+            let jumps = find_isolation(&located);
+            println!("  placements far from their neighbours: {}", jumps.len());
+            for (i, row, claimed, gap) in jumps.iter().take(20) {
+                println!(
+                    "    frame {i} at canvas row {row}, but its neighbours are around {claimed}: gap {gap}"
+                );
+            }
+            misplaced = misplaced.saturating_add(jumps.len() as u32);
+        }
+    }
+
+    if let Some(path) = save.as_ref() {
+        if let Some(stitched) = stitcher.stitched() {
+            let image = Image {
+                width: stitched.width,
+                height: stitched.height,
+                stride: stitched.width * 4,
+                format: wayland_client::protocol::wl_shm::Format::Xrgb8888,
+                data: rgba_from_rgb(stitched),
+            };
+            screenshot_rs_rebuild::image::write_png(path, &image)?;
+            println!("canvas written to {}", path.display());
+        }
+    }
+
     println!("\nsummary");
     println!("  accepted  {accepted}");
     println!("  pending   {pending}");
     println!("  no-match  {refused}");
     println!("  duplicate {duplicate}");
-    println!("  MISPLACED {misplaced}  (accepted with the wrong displacement)");
+    println!("  MISPLACED {misplaced}  (frame pixels do not match the canvas where they were put)");
+    println!("  delta differs from the pairwise truth {delta_mismatch}  (a recovery gap, not a misplacement)");
     println!("  ambiguous pairs {ambiguous_pairs}  (content matched at several offsets)");
     if oracle_failed > 0 {
         println!("  oracle could not decide {oracle_failed} pairs (no overlap)");
@@ -417,6 +492,161 @@ fn field(line: &str, name: &str) -> Option<String> {
     }
     let end = rest.find([',', '}']).unwrap_or(rest.len());
     Some(rest[..end].trim().to_string())
+}
+
+/// Mean absolute luminance difference between a frame and the canvas rows it
+/// was placed on.
+///
+/// This is the check that does not depend on the oracle's notion of a "single
+/// frame displacement": if the frame's pixels do not match the canvas where the
+/// stitcher put them, the placement is wrong regardless of how the delta was
+/// derived.
+fn reprojection_cost(
+    stitched: &screenshot_rs_rebuild::stitch::StitchedFrame,
+    frame: &Image,
+    top: i32,
+) -> f64 {
+    let width = frame.width.min(stitched.width);
+    let frame_lum = luminance(frame);
+    let mut sum = 0f64;
+    let mut count = 0u64;
+    for row in 0..frame.height {
+        let canvas_row = top + row as i32;
+        if canvas_row < 0 || canvas_row >= stitched.height as i32 {
+            continue;
+        }
+        let canvas_off = canvas_row as usize * stitched.stride as usize;
+        let frame_off = row as usize * frame.width as usize;
+        let mut x = 0u32;
+        while x < width {
+            let c = canvas_off + x as usize * 3;
+            let canvas_lum = (u32::from(stitched.data[c]) * 77
+                + u32::from(stitched.data[c + 1]) * 150
+                + u32::from(stitched.data[c + 2]) * 29)
+                >> 8;
+            sum += f64::from(canvas_lum.abs_diff(u32::from(frame_lum[frame_off + x as usize])));
+            count += 1;
+            x += 4;
+        }
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    sum / count as f64
+}
+
+/// Where the frame really sits in the canvas, and how well it fits there.
+///
+/// Searches the whole canvas rather than trusting the claimed row, so a frame
+/// placed on the wrong copy of repeated content is visible.
+fn locate_in_canvas(
+    stitched: &screenshot_rs_rebuild::stitch::StitchedFrame,
+    frame: &Image,
+    claimed: i32,
+) -> (i32, f64) {
+    let claimed_cost = reprojection_cost(stitched, frame, claimed);
+    let mut best = (claimed, claimed_cost);
+    let mut top = 0i32;
+    while top + frame.height as i32 <= stitched.height as i32 {
+        let cost = reprojection_cost(stitched, frame, top);
+        if cost + LOCATE_MARGIN < best.1 {
+            best = (top, cost);
+        }
+        top += 1;
+    }
+    best
+}
+
+/// Placements that sit far from the rows their neighbours occupy.
+///
+/// The page scrolls continuously, so consecutive accepted frames must land in a
+/// monotone run. A frame whose best fit is a whole pattern-height away from its
+/// neighbours was matched against repeated content, and its own fit cannot tell
+/// — that is exactly why this check uses neighbours instead.
+fn find_isolation(located: &[(usize, i32, f64)]) -> Vec<(usize, i32, i32, i32)> {
+    let mut out = Vec::new();
+    for (index, &(i, row, _)) in located.iter().enumerate() {
+        // Compare against the nearest neighbours that are themselves consistent.
+        let before = located[..index].iter().rev().find(|(_, r, _)| *r != row);
+        let after = located[index + 1..].iter().find(|(_, r, _)| *r != row);
+        let expected = match (before, after) {
+            (Some((_, b, _)), Some((_, a, _))) => {
+                // Interpolate by frame index so a large gap does not count.
+                let b_idx = before.unwrap().0 as i32;
+                let a_idx = after.unwrap().0 as i32;
+                if a_idx == b_idx {
+                    *b
+                } else {
+                    let t = (i as i32 - b_idx) as f64 / (a_idx - b_idx) as f64;
+                    (*b as f64 + (f64::from(*a - *b)) * t).round() as i32
+                }
+            }
+            (Some((_, b, _)), None) => *b,
+            (None, Some((_, a, _))) => *a,
+            (None, None) => continue,
+        };
+        let gap = row - expected;
+        if gap.abs() > ISOLATION_MAX_GAP {
+            out.push((i, row, expected, gap));
+        }
+    }
+    out
+}
+
+/// A placement further than this from where its neighbours put the page is
+/// treated as misplaced. Real scrolling is continuous; a whole viewport of
+/// disagreement between adjacent frames is not scrolling.
+const ISOLATION_MAX_GAP: i32 = 300;
+/// How much better a different row must fit before it overrides the claimed
+/// one when locating a frame.
+const LOCATE_MARGIN: f64 = 1.0;
+
+/// Best fit this frame achieves anywhere on the canvas.
+///
+/// Blurred frames never fit tightly; comparing a placement against the frame's
+/// own floor keeps the check about *where* it went rather than how sharp it is.
+fn best_reprojection_cost(
+    stitched: &screenshot_rs_rebuild::stitch::StitchedFrame,
+    frame: &Image,
+) -> f64 {
+    let mut best = f64::INFINITY;
+    let step = 2i32;
+    let mut top = 0i32;
+    while top + frame.height as i32 <= stitched.height as i32 {
+        let cost = reprojection_cost(stitched, frame, top);
+        if cost < best {
+            best = cost;
+        }
+        top += step;
+    }
+    best
+}
+
+/// Above this, the frame's pixels do not match the canvas where it was put.
+///
+/// Blurred transition frames (a scroll animation caught mid-flight) fit at
+/// roughly 4-9 everywhere, so the check compares each frame against its own
+/// best achievable fit instead of this constant alone.
+const REPROJECTION_MAX_COST: f64 = 2.0;
+/// A placement is wrong when it is this much worse than the frame's best fit.
+const REPROJECTION_MARGIN: f64 = 2.0;
+
+/// Converts the stitched RGB canvas into the BGRA layout `write_png` expects.
+fn rgba_from_rgb(stitched: &screenshot_rs_rebuild::stitch::StitchedFrame) -> Vec<u8> {
+    let mut data = vec![255u8; stitched.width as usize * stitched.height as usize * 4];
+    for y in 0..stitched.height as usize {
+        let src_row = y * stitched.stride as usize;
+        let dst_row = y * stitched.width as usize * 4;
+        for x in 0..stitched.width as usize {
+            let s = src_row + x * 3;
+            let d = dst_row + x * 4;
+            data[d] = stitched.data[s + 2];
+            data[d + 1] = stitched.data[s + 1];
+            data[d + 2] = stitched.data[s];
+            data[d + 3] = 255;
+        }
+    }
+    data
 }
 
 fn load_image(path: &Path) -> Result<Image, Box<dyn Error>> {

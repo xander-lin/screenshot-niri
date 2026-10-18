@@ -81,6 +81,12 @@ const EDGE_MAX_DISPLACEMENT_DENOMINATOR: i32 = 10;
 
 /// Anchor-recovery half-width around the last verified position.
 const EDGE_ANCHOR_HALF_WIDTH: i32 = 2800;
+/// How many refusals keep widening the displacement guard, in viewports.
+///
+/// Three viewports covers the gap a scroll animation can open before the next
+/// clean frame arrives, and stays far below the anchor window so a stale
+/// canvas cannot be mistaken for a match far away.
+const EDGE_REFUSAL_WIDEN_STEPS: i32 = 3;
 
 /// A frame reduced to "where does luminance change, per row".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,9 +237,15 @@ impl EdgeCanvas {
         filled[shift..].copy_from_slice(&self.filled);
         self.levels = levels;
         self.filled = filled;
+        // `origin_row` is the logical row of buffer index 0, so prepending
+        // moves it up by `shift`. The *covered logical extent* does not move:
+        // the content stayed where it was, only its buffer indices grew.
+        // Incrementing `filled_lo`/`filled_hi` here as well would claim the
+        // canvas starts `shift` rows lower than it does, and the next `write`
+        // would then land inside rows it wrongly believes are already filled —
+        // `write` skips those, so the new frame's content would never enter the
+        // canvas at all.
         self.origin_row -= shift as i32;
-        self.filled_lo += shift as i32;
-        self.filled_hi += shift as i32;
     }
 
     /// Writes `ladder` with its top at canvas row `top`, preserving rows that
@@ -445,6 +457,16 @@ pub(super) struct WindowedEdgeMatcher {
     frame_rows: u32,
     /// Row the last `Place` asked for, consumed by `commit`.
     pending_top: Option<i32>,
+    /// Consecutive refusals since the last accepted frame.
+    ///
+    /// The displacement guard exists to stop a single bad match from jumping
+    /// the canvas across the page. Once the engine has already refused, that
+    /// guard has nothing left to protect: the canvas is frozen at the last
+    /// verified row while the content keeps scrolling, so every further frame
+    /// is legitimately further away. Without widening, one blurred frame
+    /// (a scroll animation between two wheel steps) freezes the capture
+    /// permanently.
+    refusals_since_accept: u32,
     /// The ladder built by the most recent `place`, reused by `commit`.
     ///
     /// Building it costs about half of the per-frame time, and `place` is
@@ -569,8 +591,17 @@ impl WindowedEdgeMatcher {
 
     fn max_displacement(&self) -> i32 {
         let rows = self.frame_rows as i32;
-        (rows * EDGE_MAX_DISPLACEMENT_NUMERATOR / EDGE_MAX_DISPLACEMENT_DENOMINATOR)
-            .max(EDGE_IMPULSE_MIN_HALF_WIDTH)
+        let base = (rows * EDGE_MAX_DISPLACEMENT_NUMERATOR / EDGE_MAX_DISPLACEMENT_DENOMINATOR)
+            .max(EDGE_IMPULSE_MIN_HALF_WIDTH);
+        // While refusing, the content keeps moving away from the frozen canvas.
+        // Each refusal buys one more viewport of reach, up to the anchor
+        // window, so recovery is possible without ever letting a *first*
+        // match jump the page.
+        let extra = self
+            .refusals_since_accept
+            .min(EDGE_REFUSAL_WIDEN_STEPS as u32) as i32
+            * rows;
+        base.saturating_add(extra)
     }
 
     fn impulse_half_width(&self) -> i32 {
@@ -591,6 +622,7 @@ impl WindowedEdgeMatcher {
         cost: f64,
     ) -> EngineDecision {
         self.pending_ladder = Some(ladder);
+        self.refusals_since_accept = 0;
         let pos = self.pos.unwrap_or(top);
         let delta_y = top - pos;
         let overlap = self.frame_rows.saturating_sub(delta_y.unsigned_abs());
@@ -682,7 +714,10 @@ impl PlacementEngine for WindowedEdgeMatcher {
             }
         }
 
-        // Stage 4: refuse. Nothing moves.
+        // Stage 4: refuse. Nothing moves, but the displacement guard has to
+        // widen: the canvas stays frozen while the content keeps scrolling, so
+        // each refusal leaves the next frame legitimately further away.
+        self.refusals_since_accept = self.refusals_since_accept.saturating_add(1);
         EngineDecision::Reject { reason: RejectReason::Ambiguous }
     }
 
@@ -696,11 +731,11 @@ impl PlacementEngine for WindowedEdgeMatcher {
         };
         let Some(canvas) = self.canvas.as_mut() else {
             let mut canvas = EdgeCanvas::new(ladder.bins, 0);
-            canvas.write(rect.y, &ladder);
+            canvas.write(requested_top, &ladder);
             self.frame_rows = ladder.rows();
             self.canvas = Some(canvas);
-            self.pos = Some(rect.y);
-            self.anchor = Some(rect.y);
+            self.pos = Some(requested_top);
+            self.anchor = Some(requested_top);
             self.pending_top = None;
             return;
         };
@@ -708,18 +743,25 @@ impl PlacementEngine for WindowedEdgeMatcher {
             return;
         }
         // A prepend shifts every stored row down by `rect.y - requested_top`.
+        //
+        // `rect.y` is the frame's row in the *pixel canvas*, which grows
+        // upward; `requested_top` is where the engine decided the frame
+        // belongs in logical canvas coordinates. Everything the engine stores
+        // (`pos`, `anchor`, the ladder) lives in logical coordinates, so the
+        // ladder must be written at `requested_top` and the prepend only
+        // re-bases the buffer.
         let shift = rect.y - requested_top;
         if shift > 0 {
             canvas.shift_down(shift);
         }
 
         let previous = self.pos;
-        canvas.write(rect.y, &ladder);
+        canvas.write(requested_top, &ladder);
         self.frame_rows = ladder.rows();
-        self.pos = Some(rect.y);
-        self.anchor = Some(rect.y);
+        self.pos = Some(requested_top);
+        self.anchor = Some(requested_top);
         if let Some(previous) = previous {
-            let delta = rect.y - previous;
+            let delta = requested_top - previous;
             let last = self.last_delta.unwrap_or(0);
             self.trend = 0.5 * self.trend + 0.5 * f64::from(delta - last);
             self.last_delta = Some(delta);
@@ -842,6 +884,18 @@ mod tests {
         let stride = W * 3;
         let mut data = Vec::with_capacity(stride as usize * height as usize);
         for row in top..top + height {
+            data.extend_from_slice(&row_texture(row));
+        }
+        RgbFrame { width: W, height, stride, data }
+    }
+
+    /// Same page as [`frame_from`], but allowing rows above zero so a frame
+    /// that extends the canvas upward can be built.
+    fn frame_from_signed(top: i32, height: u32) -> RgbFrame {
+        let stride = W * 3;
+        let mut data = Vec::with_capacity(stride as usize * height as usize);
+        for row in top..top + height as i32 {
+            let row = ((row % 4096) + 4096) as u32 % 4096;
             data.extend_from_slice(&row_texture(row));
         }
         RgbFrame { width: W, height, stride, data }
@@ -1035,6 +1089,120 @@ mod tests {
             panic!("expected recovery once content overlaps the canvas again");
         };
         assert_eq!(placed.y, 30);
+    }
+
+    /// The pixel canvas grows upward by prepending rows when a frame extends it
+    /// past row 0, and `commit` receives both the logical row the engine asked
+    /// for (`requested_top`) and the row the pixel canvas ended up using
+    /// (`rect.y`). The engine's own state must stay in logical coordinates:
+    /// storing the re-based pixel row made every later frame compare against
+    /// content shifted by the whole prepend, and the canvas silently stopped
+    /// growing.
+    #[test]
+    fn prepending_rows_keeps_the_engine_in_logical_coordinates() {
+        let mut engine = WindowedEdgeMatcher::new();
+        let height = 60;
+
+        // Canvas starts covering page rows 100..=159 at logical row 0.
+        let first = frame_from_signed(100, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
+
+        // Scroll up by 17: the frame now starts at page row 83, i.e. 17 rows
+        // above the canvas top, so it belongs at logical row -17. The pixel
+        // canvas grows upward, so it prepends 17 rows and this frame lands at
+        // pixel row 0 while the engine asked for -17.
+        let upward = frame_from_signed(83, height);
+        let mut req = request(&upward, ViewportRect { x: 0, y: 0, width: W, height });
+        req.stitched = Box::leak(Box::new(canvas_of(height)));
+        let EngineDecision::Place { match_info, .. } = engine.place(&req) else {
+            panic!("expected the upward frame to be placed");
+        };
+        assert_eq!(match_info.delta_y, -17);
+
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, -17, &upward);
+
+        // The engine must report the logical row it decided on, not the pixel
+        // row the canvas re-based to.
+        assert_eq!(engine.pos, Some(-17));
+
+        // A further upward frame must be found 17 rows above that, at -34.
+        let further = frame_from_signed(66, height);
+        let mut req = request(&further, ViewportRect { x: 0, y: 0, width: W, height });
+        req.stitched = Box::leak(Box::new(canvas_of(height)));
+        let EngineDecision::Place { match_info, .. } = engine.place(&req) else {
+            panic!("expected the second upward frame to be placed");
+        };
+        assert_eq!(match_info.delta_y, -17);
+    }
+
+    /// A frame placed by prepending must actually be readable at the logical
+    /// row it was placed at. Before the fix the write landed inside rows that
+    /// were wrongly marked as already filled, so the new frame never entered
+    /// the canvas and the engine kept comparing against stale content.
+    #[test]
+    fn a_prepended_frame_is_written_into_the_canvas() {
+        let mut engine = WindowedEdgeMatcher::new();
+        let height = 60;
+        let first = frame_from_signed(100, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
+
+        let upward = frame_from_signed(83, height);
+        let mut req = request(&upward, ViewportRect { x: 0, y: 0, width: W, height });
+        req.stitched = Box::leak(Box::new(canvas_of(height)));
+        assert!(matches!(engine.place(&req), EngineDecision::Place { .. }));
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, -17, &upward);
+
+        let canvas = engine.canvas.as_ref().expect("canvas exists");
+        let ladder = EdgeLadder::from_source(&upward).unwrap();
+        let cost = canvas.cost_at(&ladder, -17, 1).expect("evidence at -17");
+        assert!(
+            cost.cost < 0.01,
+            "the prepended frame must be readable at its logical row, got {}",
+            cost.cost
+        );
+        // The rows it did not cover must still hold the older content.
+        let old = EdgeLadder::from_source(&first).unwrap();
+        let cost = canvas.cost_at(&old, 0, 1).expect("evidence at 0");
+        assert!(
+            cost.cost < 0.01,
+            "the original content must survive the prepend, got {}",
+            cost.cost
+        );
+    }
+
+    /// A single blurred frame (a scroll animation caught mid-flight) must not
+    /// freeze the capture permanently. While refusing, the content keeps moving
+    /// away from the frozen canvas, so the displacement guard has to widen —
+    /// otherwise every later frame is refused for being too far away and the
+    /// canvas never grows again.
+    #[test]
+    fn refusals_widen_the_displacement_guard_so_capture_recovers() {
+        let mut engine = WindowedEdgeMatcher::new();
+        let height = 60;
+        let first = frame_from(0, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
+        let base = engine.max_displacement();
+        assert_eq!(engine.refusals_since_accept, 0);
+
+        // A frame that matches nowhere: the engine refuses and counts it.
+        let nowhere = frame_from(900, height);
+        let mut req = request(&nowhere, ViewportRect { x: 0, y: 0, width: W, height });
+        req.stitched = Box::leak(Box::new(canvas_of(height)));
+        assert!(matches!(engine.place(&req), EngineDecision::Reject { .. }));
+        assert_eq!(engine.refusals_since_accept, 1);
+        assert!(
+            engine.max_displacement() > base,
+            "the guard must widen after a refusal, base={base} now={}",
+            engine.max_displacement()
+        );
+
+        // Accepting again restores the strict guard.
+        let back = frame_from(10, height);
+        let mut req = request(&back, ViewportRect { x: 0, y: 0, width: W, height });
+        req.stitched = Box::leak(Box::new(canvas_of(height)));
+        assert!(matches!(engine.place(&req), EngineDecision::Place { .. }));
+        assert_eq!(engine.refusals_since_accept, 0);
+        assert_eq!(engine.max_displacement(), base);
     }
 
     #[test]
