@@ -9,6 +9,9 @@ path = "src/main.rs"
 
 [features]
 trace-logs = []
+# Keeps the previous canvas-scan matcher available for A/B comparison.
+# Removed once the windowed edge matcher is the only implementation.
+stitch-legacy = []
 
 [dependencies]
 libc = "0.2"
