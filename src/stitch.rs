@@ -674,16 +674,14 @@ impl RawStitcher {
                 if let Some(started_at) = append_started_at {
                     self.last_profile_breakdown.append_frame += started_at.elapsed();
                 }
-                self.viewport_rect = Some(new_rect);
-                if let Some(current_perceptual_frame) = placement.current_perceptual_frame {
-                    self.previous_perceptual_frame = Some(current_perceptual_frame);
-                }
-                self.previous_compose_frame = Some(compose_frame);
-                self.last_profile_breakdown.path =
-                    placement_path_for_source(frame_placement.source);
-                self.last_fast_motion_trace = frame_placement.fast_motion_trace;
-                self.accepted_direction
-                    .record(recovery.match_info.direction);
+                self.commit_accepted(
+                    new_rect,
+                    compose_frame,
+                    placement.current_perceptual_frame,
+                    placement_path_for_source(frame_placement.source),
+                    frame_placement.fast_motion_trace,
+                    recovery.match_info.direction,
+                );
                 self.trace_placement_accept(*frame_placement);
                 return Ok(PushResult::Accepted {
                     match_info: recovery.match_info,
@@ -695,14 +693,14 @@ impl RawStitcher {
                 match_info,
                 profile_enabled,
             )? {
-                if let Some(current_perceptual_frame) = placement.current_perceptual_frame {
-                    self.previous_perceptual_frame = Some(current_perceptual_frame);
-                }
-                self.previous_compose_frame = Some(compose_frame);
-                self.last_profile_breakdown.path =
-                    placement_path_for_source(frame_placement.source);
-                self.last_fast_motion_trace = frame_placement.fast_motion_trace;
-                self.accepted_direction.record(match_info.direction);
+                self.commit_accepted(
+                    self.viewport_rect.ok_or("missing viewport rect after apply")?,
+                    compose_frame,
+                    placement.current_perceptual_frame,
+                    placement_path_for_source(frame_placement.source),
+                    frame_placement.fast_motion_trace,
+                    match_info.direction,
+                );
                 self.trace_placement_accept(*frame_placement);
                 return Ok(PushResult::Accepted { match_info });
             }
@@ -728,25 +726,54 @@ impl RawStitcher {
             if let Some(started_at) = append_started_at {
                 self.last_profile_breakdown.append_frame += started_at.elapsed();
             }
-            self.viewport_rect = Some(new_rect);
-            if let Some(current_perceptual_frame) = placement.current_perceptual_frame {
-                self.previous_perceptual_frame = Some(current_perceptual_frame);
-            }
-            self.previous_compose_frame = Some(compose_frame);
-            self.accepted_direction
-                .record(recovery.match_info.direction);
-            self.last_profile_breakdown.path = Some(StitchDecisionPath::CanvasAccepted);
+            self.commit_accepted(
+                new_rect,
+                compose_frame,
+                placement.current_perceptual_frame,
+                Some(StitchDecisionPath::CanvasAccepted),
+                None,
+                recovery.match_info.direction,
+            );
             return Ok(PushResult::Accepted {
                 match_info: recovery.match_info,
             });
         }
 
-        if let Some(current_perceptual_frame) = placement.current_perceptual_frame {
-            self.previous_perceptual_frame = Some(current_perceptual_frame);
-        }
-        self.previous_compose_frame = Some(compose_frame);
+        // Reject: deliberately touches nothing. Not the viewport, not either
+        // reference frame, not the direction memory, not the delta prediction.
+        // The next frame must be measured against the last *verified* position,
+        // otherwise its delta lands on an anchor that never moved.
         self.last_profile_breakdown.path = Some(StitchDecisionPath::NoMatch);
         Ok(PushResult::NoMatch)
+    }
+
+    /// The only place that advances the "where the last accepted frame is"
+    /// state. `viewport_rect`, both reference frames, the direction memory and
+    /// the trace slots move together or not at all.
+    ///
+    /// Every accept path calls this; the reject path calls nothing. That is the
+    /// invariant from `found.md` lesson 14: a frame whose position could not be
+    /// verified must not become the reference for the next frame's delta,
+    /// because that delta would be applied to a `viewport_rect` that never
+    /// moved.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_accepted(
+        &mut self,
+        new_rect: ViewportRect,
+        compose_frame: RgbFrame,
+        perceptual_frame: Option<PerceptualFrame>,
+        path: Option<StitchDecisionPath>,
+        fast_motion_trace: Option<FastMotionTrace>,
+        direction: AppendDirection,
+    ) {
+        self.viewport_rect = Some(new_rect);
+        if let Some(perceptual_frame) = perceptual_frame {
+            self.previous_perceptual_frame = Some(perceptual_frame);
+        }
+        self.previous_compose_frame = Some(compose_frame);
+        self.last_profile_breakdown.path = path;
+        self.last_fast_motion_trace = fast_motion_trace;
+        self.accepted_direction.record(direction);
     }
 
     fn find_nomatch_recovery(
@@ -3983,5 +4010,126 @@ mod tests {
         assert_eq!(image.data[(0 * 7 + 6) * 4 + 3], 0);
         assert_eq!(image.data[(5 * 7 + 0) * 4 + 3], 0);
         assert_eq!(image.data[(5 * 7 + 3) * 4 + 3], 255);
+    }
+
+    // --- P0-1: a rejected frame must not become the next frame's reference ---
+
+    /// Sequence from `docs/dms-stitch-comparison.md` §6.3: small steps, one jump
+    /// that breaks overlap, then small steps again. Before the fix the frames
+    /// after the jump were matched against the *rejected* frame and stitched at
+    /// `previous_rect + 40`, silently dropping 320 page rows.
+    #[test]
+    fn rejected_frame_does_not_advance_the_reference_state() {
+        let width = 64;
+        let height = 200;
+        let mut stitcher = RawStitcher::new();
+        for top in [0u32, 40, 80] {
+            let frame = frame_from_world_rows(width, &(top..top + height).collect::<Vec<_>>());
+            assert!(matches!(
+                stitcher.push_frame(frame, None).unwrap(),
+                PushResult::Initialized | PushResult::Accepted { .. }
+            ));
+        }
+        let before = (
+            stitcher.viewport_rect,
+            stitcher.previous_compose_frame.as_ref().map(|f| f.data.clone()),
+        );
+
+        for top in [400u32, 440, 480] {
+            let frame = frame_from_world_rows(width, &(top..top + height).collect::<Vec<_>>());
+            assert_eq!(
+                stitcher.push_frame(frame, None).unwrap(),
+                PushResult::NoMatch,
+                "frame at page row {top} has no overlap with the canvas and must be refused"
+            );
+        }
+
+        // Nothing about the accepted state may have moved.
+        let after = (
+            stitcher.viewport_rect,
+            stitcher.previous_compose_frame.as_ref().map(|f| f.data.clone()),
+        );
+        assert_eq!(before.0, after.0, "viewport_rect moved on a rejected frame");
+        assert_eq!(before.1, after.1, "compose reference moved on a rejected frame");
+
+        // And the canvas must not have grown with unverified content.
+        let stitched = stitcher.stitched().unwrap();
+        assert_eq!(stitched.height, 280, "canvas grew with a rejected frame");
+        assert_eq!(stitched.current_origin_y, 80);
+
+        // Every canvas row still maps to its true page row.
+        for y in (0..stitched.height).step_by(20) {
+            let want = row_texture(width, y);
+            let offset = (y * stitched.stride) as usize;
+            assert_eq!(
+                &stitched.data[offset..offset + width as usize * 3],
+                &want[..],
+                "canvas row {y} does not match page row {y}"
+            );
+        }
+    }
+
+    /// After a rejection the user scrolls back into the canvas; the stitcher
+    /// must recover instead of staying stuck on the old anchor.
+    #[test]
+    fn recovers_after_scrolling_back_from_a_rejection() {
+        let width = 64;
+        let height = 200;
+        let mut stitcher = RawStitcher::new();
+        for top in [0u32, 40, 80] {
+            let frame = frame_from_world_rows(width, &(top..top + height).collect::<Vec<_>>());
+            stitcher.push_frame(frame, None).unwrap();
+        }
+        for top in [400u32, 440, 480] {
+            let frame = frame_from_world_rows(width, &(top..top + height).collect::<Vec<_>>());
+            assert_eq!(
+                stitcher.push_frame(frame, None).unwrap(),
+                PushResult::NoMatch
+            );
+        }
+
+        // Scroll back so the frame overlaps the committed canvas (80..280).
+        let frame = frame_from_world_rows(width, &(120..120 + height).collect::<Vec<_>>());
+        let PushResult::Accepted { match_info } = stitcher.push_frame(frame, None).unwrap() else {
+            panic!("expected recovery once content overlaps the canvas again");
+        };
+        assert_eq!(match_info.delta_y, 40);
+        let stitched = stitcher.stitched().unwrap();
+        assert_eq!(stitched.current_origin_y, 120);
+        // Canvas extends only by the genuinely new 40 rows at the bottom.
+        assert_eq!(stitched.height, 320);
+        for y in (0..stitched.height).step_by(20) {
+            let want = row_texture(width, y);
+            let offset = (y * stitched.stride) as usize;
+            assert_eq!(
+                &stitched.data[offset..offset + width as usize * 3],
+                &want[..],
+                "canvas row {y} does not match page row {y} after recovery"
+            );
+        }
+    }
+
+    /// A rejection must not disturb the direction memory either: the next
+    /// accepted frame still gets the stale-edge recovery path it depends on.
+    #[test]
+    fn rejection_preserves_accepted_direction_memory() {
+        let width = 64;
+        let height = 200;
+        let mut stitcher = RawStitcher::new();
+        for top in [0u32, 40, 80] {
+            let frame = frame_from_world_rows(width, &(top..top + height).collect::<Vec<_>>());
+            stitcher.push_frame(frame, None).unwrap();
+        }
+        let before = stitcher.accepted_direction;
+        let frame = frame_from_world_rows(width, &(900..900 + height).collect::<Vec<_>>());
+        assert_eq!(
+            stitcher.push_frame(frame, None).unwrap(),
+            PushResult::NoMatch
+        );
+        assert_eq!(stitcher.accepted_direction, before);
+        assert_eq!(
+            stitcher.accepted_direction.vertical_direction(),
+            Some(AppendDirection::Bottom)
+        );
     }
 }
