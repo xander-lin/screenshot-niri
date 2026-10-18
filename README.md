@@ -114,9 +114,11 @@ border_width = 3
    - scrolling vertically first and horizontally afterwards (L-shaped captures, hint with **←** / **→**),
    - extending the bottom edge after scrolling so static content (headers/footers that repeat while scrolling and would break stitching) is captured once, perfectly attached below.
    You can change width repeatedly (wide → narrow → wide). Previously captured pixels are preserved. Rows captured only at the narrower width retain transparent side notches unless you revisit and capture those missing areas; widening fills newly captured strips in the current viewport.
-7. Press **Enter** or **Space** to finish — the tool stitches all frames and saves.
-8. Press **Esc** to cancel.
-9. Long screenshots always use cursor-free capture frames; **H** applies only to normal screenshots. Long capture is capped at 30 fps by default (`--fps` or the config file's `max_fps` to change); frames are damage-driven, so slower machines and static content naturally capture less often.
+7. **Sticky page chrome is not compensated.** A pinned nav bar, frozen table header, or fixed footer inside the box does not scroll with the page, so it cannot be matched consistently. The stitcher does not detect or crop it. Use **E** to shrink the box past these strips before scrolling — a selection that includes them is a selection error, not a stitching failure.
+8. Press **Enter** or **Space** to finish — the tool stitches all frames and saves.
+9. Press **Esc** to cancel.
+10. Long screenshots always use cursor-free capture frames; **H** applies only to normal screenshots. Long capture is capped at 30 fps by default (`--fps` or the config file's `max_fps` to change); frames are damage-driven, so slower machines and static content naturally capture less often.
+11. **If the border turns red, the stitcher refused the current frame.** This happens when content jumped too far to be matched (a fast fling, Page Down, a tab switch): rather than guessing and producing a silently misaligned image, it keeps the last verified position and tells you. Scroll back until the red content overlaps what you already captured and the border returns to white by itself — nothing is lost. While the border is red, capture drops to 5 fps to save CPU; it returns to full rate immediately after a successful placement.
 
 > **Tip**: Scroll slowly for best results. The stitcher tracks frame overlap automatically; direction hints improve accuracy with fast or jumpy scrolling.
 

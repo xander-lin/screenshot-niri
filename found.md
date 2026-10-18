@@ -10,8 +10,8 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
 
 `screenshot-rs-rebuild` is a Wayland screenshot tool (binary `screenshot`), originally developed against niri's wlroots protocols. Normal region capture and long/scroll capture are implemented end-to-end.
 
-- **No compositor gate**: the launcher no longer checks `NIRI_SOCKET` or `XDG_CURRENT_DESKTOP`. It attempts the Wayland protocols and leaves compositor compatibility to user testing. Out of scope: X11, focus-grab extensions, diagnostics bins.
-- **Modules**: `cli` parses args and resolves output paths. `app` orchestrates capture → selection → composite → write → clipboard (no preflight). `wayland::screencopy` freezes outputs and drives the persistent long-capture session. `wayland::selection` renders the layer-shell overlay and collects geometry. `geometry` maps logical selections to per-output regions. `image` composites and writes PNG. `stitch` is the multi-stage matcher (canvas placement, perceptual bands, fuzzy hash, fast-motion scan, fixed bands, previous-frame fallback), driven by `app` from the long-capture worker. `clipboard` serves `image/png` or file URI via `wlr-data-control`.
+- **No compositor gate**: the launcher no longer checks `NIRI_SOCKET` or `XDG_CURRENT_DESKTOP`. It attempts the Wayland protocols and leaves compositor compatibility to user testing. Out of scope: X11, focus-grab extensions, diagnostics bins, sticky-header/footer compensation (a selection containing them is a user error; `E` mode is the sanctioned way to exclude them).
+- **Modules**: `cli` parses args and resolves output paths. `app` orchestrates capture → selection → composite → write → clipboard (no preflight). `wayland::screencopy` freezes outputs and drives the persistent long-capture session. `wayland::selection` renders the layer-shell overlay and collects geometry. `geometry` maps logical selections to per-output regions. `image` composites and writes PNG. `stitch` is the multi-stage matcher (canvas placement, perceptual bands, fuzzy hash, fast-motion scan, fixed bands diagnostics, previous-frame fallback), driven by `app` from the long-capture worker. `clipboard` serves `image/png` or file URI via `wlr-data-control`.
 - **Config** (`~/.config/screenshot/config`): `max_fps` (long-capture cap, default 30, range 1–240) and `border_width` (1–16). The cap is a ceiling over damage-driven pull capture.
 - **Long capture**: `--long` selects one output, captures continuously, and stitches on Enter/Space. `E` toggles edit mode (per-edge resize, interior move) which blocks wheel scroll; region-changed frames are placed at the deterministic offset-implied position, growing ragged T/L canvases whose uncovered extents stay transparent. Capture pauses during edge drags.
 - **Memory model**: per output, 2 full-resolution RGBA overlay buffers plus a base/dim cache; footprint is resolution-driven, not fps-driven. Per-frame capture SHM is munmapped on drop.
@@ -110,13 +110,75 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
 - **Correction**: ① commit-on-change：buffer 已显示当前 rect+preview seq 则跳过提交、计入"已满足"，prepare 直接 ack——采集与提交/release 彻底解耦；② 渲染范围限定（`UiState::render_scope`）：长截图转换起渲染与欠账只统计选中输出的 overlay，"长截图=单屏"成为结构事实而非补丁，乒乓断粮；③ 缓冲恢复 3 块（吸收提交突发）；移除误加的"饥饿重建画布"兜底（实测不必要）；`flush()` EAGAIN 不再致命。
 - **Prevention**: 记账单位必须与资源所有权一致——画布按输出独立周转，欠账就不得捆绑全部输出做 all-or-nothing 清账；"部分提交"产生的债务必须有可达成的清账条件；用最小压力客户端建立健康基线，再逐项逼近应用模式做差分定位；release 接收与 commit 发送两端同时打点对账，不要单边推断。
 
+### 14. 拼接器与 DMS 对比：NoMatch 推进参考帧造成静默错位
+
+- **Context**：按用户要求对比 DMS（DankMaterialShell v1.6.3）`dms screenshot scroll` 的拼接器。用同一份 1920×1080 像素语料分别驱动 DMS 原始 `stitch.go`（Go 复现，`/tmp/opencode/dms-sim`）与本实现，得到性能与鲁棒性数据；完整报告见 `docs/dms-stitch-comparison.md`。
+- **已证事实**：① 1080p 同语料顺序采集（画布长到 12360 行）：DMS 平均 1.10 ms/帧，本实现 87.0 ms/帧；回访批 DMS 1.36 ms，本实现 1777 ms（最差 4215 ms）；本实现单帧 NoMatch 在 12k 行画布上 1.0–1.5 s。perf 归因为逐行 RGB 比较（`rgb_row_average_difference` + `CanvasScoreCache::score`）。② 200 行帧序列 `0,40,80,400,440,480`：400 帧 NoMatch 后，440 帧的 `delta_y=40` 被叠加到**未推进的** `viewport_rect`（仍对应页面 80）上，画布只增 80 行，行映射从页面 280 直接跳到 600——静默丢 320 行。③ 顶部粘性 chrome 扫描：≤10% 正常，12% 起退化，13.9% 起本实现 0/9 卡死，DMS 到 18.5% 仍 9/9；底部 chrome 结论相反（本实现 ≤8% 正确，DMS 4% 起就开始失败）。④ `FixedBandDetector` 只产出 trace，检测到的 `stable` 从未写回 `active_crop`（`src/stitch.rs:645-654`），运行时的"固定页眉页脚检测"名存实亡。⑤ 本实现画布无字节/行上限（DMS 为 256 MiB / 30000 行），1920×12360 画布 RGB 71.2 MiB；预览转换实测 1024×12000 为 36.9→49.2 MiB、13.8 ms/帧，按同公式 1920×12360 约 71→95 MiB、26–28 ms/帧（**[推断]**，未在 1080p 上直接计时）。
+- **Root cause**：`push_frame_sources` 在返回 `NoMatch` 前更新 `previous_compose_frame` / `previous_perceptual_frame`（`src/stitch.rs:744-747`），但 `viewport_rect` 保持旧值；随后 `try_apply_match` 用 `translate_viewport_rect(previous_rect, match_info)`（`:844`）把"相对失败帧"的位移当作"相对上一有效视口"使用。参考帧与锚点在语义上分离，却没有对应标记。
+- **产品决定（2026-10-17）**：粘性页眉/页脚的补偿是**用户选区错误**，不是拼接器职责。已写入 `AGENTS.md` 的 Out of scope 与 `stitch` 模块契约：拼接器不检测、不裁剪、不兜底；E 模式是排他手段。因此事实③**不是缺陷、不排期**，DMS 的 `matchIgnores` 忽略带**不借鉴**（它的活动行概念可以借鉴）。
+- **Correction**：仅记录结论与优先级，本次未改代码。建议顺序：①把 `NoMatch` 后的相对位移判定改为需要重新与画布对齐（或同时推进 `viewport_rect` 并标记未验证锚点）；②加画布上限并在满额时停采但保留预览；③引入显式 seam/Unanchored 语义；④匹配前置走行签名缓存、预览增量转换；⑤清理 `FixedBands` 的名实不符（标注为未接线的诊断代码，或删除生产侧调用）。
+- **Prevention**："参考帧基线"和"画布锚点"是两个独立事实，任何一方推进都必须让另一方保持一致，或显式标记为"未验证"。外部实现对比不得只读源码下结论：DMS 的"均值 + 活动行 + 上下忽略带"与我们的"逐行阈值"在页眉/页脚上会得出**相反**的鲁棒性排序，必须用同一份像素输入实测才能下判断。同时："对照实现做了某件事"不等于"我们也该做"——先判定它属于缺陷还是产品边界，再决定是否排期。
+
+### 15. 拼接匹配：盆地只有一行宽、粗筛短名单不可靠、门限不能惩罚「边界少」
+
+- **Context**：为修复教训 14 的 NoMatch 错位接受，按用户提出的「比较亮度变化的边界位置 + 方向冲量 + 拼不上就红框冻结锚点」设计做实验。语料是 6 类 1920×20000 无头 Chrome 渲染页面（正文 / 重复卡片 / 恒定行高表格 / 极稀疏 / 满宽 / 代码），每帧都是已知行偏移的裁切，所以「应落在画布第几行」精确已知，错位可计数而非目测。完整报告见 `docs/edge-stitch-design.md`。
+- **已证事实**：① 候选位置从真值挪开 1 行，边界阶梯代价涨 47 倍（亮度值 18 倍）——正确位置是尖峰不是山，步长 ≥2 的粗扫都可能采不到；② 粗筛短名单在恒定行高表格上召回率 **0–33%**，短名单里全是周期诱饵；③ 半行滚动下亮度描述子正确率从 83% 掉到 11%，边界阶梯从 65% 升到 91%；④ 端到端 600 帧：现有实现 254 静默错位（480 帧口径，其中 154 帧本就无重叠），原型 **0 静默**、216 红框（全部无重叠），跟踪态单帧 32.6–76.4 ms → **1.8–2.3 ms**；⑤ 门限消融：`separation = (second-best)/second ≥ 0.80` 是 0 静默的拐点（0.30 时 13 帧静默，全部是周期内容的整数倍错位）；⑥ 8 列边界阶梯在周期内容上仍留 42 帧静默，48 列才为 0。
+- **Root cause（现有实现）**：把「匹配」实现成「在整幅画布上找最像的位置」——搜索空间随画布线性增长、唯一行宽的盆地要求逐行穷举、且没有「拼得上但不敢确认」这个状态。加上教训 14 的参考帧/锚点不同步，错位就成了静默数据损坏。
+- **我自己犯的错误（同轮修正）**：初版设计有 `boundary_mass` 质量门限（整屏边界太少就红框），把稀疏页面判成「无法长截图」并写成产品取舍。这是错的：删除该门限后 480 帧结果完全不变（唯一差别是 `no_signal` 计数），稀疏页 `sparse2` 稳态 24/24 全对。同一错误的另一种表现是绝对代价门限 `best ≤ 0.030`——它惩罚的正是「边界少」，导致稀疏页 `fine@truth=0.0324` 被判红。**用户指出「只要不是所有像素都一致就该能找到边界」，实测确认。**
+- **我自己犯的第二个错误（2026-10-18 修正）**：§7 把 P0-1 的验收值写成「修复后画布 520 行」，但**从未实测过这个数字**——它是按「440/480 会被正确接受」推演的期望值，而修复 A 的语义恰恰是不接受它们。实际打补丁实测为 **280 行、三帧全 NoMatch**。教训：**验收标准里的每个数字都必须是跑出来的，不是推出来的**；尤其是「修复后应该变成什么」这类断言，推演很容易把「期望行为」和「实际语义」混在一起。
+- **Correction**：本轮只产出设计与证据，未改生产代码。建议顺序：①先单独修教训 14 的参考帧推进问题（可独立验证：`0,40,80,400,440,480` 序列修复后画布应为 **280** 行、且 400/440/480 三帧全部 `NoMatch`；早先写的 520 是错的，见 `docs/edge-stitch-design.md` §7 勘误）；②按 `docs/edge-stitch-design.md` §5 替换匹配器；③`PushResult` 增加显式拒绝态并在 overlay 置红，红框期间采集降到 5 fps。
+- **Prevention**：门限只能惩罚「证据不足以区分」，不能惩罚「页面属性」。具体地：不用绝对代价门限（随页面对比度漂移，且惩罚稀疏），不用边界数量门限（把「边界少」误判成「不可信」），只用 runner-up separation（歧义）+ `best/median`（自归一化）+ 最小可比较行数（统计前提）。性能优化的对象是**窗口**不是**候选数量**——周期内容上减少候选等于减少正确性；任何「粗扫 + 短名单」都必须先测召回率。描述子的横向分辨力由 separation 是否失效反推（1 值/行 与 8 列都不够，48 列才 0 静默）。另：测量前先确认语料的「尾部空白」不是页面属性（`sparse.png` 内容只到第 10557 行）。
+
+
+### 16. 方向选择与 DMS 正面对比：多一个方向不是免费的鲁棒性
+
+- **Context**：用户追问「只用了横向边界还是纵向边界？有必要测两种吗？」以及「现在到底什么状态？和 DMS 比如何？」。为此写了方向消融实验（`study_dir*.py`）并把 DMS v1.6.3 的 `stitch.go` + `scroll.go` 状态机原样接入同一 harness 做正面对比（`/tmp/opencode/dms-cmp`）。完整报告见 `docs/stitch-direction-and-dms.md`。
+- **已证事实**：① 本设计只用横向边界（`|dL/dy|`）；在正常网页上 H、V、H+V 三种描述子完全等价（各 60/60 正确、0 错误、separation p5≈0.97）。② 退化内容上各有盲区：纯竖条纹 H 无候选、纯横条纹 V 无候选、纯渐变两者都无候选。③ **双方向会稀释 separation**：`tallgrid` 在 σ=10 时 H 单独 9/9、V 单独 0/9、H+V 0/9；原因是 V 的代价曲线 spread 只有 0.055（H 是 1.000），等于给所有候选打「差不多」的分，平均后把 H 的尖锐度冲淡（sep 0.990 → 0.769）。④ 端到端 720 帧只换方向：H/V/HV 的接受、拒绝、覆盖率都在噪声内（490/489/490，58.6%），V 的跳变少 1 次（单帧事件）。⑤ 与 DMS 正面对比（720 帧、同真值）：DMS 630 接受 / **90 次静默跳变** / 2.55 ms；本设计 490 接受 / **2 次跳变** / 13.4 ms / 覆盖率 58.6% vs 55.9%。⑥ DMS 的 90 次跳变全部来自 `seamAppend`（`scroll.go:560-570`：连续 4 次 unmatched 后不验证重叠直接追加），本设计的 230 次拒绝中 **0 次是本可匹配却拒绝**。⑦ 本设计的 13.4 ms 里 85% 花在宽窗+锚点窗（只在长跳时触发），是「愿不愿花时间确认」的选择，不是实现效率问题。
+- **Root cause（方向问题）**：多方向描述子只有在「该方向携带独立位置信息」时才有增益。滚动场景下纵向结构不随滚动变化，纵向边界给的是与位置无关的常数信号；把它与横向边界平均，等于引入低区分度的稀释项。这与教训 15 的「门限不能惩罚页面属性」是同一类错误：**信息量不能用「值更多」来衡量，要用「能否区分位置」来衡量**。
+- **Correction**：决定保留单方向（横向），不实现双方向；把理由写成可证伪约束（若遇到「纵向结构极弱、横向极强」的真实页面需重评）。生产代码仍未改动。
+- **Prevention**：新增一个维度前必须测「它在该维度上是否携带独立位置信息」，而不是测「加了它准不准」——正常内容上几乎所有描述子都准，测不出稀释效应。检验方法是看代价曲线的 spread（区分度）与 separation，而不是 top-1。与外部实现对比时必须用**能区分「丢帧」与「错位」的指标**：DMS 的接受数更高，但把 90 次无法确定的情况写成静默接缝；只看「接受率」会得出完全相反的结论。
+
+
+### 17. 换掉一个模块时，所有「为旧模块的失败模式写的补丁」都要重新审
+
+- **Context**：把匹配器从「整幅画布找最像的位置」换成「预测窗口内验证边界位置」后，生产代码里还留着两条为旧失败模式写的补救路径：`recover_stale_bottom_edge`（在「找不到候选」后逐行 RGB 前缀搜索画布）和 `find_dirty_overlap_recovery`（每帧扫描画布边缘找脏条）。两者都编译通过、单测全绿，但语义已经变了。
+- **已证事实**：① `recover_stale_bottom_edge` 在新引擎下变成**后门**——新引擎的拒绝是判断而不是失败，这条更宽松的第二匹配器会在拒绝之后把帧放进去。实测启用它：静默错位从 2 帧涨到 **29 帧**（480 帧口径），全部在重复内容上，因为行前缀相似度在卡片/表格/代码页会在偏几百行的位置报告 70–250 行「稳定」。② `find_dirty_overlap_recovery` 每帧运行、约 **4.3 ms**（占单帧预算 43%），在干净的连续滚动上**从未命中**。加两条必要条件（帧到达画布边缘 + 引擎匹配不完美）后单帧 9.9 → 6.3 ms，质量指标不变。③ `NOMATCH_RECOVERY_MIN_STABLE_ROWS = 8` 在 700 行视口上，10 行前缀就能让它接受偏移 212 行的位置；改成按帧高比例（`max(8, h/20)`）并把判据从「平均差」换成「已证明的重叠行数」（刷新过的脏条本身平均差就高，用平均差会把这条路径存在的理由一并拒掉）。
+- **Root cause**：补救路径的存在理由是「旧实现会失败」，而新实现的「拒绝」是**有意的判断**。两者的语义方向相反：补救路径在失败后加一次宽松尝试，而判断被绕过之后，宽松尝试就变成了唯一的裁决者。这类代码不会编译失败，也不会在旧测试里暴露——旧测试断言的正是旧语义（「找不到候选时应该能恢复」）。
+- **Correction**：从拒绝路径移除 stale-edge recovery，只保留在接受路径（引擎确实给出了候选、画布边缘需要重写）；给 recovery 加成本前置条件；把它的证据门槛改成与帧高成比例。三处都有新测试，且都验证过「改回旧行为测试会红」。
+- **Prevention**：替换一个模块时，除了迁移它的调用点，还要**列出所有「因为旧模块做不到而存在的代码」**，逐条问「新模块做到了之后，这条路径是补救还是后门」。判据：如果这条路径能在新模块**已经做出判断之后**仍然改变结果，它就是后门。另：性能回归要按调用点归因，不要只看总耗时——这次 43% 的预算是「每帧都跑、从未命中」的一条路径，删掉前置条件不满足时的调用比优化算法有效得多。
+
+### 18. 落地时的验收数字必须来自实测，不能来自推演
+
+- **Context**：P0-1（NoMatch 不推进参考帧）的验收值在文档里写成「修复后画布应为 520 行」。这个数字是按「440/480 两帧会被正确接受」推演出来的，从未跑过。
+- **已证事实**：实际打补丁后是 **280 行**，且 400/440/480 三帧全部 `NoMatch`。修复 A 的语义恰恰是**不**接受它们（参考帧不推进，这两帧与画布无重叠）。推演把「期望行为」和「实际语义」混在了一起。
+- **Root cause**：写验收标准时，从「我希望系统变成什么样」出发，而不是从「这个改动的语义必然导致什么」出发。前者是愿望，后者是推论。
+- **Correction**：`docs/edge-stitch-design.md` §7 加勘误，`found.md` 教训 15 的 Correction 同步改为 280，并写明「早先写的 520 是错的」。
+- **Prevention**：验收标准里的每个数字都必须跑出来。尤其是「修复后应该变成什么」这类断言——先把补丁打上跑一遍，再写进文档。如果暂时不能跑，标注 **[未验证]** 而不是给一个看起来合理的数。
+
+
 ---
 
 ## Verification Memory
 
 - **2026-10-13 local install**: HEAD `ca24865` packaged from an isolated directory (`git archive` tarball + local-source PKGBUILD, pkgrel 11) and installed via `pacman -U`; makepkg `check()` passed with 133 lib + 153 bin tests (2 profiling tests ignored, as before). GitHub `origin/niri` still at `a8eb251` — the repo PKGBUILD (git source) would build outdated code until pushed.
+- **2026-10-13 scope fix**: `a279527`（render_scope 限定选中输出）+ `3b09486`（移除重建兜底）双输出机器用户实测 3 次（404/55/183 帧、两块屏、零死锁）；精确根因见教训 13 最终版。`0.1.0-14`（trace-logs）已本地安装供用户回归验证，结果待回报。压力客户端 `/tmp/opencode/wl-stress` 与注入脚本 `/tmp/opencode/inject.py` 为 tmpfs 临时资产（见 Optimization Backlog 第 4 条）。
 - **2026-10-13 long-capture deadlock root-caused and fixed** (see lesson 13): dual-output `--long` starvation traced via staged trace logging (prepare gates → release/commit accounting); final run on the dual-output machine: 178 commits, 173 releases, 30 frames captured and stitched, zero starvation. Smithay source confirms release is sent at commit-processing time (`InnerBuffer::drop`), exonerating niri.
 - **2026-10-12 final state**: 133 lib + 153 bin tests pass (two profiling tests ignored); `cargo check --locked` and `cargo build --release --locked` pass. Two pre-existing clippy errors (`absurd_extreme_comparisons`) and two unused-import warnings in `cli.rs` exist at the prior commit and were not introduced by recent work.
 - Release-binary smoke checks with Niri hints unset and desktop set to `sway` reached the deliberately unavailable Wayland connection instead of a compositor-name rejection.
 - Wayland dispatch/compositor behavior (input grabbing, wheel blocking, passthrough toggling, live capture) remains manually testable only under a live session; unit tests cover the pure logic and pixel rendering.
+- **DMS stitch comparison (2026-10-17)**: `docs/dms-stitch-comparison.md`；DMS v1.6.3 `stitch.go` 与本实现用同一 1920×1080 语料实测（1.10 ms/帧 vs 87.0 ms/帧），并复现 NoMatch 后错位接受、`FixedBands` 未接线、画布无上限三项待修问题；顶部粘性页眉失败已按产品决定列为 out of scope（非缺陷）。算法结论与缺陷优先级以该文档为准。
+- **Edge-stitch experiment (2026-10-18)**: `docs/edge-stitch-design.md`；6 类 1920×20000 渲染语料（每帧真值精确已知）+ Rust 探针（实验后已删除）对比 shipped 与原型。最终配置 48 列边界阶梯 + separation ≥ 0.80 + 无绝对门限 + 无质量门限：600 帧口径 **0 静默**（shipped 254/480 帧）、216 红框（全部无重叠）、跟踪态单帧 1.8–2.3 ms（shipped 32.6–76.4 ms）。半行滚动 120/120 全对。三条结构性结论：边界盆地只有 1 行宽、粗筛短名单在恒定行高表格上召回 0–33%、门限不能惩罚「边界少」（稀疏页不是问题，删除质量门限后结果不变）。生产代码未改动。
+- **Stitcher replacement landed (2026-10-18)**: `PlacementEngine` + `WindowedEdgeMatcher` (`src/stitch/engine.rs`), `LegacyPipeline` behind `stitch-legacy`, `ScriptedEngine` as the test mock. Same 480-frame corpus: silently misplaced 278 → 11, position jumps 205 → 2, per-frame 6.3 ms (tracking) / 4.2 ms (wheel). Red border + 5 fps while refusing. Two defects only surfaced after wiring: stale-edge recovery became a gate bypass (2 → 29 misplaced) and the dirty-edge scan cost 4.3 ms/frame while never hitting — see lessons 17 and 18.
+- **Direction + DMS head-to-head (2026-10-18)**: `docs/stitch-direction-and-dms.md`；方向消融（H/V/H+V 在正常网页等价，双方向在 tallgrid σ=10 时把 9/9 稀释到 0/9）+ DMS 原样接入同 harness 对比（720 帧：DMS 90 次静默跳变 / 2.55 ms；本设计 2 次 / 13.4 ms / 覆盖率 58.6% vs 55.9%）。结论：保留单方向（横向）；DMS 的 `seamAppend` 不借鉴。生产代码未改动。
 - **Hyprland findings (2026-10-12)**: `docs/hyprland-findings.md` records three Hyprland-side problems (wheel passthrough, missing cursor in cursor-requested frames, cursor not removable from region frames), each with triggers, upstream evidence, and what remains separately fixable on our side. Mechanisms are source-verified; none reproduced end-to-end on a live Hyprland session yet.
+
+---
+
+## Optimization Backlog（未排期优化方向）
+
+2026-10-13 死锁排查会话中识别，均为内存/性能优化，不影响正确性。动手前先读教训 13 的 Prevention。
+
+1. **遮罩条带化**（收益最大）：全屏 overlay 画布 ×3 → 框外四条带 surface（洞区无 surface），预览可独立为框内小 surface。内存 ~33MB/输出(1080p) → 周长级 <1MB；4K 双输出 ~200MB → 个位数 MB。代价：surface 数量×输出数、configure/resize、输入区域管理全面复杂化。触发条件：4K/多输出内存成为实际顾虑。
+2. **wl_shm → dmabuf/GPU 路径**：GPU 渲染画布 + 合成器零拷贝，CPU 占用归零。代价：EGL/GBM 依赖栈与驱动兼容矩阵，违背最小依赖原则。当前负载（简单填充、每秒次数个位数）CPU 成本可忽略，仅当捕获会话 CPU 实测成为问题时考虑。
+3. **overlay 缓冲 3→2**（收益最小）：修复后缓冲数已非正确性参数（乒乓已断、prepare 不依赖提交），2 块仅在突发时偶发推迟一次重画。省 8.3MB/输出。低优先级。
+4. **诊断资产去留**：压力客户端（wl-stress，建立健康基线的差分工具）与 uinput 注入脚本当前在 tmpfs 上，重启即失；是否收编入仓库 tools/ 由项目主决定。
