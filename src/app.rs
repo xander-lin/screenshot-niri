@@ -3,7 +3,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 use crate::cli::{Command, Mode};
-use crate::stitch::{FrameScreenOffset, ImageRgbView, PushResult, RawStitcher};
+use crate::stitch::{ImageRgbView, PushResult, RawStitcher};
 use crate::wayland::screencopy::CaptureOutputRegion;
 use crate::wayland::selection::LongDirection;
 
@@ -18,48 +18,6 @@ const LONG_FRAME_PACE_SLEEP: Duration = Duration::from_millis(2);
 
 fn long_frame_interval(max_frame_rate: u32) -> Duration {
     Duration::from_nanos(1_000_000_000 / u64::from(max_frame_rate.max(1)))
-}
-
-/// Shrinks a region inward without moving tiny selections outside their bounds.
-/// Long screencopy requests use logical coordinates and pass scale = 1.
-fn inset_capture_region(
-    region: CaptureOutputRegion,
-    scale: i32,
-) -> CaptureOutputRegion {
-    let inset = scale.max(1);
-    let inset_x = inset.min((region.region.width - 1).max(0));
-    let inset_y = inset.min((region.region.height - 1).max(0));
-    CaptureOutputRegion {
-        output_name: region.output_name,
-        region: crate::wayland::screencopy::Region {
-            x: region.region.x + inset_x,
-            y: region.region.y + inset_y,
-            width: (region.region.width - 2 * inset_x).max(1),
-            height: (region.region.height - 2 * inset_y).max(1),
-        },
-        dst_x: region.dst_x,
-        dst_y: region.dst_y,
-    }
-}
-
-/// Logical screen rectangle a capture region actually covers: the inset
-/// region in output-local logical coordinates mapped through the
-/// output's logical origin. The preview must map stitched
-/// content through this rectangle — using the un-inset selection box
-/// would offset the preview by the inset, and after an E-extend the new
-/// capture region would re-capture those shifted preview pixels into the
-/// stitch as misaligned seams.
-fn capture_region_logical_rect(
-    region: CaptureOutputRegion,
-    outputs: &[crate::geometry::OutputInfo],
-) -> Option<crate::geometry::LogicalRect> {
-    let output = outputs.iter().find(|o| o.global_name == region.output_name)?;
-    Some(crate::geometry::LogicalRect {
-        x: output.logical.x + region.region.x,
-        y: output.logical.y + region.region.y,
-        width: region.region.width,
-        height: region.region.height,
-    })
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
@@ -144,31 +102,6 @@ enum PrepareAck {
     /// Skip this frame: an edit drag is reshaping the box, or the clean
     /// overlay could not be committed (all buffers busy).
     Skip,
-}
-
-/// Capture region for a settled selection rectangle on a single output,
-/// inset one logical pixel per side. Returns `None` for selections that do
-/// not map to exactly one output (long capture cannot follow them).
-fn prepare_capture_region(
-    rect: crate::geometry::LogicalRect,
-    outputs: &[crate::geometry::OutputInfo],
-) -> Option<CaptureOutputRegion> {
-    let viewport = crate::geometry::SelectedViewport::from_outputs(rect, outputs).ok()?;
-    if viewport.regions.len() != 1 {
-        return None;
-    }
-    // wlr-screencopy capture_output_region takes output-local logical units,
-    // unlike the pixel rectangles used to crop frozen normal screenshots.
-    let selected = viewport.regions[0];
-    let local = selected.local_region;
-    Some(inset_capture_region(CaptureOutputRegion {
-        output_name: selected.output_global_name,
-        region: crate::wayland::screencopy::Region {
-            x: local.x, y: local.y, width: local.width, height: local.height,
-        },
-        dst_x: 0,
-        dst_y: 0,
-    }, 1))
 }
 
 struct LongCaptureWorker {
@@ -326,7 +259,7 @@ fn run_long_capture(
         return Err(err);
     }
 
-    let initial_region = prepare_capture_region(viewport.rect, &selection_session.output_infos())
+    let initial_region = crate::geometry::prepare_capture_region(viewport.rect, &selection_session.output_infos())
         .ok_or("long capture requires a selection on one output")?;
     let max_frame_rate = args.max_frame_rate.unwrap_or(config.max_fps);
     let mut worker = LongCaptureWorker::start(initial_region, max_frame_rate);
@@ -359,7 +292,7 @@ fn run_long_capture(
                 // geometry — that mismatch was the root cause of white
                 // borders inside stitched long captures.
                 let decision = selection_session.prepare_capture_clean()?
-                    .and_then(|rect| prepare_capture_region(rect, &selection_session.output_infos()));
+                    .and_then(|rect| crate::geometry::prepare_capture_region(rect, &selection_session.output_infos()));
                 if decision.is_none() {
                     selection_session.complete_capture();
                 }
@@ -397,7 +330,7 @@ fn run_long_capture(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let offset = frame_screen_offset(region, current_frame);
+                let offset = crate::geometry::frame_screen_offset(region, current_frame);
                 let outcome = match stitcher.push_frame_with_offset(&compose, &analysis, direction, offset) {
                     Ok(o) => {
                         crate::trace_log!("ui: pushed frame offset=({},{}) outcome={:?}", offset.x, offset.y, o);
@@ -442,7 +375,7 @@ fn run_long_capture(
                             // box: they differ by the one-pixel inset, and a
                             // preview offset from the real screen content
                             // gets re-captured after selection-box edits.
-                            let preview_viewport = capture_region_logical_rect(
+                            let preview_viewport = crate::geometry::capture_region_logical_rect(
                                 region,
                                 &selection_session.output_infos(),
                             )
@@ -535,13 +468,6 @@ fn run_long_capture(
 }
 
 /// Convert logical screen offsets into the returned frame's pixel space.
-fn frame_screen_offset(region: CaptureOutputRegion, image: &crate::image::Image) -> FrameScreenOffset {
-    FrameScreenOffset {
-        x: (i64::from(region.region.x) * i64::from(image.width) / i64::from(region.region.width.max(1))) as i32,
-        y: (i64::from(region.region.y) * i64::from(image.height) / i64::from(region.region.height.max(1))) as i32,
-    }
-}
-
 /// Fast raw-frame similarity check. Samples every 8th pixel, 4px per row.
 /// Returns true if the frames are so similar they can be treated as duplicate.
 fn raw_frame_nearly_identical(a: &crate::image::Image, b: &crate::image::Image) -> bool {
@@ -592,6 +518,9 @@ fn should_skip_duplicate_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::{
+        capture_region_logical_rect, inset_capture_region, prepare_capture_region,
+    };
     use crate::image::Image;
     use crate::wayland::screencopy::Region;
     use wayland_client::protocol::wl_shm::Format;
@@ -692,10 +621,10 @@ mod tests {
             x: -899, y: 251, width: 298, height: 198,
         }));
         let frame = solid(596, 396, 80);
-        assert_eq!(frame_screen_offset(region, &frame), FrameScreenOffset { x: 202, y: 102 });
+        assert_eq!(crate::geometry::frame_screen_offset(region, &frame), crate::stitch::FrameScreenOffset { x: 202, y: 102 });
         // Moving left by ten logical pixels must move the canvas by twenty pixels.
         let moved = region_at(91, 51, 298, 198);
-        assert_eq!(frame_screen_offset(moved, &frame), FrameScreenOffset { x: 182, y: 102 });
+        assert_eq!(crate::geometry::frame_screen_offset(moved, &frame), crate::stitch::FrameScreenOffset { x: 182, y: 102 });
     }
 
     #[test]

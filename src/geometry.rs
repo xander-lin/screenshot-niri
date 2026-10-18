@@ -287,3 +287,91 @@ mod tests {
         );
     }
 }
+
+/// Shrinks a capture region inward without moving tiny selections outside
+/// their bounds. Long screencopy requests use logical coordinates.
+pub fn inset_capture_region(
+    region: crate::wayland::screencopy::CaptureOutputRegion,
+    scale: i32,
+) -> crate::wayland::screencopy::CaptureOutputRegion {
+    let inset = scale.max(1);
+    let inset_x = inset.min((region.region.width - 1).max(0));
+    let inset_y = inset.min((region.region.height - 1).max(0));
+    crate::wayland::screencopy::CaptureOutputRegion {
+        output_name: region.output_name,
+        region: crate::wayland::screencopy::Region {
+            x: region.region.x + inset_x,
+            y: region.region.y + inset_y,
+            width: (region.region.width - 2 * inset_x).max(1),
+            height: (region.region.height - 2 * inset_y).max(1),
+        },
+        dst_x: region.dst_x,
+        dst_y: region.dst_y,
+    }
+}
+
+/// Capture region for a settled selection rectangle on a single output, inset
+/// one logical pixel per side.
+///
+/// Returns `None` for selections that do not map to exactly one output: long
+/// capture cannot follow them.
+pub fn prepare_capture_region(
+    rect: LogicalRect,
+    outputs: &[OutputInfo],
+) -> Option<crate::wayland::screencopy::CaptureOutputRegion> {
+    let viewport = SelectedViewport::from_outputs(rect, outputs).ok()?;
+    if viewport.regions.len() != 1 {
+        return None;
+    }
+    // wlr-screencopy capture_output_region takes output-local logical units,
+    // unlike the pixel rectangles used to crop frozen normal screenshots.
+    let selected = viewport.regions[0];
+    let local = selected.local_region;
+    Some(inset_capture_region(
+        crate::wayland::screencopy::CaptureOutputRegion {
+            output_name: selected.output_global_name,
+            region: crate::wayland::screencopy::Region {
+                x: local.x,
+                y: local.y,
+                width: local.width,
+                height: local.height,
+            },
+            dst_x: 0,
+            dst_y: 0,
+        },
+        1,
+    ))
+}
+
+/// Logical screen rectangle a capture region actually covers.
+///
+/// The preview must map stitched content through this rectangle: using the
+/// un-inset selection box would offset the preview by the inset.
+pub fn capture_region_logical_rect(
+    region: crate::wayland::screencopy::CaptureOutputRegion,
+    outputs: &[OutputInfo],
+) -> Option<LogicalRect> {
+    let output = outputs.iter().find(|o| o.global_name == region.output_name)?;
+    Some(LogicalRect {
+        x: output.logical.x + region.region.x,
+        y: output.logical.y + region.region.y,
+        width: region.region.width,
+        height: region.region.height,
+    })
+}
+
+/// Where the captured frame sits in output-local buffer pixels.
+///
+/// `region` is in logical units while `image` is in buffer pixels, so the
+/// offset has to be scaled by the ratio the compositor actually produced.
+pub fn frame_screen_offset(
+    region: crate::wayland::screencopy::CaptureOutputRegion,
+    image: &crate::image::Image,
+) -> crate::stitch::FrameScreenOffset {
+    crate::stitch::FrameScreenOffset {
+        x: (i64::from(region.region.x) * i64::from(image.width)
+            / i64::from(region.region.width.max(1))) as i32,
+        y: (i64::from(region.region.y) * i64::from(image.height)
+            / i64::from(region.region.height.max(1))) as i32,
+    }
+}
