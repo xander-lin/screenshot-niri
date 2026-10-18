@@ -28,6 +28,11 @@ pub fn trace_fast_motion_enabled() -> bool {
     std::env::var_os("SCREENSHOT_TRACE_FAST_MOTION").is_some()
 }
 
+#[cfg(feature = "trace-logs")]
+pub fn edge_gate_trace_enabled() -> bool {
+    std::env::var_os("SCREENSHOT_TRACE_EDGE_GATE").is_some()
+}
+
 pub fn fast_motion_accept_enabled() -> bool {
     std::env::var_os("SCREENSHOT_FAST_MOTION_ACCEPT").is_some()
 }
@@ -57,5 +62,10 @@ pub fn trace_deep_profile_enabled() -> bool {
 
 #[cfg(not(feature = "trace-logs"))]
 pub fn trace_fast_motion_enabled() -> bool {
+    false
+}
+
+#[cfg(not(feature = "trace-logs"))]
+pub fn edge_gate_trace_enabled() -> bool {
     false
 }

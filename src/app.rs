@@ -418,6 +418,7 @@ fn run_long_capture(
                         worker.set_stitch_warning(false);
                         let _ = selection_session.set_stitch_warning(false);
                     }
+                    PushResult::Pending => {}
                     PushResult::NoMatch => {
                         worker.set_stitch_warning(true);
                         let _ = selection_session.set_stitch_warning(true);

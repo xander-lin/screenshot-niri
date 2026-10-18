@@ -156,6 +156,15 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
 - **Prevention**：验收标准里的每个数字都必须跑出来。尤其是「修复后应该变成什么」这类断言——先把补丁打上跑一遍，再写进文档。如果暂时不能跑，标注 **[未验证]** 而不是给一个看起来合理的数。
 
 
+
+### 19. 合成语料只能验证结构，不能作为验收标准
+
+- **Context**：用户报告「分明应该能拼接上的，非得报红框」。我怀疑是**亚像素滚动**（浏览器按设备像素滚动，相邻帧位移不是整数行，而引擎只在整数行上搜索），于是投入大量工作做画布多相位重采样、帧侧相位搜索、相位窗口测量。
+- **已证事实**：① 用真实 Chrome 验证，`scrollTo(0, 1000.25)` 实际是 1000、`1000.5` 是 1001、`1000.75` 是 1001——**DPR=1 时浏览器把滚动位置量化到整数像素**，所谓亚像素相位根本不存在。② 我的合成语料里「存在」亚像素，因为那是我用线性插值**伪造**的。③ 用真实浏览器帧（headless Chrome + `Emulation.setDeviceMetricsOverride`，98 帧）实测旧门限：**8 接受 / 89 拒绝 / 0 错位**——位置全对，92% 被拒，正是用户看到的红框。④ 正确帧的 `sep` 实际分布是 0.637–0.915、`bm` 是 0.043–0.152；合成语料因为「同一张图裁切」一致性偏高，`sep` 普遍 > 0.85，所以 `SEP = 0.80` 在合成语料上看起来安全，在真实渲染上把 92% 的正确帧拒掉。重标定为 `0.45 / 0.28` 后：**97 接受 / 0 拒绝 / 0 错位**，跳变误接受仍为 0/12。
+- **Root cause**：合成语料由同一张渲染图裁切而来，帧间差异只有「位置」，没有真实渲染的字体 hinting、抗锯齿、图片解码时序、滚动条重绘。它足以验证算法的**结构**（盆地宽度、扫描顺序、门限方向），但**分布**是错的，而门限是分布的函数。用合成语料定门限，等于用错误分布定阈值。
+- **Correction**：门限按真实浏览器帧重标定；`docs/edge-stitch-design.md` §12 记录完整实测与三个缺陷（门限过严、长位移上限缺失、竞争峰被当成肩部）；相位搜索的全部代码已撤回。
+- **Prevention**：**验收必须用真实数据**。判断「这个假设是否成立」时，先用真实环境做一个最小验证（这次是 6 行 CDP 脚本），再决定要不要投入实现。合成语料可以用来做回归（保证结构不被破坏），但不能用来决定阈值。另：当用户说「明明应该可以」时，先量**正确帧被拒的比例**，而不是先猜机制——这次量出来是 92%，一眼就能定位到门限而不是算法。
+
 ---
 
 ## Verification Memory
@@ -170,6 +179,7 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
 - **Edge-stitch experiment (2026-10-18)**: `docs/edge-stitch-design.md`；6 类 1920×20000 渲染语料（每帧真值精确已知）+ Rust 探针（实验后已删除）对比 shipped 与原型。最终配置 48 列边界阶梯 + separation ≥ 0.80 + 无绝对门限 + 无质量门限：600 帧口径 **0 静默**（shipped 254/480 帧）、216 红框（全部无重叠）、跟踪态单帧 1.8–2.3 ms（shipped 32.6–76.4 ms）。半行滚动 120/120 全对。三条结构性结论：边界盆地只有 1 行宽、粗筛短名单在恒定行高表格上召回 0–33%、门限不能惩罚「边界少」（稀疏页不是问题，删除质量门限后结果不变）。生产代码未改动。
 - **Stitcher replacement landed (2026-10-18)**: `PlacementEngine` + `WindowedEdgeMatcher` (`src/stitch/engine.rs`), `LegacyPipeline` behind `stitch-legacy`, `ScriptedEngine` as the test mock. Same 480-frame corpus: silently misplaced 278 → 11, position jumps 205 → 2, per-frame 6.3 ms (tracking) / 4.2 ms (wheel). Red border + 5 fps while refusing. Two defects only surfaced after wiring: stale-edge recovery became a gate bypass (2 → 29 misplaced) and the dirty-edge scan cost 4.3 ms/frame while never hitting — see lessons 17 and 18.
 - **Direction + DMS head-to-head (2026-10-18)**: `docs/stitch-direction-and-dms.md`；方向消融（H/V/H+V 在正常网页等价，双方向在 tallgrid σ=10 时把 9/9 稀释到 0/9）+ DMS 原样接入同 harness 对比（720 帧：DMS 90 次静默跳变 / 2.55 ms；本设计 2 次 / 13.4 ms / 覆盖率 58.6% vs 55.9%）。结论：保留单方向（横向）；DMS 的 `seamAppend` 不借鉴。生产代码未改动。
+- **Red border recalibration (2026-10-18)**: real-browser corpus (headless Chrome, `Emulation.setDeviceMetricsOverride` 960x700 DPR 1, 98 scroll positions, `docs` page) replaced the synthetic one for threshold calibration. Old gates (`sep 0.80` / `bm 0.10`): 8 accepted / 89 refused / 0 misplaced. New gates (`sep 0.45` / `bm 0.28`): **97 accepted / 0 refused / 0 misplaced**, jumps still 0/12 wrongly accepted. Three defects found: thresholds calibrated on synthetic frames (see lesson 19), no per-frame displacement cap (630-row jumps accepted on 70 rows of evidence), and the runner-up definition measuring the winner's own shoulder instead of a rival peak (a 235-row card grid scored `sep = 1.000` while a candidate one period away matched at cost 0.000). Added `PushResult::Pending` with `REFUSAL_PATIENCE = 8` so a single ambiguous frame no longer turns the border red. Sub-pixel scrolling was investigated and **disproved**: at DPR 1 browsers quantise scroll positions to integer pixels.
 - **Hyprland findings (2026-10-12)**: `docs/hyprland-findings.md` records three Hyprland-side problems (wheel passthrough, missing cursor in cursor-requested frames, cursor not removable from region frames), each with triggers, upstream evidence, and what remains separately fixable on our side. Mechanisms are source-verified; none reproduced end-to-end on a live Hyprland session yet.
 
 ---

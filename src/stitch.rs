@@ -110,6 +110,14 @@ const NOMATCH_RECOVERY_STABLE_MAX_AVERAGE_DIFF: f64 = MATCH_LINE_MAX_AVERAGE_DIF
 /// dirty-edge recovery has nothing to repair and must not pay for its scan.
 const NOMATCH_RECOVERY_CLEAN_MATCH_SCORE: f64 = 0.02;
 
+/// Consecutive refusals before the failure is reported as `NoMatch`.
+///
+/// One unplaceable frame is not evidence that the content stopped overlapping.
+/// The border turns red only once the failure has repeated this many times in a
+/// row, which at 30 fps is about a quarter of a second — long enough to ride out
+/// a rendering seam, short enough that a real jump is still reported promptly.
+const REFUSAL_PATIENCE: u32 = 8;
+
 #[cfg(feature = "stitch-legacy")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlacementSource {
@@ -422,6 +430,12 @@ pub struct RawStitcher {
     engine: Box<dyn PlacementEngine>,
     /// Why the last frame was refused, for the overlay and the trace.
     last_reject_reason: Option<RejectReason>,
+    /// Consecutive refusals, reset by any accepted frame.
+    ///
+    /// Drives the difference between `Pending` (a single unplaceable frame,
+    /// which must not turn the border red) and `NoMatch` (a sustained failure
+    /// the user needs to see).
+    consecutive_refusals: u32,
 }
 
 impl RawStitcher {
@@ -445,6 +459,7 @@ impl RawStitcher {
             last_screen_offset: None,
             engine: new_placement_engine(),
             last_reject_reason: None,
+            consecutive_refusals: 0,
         }
     }
 
@@ -743,7 +758,7 @@ impl RawStitcher {
                 // The dirty-edge case is still handled, from the accept path:
                 // `find_dirty_overlap_recovery` runs when the engine *did*
                 // produce a candidate and the canvas edge needs rewriting.
-                return self.reject_frame();
+                return self.reject_frame(reason);
             }
         };
 
@@ -828,7 +843,7 @@ impl RawStitcher {
         }
 
         self.last_reject_reason = Some(RejectReason::NoCandidate);
-        self.reject_frame()
+        self.reject_frame(RejectReason::NoCandidate)
     }
 
     /// Refuses the frame without touching any accepted state.
@@ -837,8 +852,26 @@ impl RawStitcher {
     /// direction memory and the delta prediction all stay where the last
     /// *verified* frame left them, so a user who scrolls back recovers instead
     /// of the canvas silently skipping content.
-    fn reject_frame(&mut self) -> Result<PushResult, Box<dyn Error>> {
+    ///
+    /// A refusal is reported as [`PushResult::Pending`] until it has repeated
+    /// `REFUSAL_PATIENCE` times in a row. One unplaceable frame is not
+    /// evidence that the content stopped overlapping — a frame can land on a
+    /// rendering seam and be genuinely ambiguous while the next one matches
+    /// cleanly — so the border only turns red once the failure is sustained.
+    fn reject_frame(&mut self, _reason: RejectReason) -> Result<PushResult, Box<dyn Error>> {
         self.last_profile_breakdown.path = Some(StitchDecisionPath::NoMatch);
+        self.consecutive_refusals = self.consecutive_refusals.saturating_add(1);
+        if self.consecutive_refusals < REFUSAL_PATIENCE {
+            crate::trace_log!(
+                "stitch: refusal {} of {} ({}), still pending",
+                self.consecutive_refusals,
+                REFUSAL_PATIENCE,
+                self.last_reject_reason
+                    .map(|reason| reason.as_str())
+                    .unwrap_or("unknown")
+            );
+            return Ok(PushResult::Pending);
+        }
         Ok(PushResult::NoMatch)
     }
 
@@ -944,6 +977,7 @@ impl RawStitcher {
         self.last_profile_breakdown.path = path;
         self.last_fast_motion_trace = fast_motion_trace;
         self.accepted_direction.record(direction);
+        self.consecutive_refusals = 0;
     }
 
     fn find_nomatch_recovery(
@@ -2536,6 +2570,24 @@ mod tests {
         }
     }
 
+    /// Drives `stitcher` with the same frame until the refusal is sustained.
+    ///
+    /// A single unplaceable frame is reported as `Pending`, not `NoMatch`: the
+    /// border must not turn red for one ambiguous frame. Tests that care about
+    /// the refusal contract push the same frame `REFUSAL_PATIENCE` times and
+    /// assert the last result.
+    fn push_until_refused(
+        stitcher: &mut RawStitcher,
+        frame: &RgbFrame,
+        direction: Option<LongDirection>,
+    ) -> PushResult {
+        let mut result = PushResult::Pending;
+        for _ in 0..REFUSAL_PATIENCE {
+            result = stitcher.push_frame(frame.clone(), direction).unwrap();
+        }
+        result
+    }
+
     fn stitched_pixel_rgb(frame: &StitchedFrame, x: u32, y: u32) -> [u8; 3] {
         let offset = y as usize * frame.stride as usize + x as usize * 3;
         [
@@ -3077,9 +3129,8 @@ mod tests {
                 Some(LongDirection::Down),
             )
             .unwrap();
-        let result = stitcher
-            .push_frame_with_analysis(current_compose, current_analysis, Some(LongDirection::Down))
-            .unwrap();
+        let result = push_until_refused(&mut stitcher, &current_compose, Some(LongDirection::Down));
+        let _ = current_analysis;
 
         assert_eq!(result, PushResult::NoMatch);
     }
@@ -3135,7 +3186,7 @@ mod tests {
             .unwrap();
         let before = stitcher.stitched.as_ref().unwrap().clone();
         assert_eq!(
-            stitcher.push_frame(stale, Some(LongDirection::Down)).unwrap(),
+            push_until_refused(&mut stitcher, &stale, Some(LongDirection::Down)),
             PushResult::NoMatch
         );
         let after = stitcher.stitched.as_ref().unwrap();
@@ -3298,9 +3349,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            stitcher
-                .push_frame(current, Some(LongDirection::Down))
-                .unwrap(),
+            push_until_refused(&mut stitcher, &current, Some(LongDirection::Down)),
             PushResult::NoMatch
         );
     }
@@ -4323,7 +4372,7 @@ mod tests {
         for top in [400u32, 440, 480] {
             let frame = frame_from_world_rows(width, &(top..top + height).collect::<Vec<_>>());
             assert_eq!(
-                stitcher.push_frame(frame, None).unwrap(),
+                push_until_refused(&mut stitcher, &frame, None),
                 PushResult::NoMatch,
                 "frame at page row {top} has no overlap with the canvas and must be refused"
             );
@@ -4368,7 +4417,7 @@ mod tests {
         for top in [400u32, 440, 480] {
             let frame = frame_from_world_rows(width, &(top..top + height).collect::<Vec<_>>());
             assert_eq!(
-                stitcher.push_frame(frame, None).unwrap(),
+                push_until_refused(&mut stitcher, &frame, None),
                 PushResult::NoMatch
             );
         }
@@ -4394,7 +4443,75 @@ mod tests {
         }
     }
 
-    /// A rejection must not disturb the direction memory either: the next
+    /// One unplaceable frame must not be reported as a failure.
+    ///
+    /// The border is driven straight from `PushResult`, so `Pending` is what
+    /// keeps a single ambiguous frame from flashing red on content that plainly
+    /// overlaps. `NoMatch` only arrives once the refusal has repeated.
+    #[test]
+    fn a_single_refusal_is_pending_and_a_sustained_one_is_no_match() {
+        let width = 64;
+        let height = 200;
+        let mut stitcher = RawStitcher::new();
+        for top in [0u32, 40, 80] {
+            let frame = frame_from_world_rows(width, &(top..top + height).collect::<Vec<_>>());
+            stitcher.push_frame(frame, None).unwrap();
+        }
+
+        let jump = frame_from_world_rows(width, &(900..900 + height).collect::<Vec<_>>());
+        for expected in 1..REFUSAL_PATIENCE {
+            assert_eq!(
+                stitcher.push_frame(jump.clone(), None).unwrap(),
+                PushResult::Pending,
+                "refusal {expected} of {REFUSAL_PATIENCE} must stay pending"
+            );
+        }
+        assert_eq!(
+            stitcher.push_frame(jump.clone(), None).unwrap(),
+            PushResult::NoMatch,
+            "a sustained refusal must be reported"
+        );
+        // The patience counter must not run past the threshold.
+        assert_eq!(stitcher.consecutive_refusals, REFUSAL_PATIENCE);
+    }
+
+    /// An accepted frame clears the patience, so an isolated refusal between
+    /// two good frames never accumulates into a red border.
+    #[test]
+    fn an_accepted_frame_clears_the_refusal_patience() {
+        let width = 64;
+        let height = 200;
+        let mut stitcher = RawStitcher::new();
+        for top in [0u32, 40, 80] {
+            let frame = frame_from_world_rows(width, &(top..top + height).collect::<Vec<_>>());
+            stitcher.push_frame(frame, None).unwrap();
+        }
+
+        let jump = frame_from_world_rows(width, &(900..900 + height).collect::<Vec<_>>());
+        for _ in 0..REFUSAL_PATIENCE - 1 {
+            assert_eq!(
+                stitcher.push_frame(jump.clone(), None).unwrap(),
+                PushResult::Pending
+            );
+        }
+        assert_eq!(stitcher.consecutive_refusals, REFUSAL_PATIENCE - 1);
+
+        // Back into the canvas: accepted, so the next refusal starts at one.
+        let back = frame_from_world_rows(width, &(120..120 + height).collect::<Vec<_>>());
+        assert!(matches!(
+            stitcher.push_frame(back, None).unwrap(),
+            PushResult::Accepted { .. }
+        ));
+        assert_eq!(stitcher.consecutive_refusals, 0);
+
+        assert_eq!(
+            stitcher.push_frame(jump, None).unwrap(),
+            PushResult::Pending,
+            "patience must restart after an acceptance"
+        );
+    }
+
+    /// A refusal must not disturb the direction memory either: the next
     /// accepted frame still gets the stale-edge recovery path it depends on.
     #[test]
     fn rejection_preserves_accepted_direction_memory() {
@@ -4408,7 +4525,7 @@ mod tests {
         let before = stitcher.accepted_direction;
         let frame = frame_from_world_rows(width, &(900..900 + height).collect::<Vec<_>>());
         assert_eq!(
-            stitcher.push_frame(frame, None).unwrap(),
+            push_until_refused(&mut stitcher, &frame, None),
             PushResult::NoMatch
         );
         assert_eq!(stitcher.accepted_direction, before);

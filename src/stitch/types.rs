@@ -90,6 +90,18 @@ pub enum PushResult {
     Initialized,
     Accepted { match_info: FrameMatch },
     Duplicate,
+    /// The frame could not be placed, but the refusal has not repeated long
+    /// enough to count as a failure.
+    ///
+    /// A single unplaceable frame is not evidence that the content stopped
+    /// overlapping. A rendering seam, a repaint in flight or a momentarily
+    /// low-contrast region can make one frame genuinely ambiguous while the
+    /// very next one matches cleanly. Reporting that first frame as a failure
+    /// is what makes the border flash red on content that plainly overlaps.
+    ///
+    /// Like [`PushResult::NoMatch`] this must not advance any accepted state;
+    /// it differs only in what it tells the user.
+    Pending,
     NoMatch,
 }
 

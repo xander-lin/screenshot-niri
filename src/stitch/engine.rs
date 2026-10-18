@@ -41,18 +41,44 @@ const EDGE_MAX_SCORING_ROWS: usize = 192;
 const EDGE_MIN_COMPARABLE_ROWS: u32 = 8;
 /// Runner-up separation floor, `(second - best) / second`.
 /// 0.30 leaves 13 silently misplaced frames on periodic content, 0.80 none.
-const EDGE_MIN_SEPARATION: f64 = 0.80;
+const EDGE_MIN_SEPARATION: f64 = 0.45;
 /// Self-normalised "no evidence" gate: the winner must be much better than a
 /// typical candidate. Relative, so it does not punish sparse pages.
-const EDGE_MAX_BEST_OVER_MEDIAN: f64 = 0.10;
+const EDGE_MAX_BEST_OVER_MEDIAN: f64 = 0.28;
 /// Positions closer than this to the winner are the same peak, not a rival.
 const EDGE_ADJACENT_ROWS: i32 = 2;
+/// A candidate whose cost is within this of the winner is "as good".
+///
+/// Used to count distinct equally-good answers: a periodic page has several,
+/// and choosing one of them would be a silent misplacement.
+const EDGE_RIVAL_COST_MARGIN: f64 = 0.02;
+/// Divisor that turns the frame height into the winner's basin width.
+///
+/// A rival closer than this is the winner's own shoulder, not a second answer.
+/// One eighth of the viewport is wide enough to cover the peak, and narrow
+/// enough that a repeated pattern one card-height away still counts as a rival.
+const EDGE_BASIN_DIVISOR: i32 = 8;
 /// Impulse window half-width, and its scale with the previous delta.
 const EDGE_IMPULSE_MIN_HALF_WIDTH: i32 = 24;
 const EDGE_IMPULSE_SCALE_NUMERATOR: i32 = 6;
 const EDGE_IMPULSE_SCALE_DENOMINATOR: i32 = 10;
 /// Wide-window half-width around the impulse prediction.
 const EDGE_WIDE_HALF_WIDTH: i32 = 1400;
+/// Maximum single-frame displacement, as a fraction of the viewport height.
+///
+/// The generic overlap floor (10% of the viewport) is far too permissive for
+/// this matcher: a 700-row viewport could accept a 630-row jump on 70 rows of
+/// evidence, and on periodic content those 70 rows are trivially "matched" at
+/// the wrong place. Measured on the synthetic corpus, allowing 630-row jumps
+/// produced 51 silent misplacements on `table` and 97 on `cards2`, all of them
+/// at long offsets after a refusal had stalled the canvas.
+///
+/// A real scroll advances by a fraction of a viewport between frames. 60%
+/// keeps at least 40% of the frame as overlap, which is what makes the
+/// separation gate meaningful in the first place.
+const EDGE_MAX_DISPLACEMENT_NUMERATOR: i32 = 6;
+const EDGE_MAX_DISPLACEMENT_DENOMINATOR: i32 = 10;
+
 /// Anchor-recovery half-width around the last verified position.
 const EDGE_ANCHOR_HALF_WIDTH: i32 = 2800;
 
@@ -458,10 +484,52 @@ impl WindowedEdgeMatcher {
 
         costs.sort_by(|a, b| a.0.total_cmp(&b.0));
         let (best_cost, best_top) = costs[0];
+        // A candidate further than this from the previous accepted position
+        // leaves too little overlap for the separation gate to mean anything.
+        let limit = self.max_displacement();
+        if (best_top - self.pos.unwrap_or(best_top)).abs() > limit {
+            if crate::trace::edge_gate_trace_enabled() {
+                crate::trace_log!(
+                    "stitch: edge candidate {best_cost:.4}@{best_top} refused, displacement over {limit}"
+                );
+            }
+            return DecideOutcome::Reject(RejectReason::Ambiguous);
+        }
+        // The runner-up is the cheapest candidate outside the winner's basin.
+        //
+        // Skipping only `EDGE_ADJACENT_ROWS` rows finds the shoulder of the
+        // winner's own peak, not a rival: on a smooth cost surface the next few
+        // rows are always a little worse, which made `sep` look healthy even
+        // when a second, equally good answer existed. The basin is therefore
+        // widened, so a candidate one period away (a 235-row card grid) counts
+        // as the rival it actually is.
+        let basin = self.basin_rows();
         let second = costs
             .iter()
-            .find(|(_, top)| (top - best_top).abs() > EDGE_ADJACENT_ROWS)
+            .find(|(_, top)| (top - best_top).abs() > basin)
             .map(|(cost, _)| *cost);
+        // How many distinct places match about as well as the winner.
+        //
+        // This is the periodic-content guard. A card grid repeats every 235
+        // rows inside a 700-row viewport, so three offsets match at cost 0.000;
+        // the separation gate cannot see it because every other offset is much
+        // worse, so `sep` reads 1.000 while the answer is genuinely ambiguous.
+        // Counting equally-good places refuses those frames instead of picking
+        // one at random.
+        let mut rival_tops: Vec<i32> = Vec::new();
+        for (cost, top) in &costs {
+            if *cost > best_cost + EDGE_RIVAL_COST_MARGIN {
+                break;
+            }
+            if (top - best_top).abs() <= basin {
+                continue;
+            }
+            if rival_tops.iter().any(|kept| (kept - top).abs() <= basin) {
+                continue;
+            }
+            rival_tops.push(*top);
+        }
+        let equally_good_rivals = rival_tops.len();
         let mut sorted_costs: Vec<f64> = costs.iter().map(|(cost, _)| *cost).collect();
         sorted_costs.sort_by(|a, b| a.total_cmp(b));
         let median = sorted_costs[sorted_costs.len() / 2];
@@ -472,6 +540,17 @@ impl WindowedEdgeMatcher {
             Some(_) => 0.0,
             None => 0.0,
         };
+        if crate::trace::edge_gate_trace_enabled() {
+            crate::trace_log!(
+                "stitch: edge gate window={lo}..={hi} best={best_cost:.4}@{best_top} \
+                 second={second:?} rivals={equally_good_rivals} sep={separation:.3} \
+                 median={median:.4} best_over_median={:.3}",
+                if median > 0.0 { best_cost / median } else { f64::INFINITY }
+            );
+        }
+        if equally_good_rivals > 0 {
+            return DecideOutcome::Reject(RejectReason::Ambiguous);
+        }
         if separation < EDGE_MIN_SEPARATION {
             return DecideOutcome::Reject(RejectReason::Ambiguous);
         }
@@ -479,6 +558,19 @@ impl WindowedEdgeMatcher {
             return DecideOutcome::Reject(RejectReason::NoCandidate);
         }
         DecideOutcome::Accept { top: best_top, cost: best_cost }
+    }
+
+    fn basin_rows(&self) -> i32 {
+        // A peak is a few rows wide (a one-row shift multiplies the cost ~47x),
+        // so anything inside this is the same answer. Scaled with the frame so
+        // a large viewport does not treat its own peak as a rival.
+        (self.frame_rows as i32 / EDGE_BASIN_DIVISOR).max(EDGE_ADJACENT_ROWS)
+    }
+
+    fn max_displacement(&self) -> i32 {
+        let rows = self.frame_rows as i32;
+        (rows * EDGE_MAX_DISPLACEMENT_NUMERATOR / EDGE_MAX_DISPLACEMENT_DENOMINATOR)
+            .max(EDGE_IMPULSE_MIN_HALF_WIDTH)
     }
 
     fn impulse_half_width(&self) -> i32 {
