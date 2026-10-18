@@ -8,6 +8,11 @@ use crate::wayland::screencopy::CaptureOutputRegion;
 use crate::wayland::selection::LongDirection;
 
 const LONG_UI_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Frame-rate cap while the stitcher is refusing content. Every refused frame
+/// costs a full anchor-window scan, and the user's recovery (scrolling back) is
+/// a seconds-long action, so 5 fps captures it just as well as the configured
+/// rate at a sixth of the cost.
+const LONG_WARNING_FRAME_RATE: u32 = 5;
 /// Granularity of the capture-thread pacing sleep loop.
 const LONG_FRAME_PACE_SLEEP: Duration = Duration::from_millis(2);
 
@@ -169,6 +174,12 @@ fn prepare_capture_region(
 struct LongCaptureWorker {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set while the stitcher is refusing content. Capture keeps running so a
+    /// scroll back is noticed immediately, but at `LONG_WARNING_FRAME_RATE`
+    /// instead of the configured rate: every refused frame costs a full anchor
+    /// window scan, and the user's recovery is a seconds-long action that 5 fps
+    /// resolves just as well.
+    warning: std::sync::Arc<std::sync::atomic::AtomicBool>,
     receiver: mpsc::Receiver<CaptureMessage>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -177,11 +188,14 @@ impl LongCaptureWorker {
     fn start(initial_region: CaptureOutputRegion, max_frame_rate: u32) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let warning = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (sender, receiver) = mpsc::sync_channel::<CaptureMessage>(4);
         let thread_stop = std::sync::Arc::clone(&stop);
         let thread_paused = std::sync::Arc::clone(&paused);
+        let thread_warning = std::sync::Arc::clone(&warning);
         let output_name = initial_region.output_name;
-        let frame_interval = long_frame_interval(max_frame_rate);
+        let normal_interval = long_frame_interval(max_frame_rate);
+        let warning_interval = long_frame_interval(LONG_WARNING_FRAME_RATE);
         let thread = std::thread::spawn(move || {
             let mut session = match crate::wayland::screencopy::CaptureSession::new(output_name) {
                 Ok(s) => s,
@@ -199,6 +213,11 @@ impl LongCaptureWorker {
                     std::thread::sleep(Duration::from_millis(2));
                     continue;
                 }
+                let frame_interval = if thread_warning.load(std::sync::atomic::Ordering::Relaxed) {
+                    warning_interval
+                } else {
+                    normal_interval
+                };
                 if index > 0 {
                     if let Some(prev) = last {
                         while prev.elapsed() < frame_interval {
@@ -253,7 +272,7 @@ impl LongCaptureWorker {
             }
             let _ = sender.send(CaptureMessage::Finished);
         });
-        Self { stop, paused, receiver, thread: Some(thread) }
+        Self { stop, paused, warning, receiver, thread: Some(thread) }
     }
 
     /// Pauses or resumes frame capture. Paused while an edit-mode edge drag
@@ -261,6 +280,13 @@ impl LongCaptureWorker {
     /// the settled geometry.
     fn set_paused(&self, paused: bool) {
         self.paused.store(paused, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Switches the capture cadence between the configured rate and the
+    /// reduced warning rate. Never stops capturing: the recovery depends on
+    /// noticing that content overlaps the canvas again.
+    fn set_stitch_warning(&self, warning: bool) {
+        self.warning.store(warning, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn recv_timeout(&self, dur: Duration) -> Result<CaptureMessage, RecvTimeoutError> {
@@ -382,6 +408,30 @@ fn run_long_capture(
                         continue;
                     }
                 };
+                // The border is the only failure signal the user gets, so it is
+                // driven directly from the stitcher's decision: red while it is
+                // refusing, normal as soon as a frame is placed again. `Duplicate`
+                // is not a failure (nothing changed), so it leaves the border as
+                // it was rather than flapping.
+                match outcome {
+                    PushResult::Initialized | PushResult::Accepted { .. } => {
+                        worker.set_stitch_warning(false);
+                        let _ = selection_session.set_stitch_warning(false);
+                    }
+                    PushResult::NoMatch => {
+                        worker.set_stitch_warning(true);
+                        let _ = selection_session.set_stitch_warning(true);
+                        crate::trace_log!(
+                            "ui: stitch refused ({}), border red at {} fps",
+                            stitcher
+                                .last_reject_reason()
+                                .map(|reason| reason.as_str())
+                                .unwrap_or("unknown"),
+                            LONG_WARNING_FRAME_RATE
+                        );
+                    }
+                    PushResult::Duplicate => {}
+                }
                 if matches!(outcome, PushResult::Initialized | PushResult::Accepted { .. }) {
                     if let Some(s) = stitcher.stitched() {
                         if let Ok(image) = crate::stitch::image_from_stitched_frame(s) {
@@ -567,6 +617,23 @@ mod tests {
         assert_eq!(long_frame_interval(240), Duration::from_nanos(1_000_000_000 / 240));
         // Degenerate zero falls back to a 1 fps crawl instead of dividing by zero.
         assert_eq!(long_frame_interval(0), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn warning_frame_rate_is_a_sixth_of_the_default_cap() {
+        // The point of the reduced rate is cost, not responsiveness: a refused
+        // frame scans a whole anchor window, and the user's recovery is a
+        // seconds-long scroll. 5 fps against the 30 fps default keeps the
+        // recovery latency well under a scroll gesture at a sixth of the cost.
+        assert_eq!(LONG_WARNING_FRAME_RATE, 5);
+        assert_eq!(
+            long_frame_interval(LONG_WARNING_FRAME_RATE),
+            Duration::from_millis(200)
+        );
+        assert!(
+            long_frame_interval(LONG_WARNING_FRAME_RATE)
+                > long_frame_interval(crate::config::DEFAULT_MAX_FRAME_RATE)
+        );
     }
 
     #[test]

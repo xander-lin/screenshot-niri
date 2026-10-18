@@ -221,6 +221,11 @@ struct UiState {
     long_finish_requested: bool,
     long_direction: Option<SearchDirection>,
     long_preview: Option<LongPreviewSnapshot>,
+    /// Set while the stitcher is refusing frames: the new content could not be
+    /// placed, so the border turns red and the user is asked to scroll back.
+    /// Distinct from the spans-outputs warning, which is about the selection
+    /// itself rather than the stitch state.
+    stitch_warning: bool,
     pending_render: Option<bool>,
     /// Selection-box edit mode (toggled with E). While set, the four box
     /// edges have snap targets and can be dragged to resize the box.
@@ -300,6 +305,7 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
         long_finish_requested: false,
         long_direction: None,
             long_preview: None,
+            stitch_warning: false,
             pending_render: None,
         editing: false,
         edit_drag: None,
@@ -378,10 +384,14 @@ enum EditDrag {
     Move { offset_x: i32, offset_y: i32 },
 }
 
-/// Border color for the current selection: red warns that a long-mode
-/// selection spans outputs and cannot be captured as-is; white otherwise.
-fn selection_border_color(long_mode: bool, spans_outputs: bool) -> [u8; 4] {
-    if long_mode && spans_outputs {
+/// Border color for the current selection.
+///
+/// Red means "something needs your attention" and has two causes: a long-mode
+/// selection spanning outputs (cannot be captured as-is), or the stitcher
+/// refusing the current content (a jump it could not place). Both are states
+/// the user can act on; neither is a silent failure.
+fn selection_border_color(long_mode: bool, spans_outputs: bool, stitch_warning: bool) -> [u8; 4] {
+    if stitch_warning || (long_mode && spans_outputs) {
         OVERLAY_BORDER_RED_BGRA
     } else {
         OVERLAY_BORDER_WHITE_BGRA
@@ -397,7 +407,7 @@ fn selection_spans_outputs(state: &UiState, rect: LogicalRect) -> bool {
 /// spans-outputs warning.
 fn border_color_for_state(state: &UiState, rect: Option<LogicalRect>) -> [u8; 4] {
     let spans = rect.map_or(false, |rect| selection_spans_outputs(state, rect));
-    selection_border_color(state.long_mode, spans)
+    selection_border_color(state.long_mode, spans, state.stitch_warning)
 }
 
 /// Selection rectangle used for overlay rendering. During an edit-mode drag
@@ -637,6 +647,7 @@ impl SelectionSession {
             long_finish_requested: false,
             long_direction: None,
             long_preview: None,
+            stitch_warning: false,
             pending_render: None,
             editing: false,
             edit_drag: None,
@@ -792,6 +803,28 @@ impl SelectionSession {
 
     pub fn screenshot_cursor_hidden(&self) -> bool {
         self.state.screenshot_cursor_hidden
+    }
+
+    /// Turns the long-capture border red while the stitcher is refusing
+    /// content, and back to normal once it places a frame again.
+    ///
+    /// The preview is deliberately left alone: it keeps showing what has
+    /// already been stitched, so the warning reads as "new content is not being
+    /// added" rather than "your capture is gone".
+    pub fn set_stitch_warning(&mut self, warning: bool) -> Result<(), Box<dyn Error>> {
+        if self.state.stitch_warning == warning {
+            return Ok(());
+        }
+        self.state.stitch_warning = warning;
+        self.state.live_state_seq = self.state.live_state_seq.wrapping_add(1);
+        self.state.pending_render = Some(true);
+        render_live_overlays(&mut self.state, None);
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    pub fn stitch_warning(&self) -> bool {
+        self.state.stitch_warning
     }
 
     pub fn update_long_capture_preview(&mut self, snapshot: LongPreviewSnapshot) -> Result<(), Box<dyn Error>> {
@@ -2533,11 +2566,15 @@ mod tests {
 
     #[test]
     fn border_color_warns_red_only_for_long_mode_spanning_selections() {
-        assert_eq!(selection_border_color(true, true), OVERLAY_BORDER_RED_BGRA);
-        assert_eq!(selection_border_color(true, false), OVERLAY_BORDER_WHITE_BGRA);
+        assert_eq!(selection_border_color(true, true, false), OVERLAY_BORDER_RED_BGRA);
+        assert_eq!(selection_border_color(true, false, false), OVERLAY_BORDER_WHITE_BGRA);
         // Normal (non-long) screenshots may span outputs: always white.
-        assert_eq!(selection_border_color(false, true), OVERLAY_BORDER_WHITE_BGRA);
-        assert_eq!(selection_border_color(false, false), OVERLAY_BORDER_WHITE_BGRA);
+        assert_eq!(selection_border_color(false, true, false), OVERLAY_BORDER_WHITE_BGRA);
+        assert_eq!(selection_border_color(false, false, false), OVERLAY_BORDER_WHITE_BGRA);
+        // A stitch warning is red on its own: it is about the content, not
+        // about the selection geometry.
+        assert_eq!(selection_border_color(true, false, true), OVERLAY_BORDER_RED_BGRA);
+        assert_eq!(selection_border_color(false, false, true), OVERLAY_BORDER_RED_BGRA);
     }
 
     #[test]
@@ -2631,6 +2668,7 @@ mod tests {
             long_finish_requested: false,
             long_direction: None,
             long_preview: None,
+            stitch_warning: false,
             pending_render: None,
             editing: false,
             edit_drag: None,
