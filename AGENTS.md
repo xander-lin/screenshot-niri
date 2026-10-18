@@ -52,6 +52,7 @@
 - `src/wayland/selection.rs` → layer-shell overlay: frozen/dimmed selection UI, drag redraw, long-mode preview and status, pointer passthrough for capture.
 - `src/bin/capture-frames.rs` → 真实帧抓取工具：走与正式长截图相同的 overlay/`prepare_capture_clean`/`zwlr_screencopy_manager_v1` 路径，只抓帧存盘（`frame-NNNN.png` + `session.json`），不拼接、不判断。
 - `src/bin/replay-frames.rs` → 离线回放：喂给真实拼接器，同时用逐像素穷举给出相邻帧真值，并用「回投影到画布」+「与邻居位置连续性」两项独立判据判定错位。
+- `testdata/frames/` → 验收语料（PNG 50 MB，gitignore；`session.json` + `truth.tsv` + `README.md` 进 git）。`real-1` 是真实 screencopy 主语料，改动拼接器后必须跑：`./target/release/replay-frames --dir testdata/frames/real-1`，基线 204 接受 / 0 no-match / 0 错位。
 - `docs/hyprland-findings.md` → Hyprland 兼容性问题调研（三个问题的触发条件、上游源码证据、版本时间线、可做的规避、待实测清单）。
 - `docs/dms-stitch-comparison.md` → 与 DMS `dms screenshot scroll` 拼接算法的源码级对比 + 同输入实测（性能/鲁棒性差异、本实现缺陷清单与优先级）。
 - `docs/edge-stitch-design.md` → 边界位置 + 方向冲量 + 显式失败态的新拼接机制：设计、实验数据、以及**落地后重新实测**（§11：同语料静默错位 278→11、跳变 205→2、单帧 6.3 ms；含落地才暴露的两个缺陷）。
