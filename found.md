@@ -177,6 +177,19 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
 
 ---
 
+### 21. 「跳变 + 大量重复帧」是正常输入；无置信防护的快速分析会把好引擎误诊成坏引擎
+
+- **Context**：real-1 修复后仍剩三项未闭环异常：19 个高成本帧被写入画布、链漂移 -257px、2 帧 delta 与真值差 -160/-180。我用 python 对 21 个高成本帧做条带位移分析，得出「10 帧撕裂（条带位移差 54–250px）、写入即损伤」的结论，并开始设计「撕裂帧检测→拒绝」机制。用户指出：某些窗口的移动特性就是**跳变性**的（real-1 里 461 对相邻帧 348 对 delta=0，其余为 60–120px 档位跳动），重复帧多正是这个原因，且**全部可连接、不存在连不起来的帧**。
+- **已证事实**：给 replay-frames 加严格条带判据（每个被接受帧分 4 条带、独立在画布上定位、要求置信边际 + 完整落在画布内）后：**real-1 全部 204 帧的全部条带 0 位移**，六个语料全部 0。我此前的「10 帧撕裂」全部是测量噪声：低纹理条带的最佳位移是随机数。判据工具自身在此过程中暴露两个 bug：① 候选位置把条带推出画布时 `count==0` 返回 cost 0.0（「完美吻合」），末帧底部条带因此必然被标；② 骑在画布边缘的条带拿全条带和残条比较不对等。-257px 漂移定性为：跳变过渡帧（一帧内含两个滚动位置的混合）上，oracle 与引擎对「这帧位移是多少」这个**无定义问题**给出不同答案，任何帧都没有写错位置。
+- **Root cause**：两次都错在**判据先于结论**：第一次用无防护的裸匹配下结论（低纹理 → argmin 是噪声），第一次写判据时又踩了「空比较 = 完美」的地雷。内容本身没有错——错的是我把「高残差」直接当成了「撕裂」。
+- **Correction**：撤销「撕裂帧检测→拒绝」的设计方向；引擎不为跳变输入做任何改动（数据证明它已正确处理）。判据保留在 replay-frames（coverage / band / drift 三项 + 按语料中位数自适应的成对异常阈值）。
+- **Prevention**：
+  1. **对「看起来不对」的数据下结论前，判据本身要过三道关**：置信边际（最佳必须明显优于次优/原位）、完整重叠（比较双方必须可见同样多的像素）、否定对照（在已知干净的语料上必须报 0）。这次否定对照（CDP 语料）反而暴露了判据自己的两个 bug。
+  2. **cost/误差函数永远不应对空比较返回最优值**。`count==0 → return 0.0` 让「什么都看不见」击败「看见且吻合」，任何搜索都会被它劫持。
+  3. **重复帧多、位移跳变是正常输入形态**（滚轮档位、PDF 翻页、终端输出），不是缺陷信号；不要为它设计拒绝机制，除非带防护的判据显示真实损伤（这次是 0）。
+
+---
+
 ---
 
 ## Verification Memory
@@ -193,6 +206,7 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
 - **Direction + DMS head-to-head (2026-10-18)**: `docs/stitch-direction-and-dms.md`；方向消融（H/V/H+V 在正常网页等价，双方向在 tallgrid σ=10 时把 9/9 稀释到 0/9）+ DMS 原样接入同 harness 对比（720 帧：DMS 90 次静默跳变 / 2.55 ms；本设计 2 次 / 13.4 ms / 覆盖率 58.6% vs 55.9%）。结论：保留单方向（横向）；DMS 的 `seamAppend` 不借鉴。生产代码未改动。
 - **Red border recalibration (2026-10-18)**: real-browser corpus (headless Chrome, `Emulation.setDeviceMetricsOverride` 960x700 DPR 1, 98 scroll positions, `docs` page) replaced the synthetic one for threshold calibration. Old gates (`sep 0.80` / `bm 0.10`): 8 accepted / 89 refused / 0 misplaced. New gates (`sep 0.45` / `bm 0.28`): **97 accepted / 0 refused / 0 misplaced**, jumps still 0/12 wrongly accepted. Three defects found: thresholds calibrated on synthetic frames (see lesson 19), no per-frame displacement cap (630-row jumps accepted on 70 rows of evidence), and the runner-up definition measuring the winner's own shoulder instead of a rival peak (a 235-row card grid scored `sep = 1.000` while a candidate one period away matched at cost 0.000). Added `PushResult::Pending` with `REFUSAL_PATIENCE = 8` so a single ambiguous frame no longer turns the border red. Sub-pixel scrolling was investigated and **disproved**: at DPR 1 browsers quantise scroll positions to integer pixels.
 - **Hyprland findings (2026-10-12)**: `docs/hyprland-findings.md` records three Hyprland-side problems (wheel passthrough, missing cursor in cursor-requested frames, cursor not removable from region frames), each with triggers, upstream evidence, and what remains separately fixable on our side. Mechanisms are source-verified; none reproduced end-to-end on a live Hyprland session yet.
+- **Acceptance criteria hardened (2026-10-20)**: `replay-frames` gained coverage (no canvas row uncovered), band (no accepted frame's content displaced from its own top), chain-drift, and corpus-adaptive pairwise-outlier criteria; oracle/locate parallelised (real-1: 30 min → ~5 s). All six corpora clean — real-1: **204 accepted / 0 no-match / 0 misplaced / 0 uncovered / 0 displaced bands**. Verdict: jumpy scroll with heavy duplicates is handled correctly by the engine; no stitcher change made or needed (see lesson 21). Commits `e125c33`, `a749424`, `b618723`.
 
 ---
 

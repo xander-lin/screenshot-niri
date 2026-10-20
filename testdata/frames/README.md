@@ -46,18 +46,24 @@ cargo build --release --bins
 1. `delta differs from the pairwise truth` —— 恢复时把拒绝期间漏掉的位移一次补齐，**不是**错位
 2. `placements whose pixels do not fit the canvas` —— 回投影逐像素比对
 3. `placements far from their neighbours` —— 帧在画布中的真实行是否落在邻居的连续序列上
+4. `coverage check` —— 画布内不得存在没有任何被接受帧覆盖过的行（恢复跳变丢内容会在这里现形）
+5. `frames with displaced bands` —— 每个被接受帧分 4 条带独立定位，条带内容不得落在远离自己帧顶的位置（跳变过渡帧写错行会在这里现形）
+6. `chain drift` —— 引擎链与逐帧真值链的累计偏差；跳变过渡帧（一帧含两个滚动位置）上出现有限漂移是预期行为，只要条带判据为 0
 
 ## 当前基线
 
-| 语料 | 接受 | no-match | 错位 |
-|---|---|---|---|
-| `real-1` | 204 | 0 | 0 |
-| `mini` | 3 | 0 | 0 |
-| `real-long` | 97 | 0 | 0 |
-| `pipeline-test` | 7 | 0 | 0 |
-| `pipeline-bad` | 7 | 0 | 0（7 对 ambiguous，符合预期） |
+| 语料 | 接受 | no-match | 错位 | 未覆盖行 | 位移条带 |
+|---|---|---|---|---|---|
+| `real-1` | 204 | 0 | 0 | 0 | 0 |
+| `mini` | 3 | 0 | 0 | 0 | 0 |
+| `real-long` | 97 | 0 | 0 | 0 | 0 |
+| `real-scroll` | 8 | 0 | 0 | 0 | 0 |
+| `pipeline-test` | 7 | 0 | 0 | 0 | 0 |
+| `pipeline-bad` | 7 | 0 | 0 | 0 | 0（7 对 ambiguous，符合预期） |
 
 修复前 `real-1` 是 **2 接受 / 405 no-match / 1 错位**。任何一项退化都是回归。
+
+`real-1` 的输入形态是跳变滚动（461 对相邻帧中 348 对 delta=0，其余 60–120px 档位跳动）——重复帧多是正常现象，不是缺陷信号；引擎按设计去重并全部连上。
 
 ## 重建
 
