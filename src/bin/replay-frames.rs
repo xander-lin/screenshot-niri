@@ -73,12 +73,20 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut refused = 0u32;
     let mut duplicate = 0u32;
     let mut misplaced = 0u32;
+    let mut uncovered = 0u32;
     let mut oracle_failed = 0u32;
     let mut ambiguous_pairs = 0u32;
     let mut delta_mismatch = 0u32;
     let mut canvas_top = 0i32;
     let mut worst: Vec<(u32, i32)> = Vec::new();
     let mut placements: Vec<(usize, i32)> = Vec::new();
+    let mut blended_pair_costs: Vec<(usize, f64)> = Vec::new();
+    let mut pair_costs: Vec<f64> = Vec::new();
+    // Where the canvas top should be if it had followed the pairwise truth at
+    // every step, and the largest gap between that chain and the engine's.
+    let mut expected_top = 0i32;
+    let mut max_drift: (usize, i32) = (0, 0);
+    let mut final_drift: Option<i32> = None;
 
     let first = load_image(&frames[0].path)?;
     stitcher.push_frame_with_offset(
@@ -88,6 +96,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         frames[0].offset,
     )?;
     let mut previous = first;
+    if let Some(top) = stitcher.last_engine_top() {
+        expected_top = top;
+    }
 
     println!(
         "\n{:>4} {:>9} {:>9} {:>7} {:>7} {:>8}  {}",
@@ -110,6 +121,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         if oracle_ambiguous {
             ambiguous_pairs += 1;
         }
+        // The truth chain advances on every pair, accepted or not: content the
+        // engine skipped still scrolled, and the drift below has to account
+        // for it or a recovery jump would look like steady-state error.
+        if oracle_delta != i32::MIN {
+            expected_top += oracle_delta;
+        }
+        if let Some(o) = &oracle {
+            pair_costs.push(o.cost);
+        }
 
         let outcome = stitcher.push_frame_with_offset(
             &ImageRgbView::new(&image)?,
@@ -126,6 +146,16 @@ fn run() -> Result<(), Box<dyn Error>> {
                 frame_delta = Some(match_info.delta_y);
                 if let Some(top) = stitcher.last_engine_top() {
                     placements.push((i, top));
+                    let drift = top - expected_top;
+                    if drift.abs() > max_drift.1.abs() {
+                        max_drift = (i, drift);
+                    }
+                }
+                // Candidate blend frame that was written anyway: the position
+                // may be right, but smeared pixels baked into the output are
+                // not. Judged against the corpus-adaptive threshold below.
+                if let Some(o) = oracle.as_ref() {
+                    blended_pair_costs.push((i, o.cost));
                 }
                 let err = if oracle_delta == i32::MIN {
                     i32::MIN
@@ -214,6 +244,20 @@ fn run() -> Result<(), Box<dyn Error>> {
         previous = image;
     }
 
+    // Blend threshold. On the screencopy corpus sharp pairs cost ~0.05 and
+    // blends stand out above 1.0, but corpora with larger scroll steps (the
+    // CDP sets) cost 1.2-2.5 on every pair — a constant there would brand
+    // every frame a blend. Calibrate against the corpus median so the counter
+    // means "an outlier for this corpus", never "above an absolute bar".
+    let mut sorted_costs = pair_costs.clone();
+    sorted_costs.sort_by(|a, b| a.total_cmp(b));
+    let median_cost = sorted_costs.get(sorted_costs.len() / 2).copied().unwrap_or(0.0);
+    let blend_threshold = (4.0 * median_cost).max(ORACLE_BLEND_COST);
+    let blended_written = blended_pair_costs
+        .iter()
+        .filter(|(_, cost)| *cost > blend_threshold)
+        .count() as u32;
+
     // Verify every accepted placement against the pixels: re-project the frame
     // onto the canvas it was placed in and measure how well it fits.
     if !placements.is_empty() {
@@ -282,6 +326,44 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    // Coverage: within the stitched extent, every row must be fully covered.
+    // A recovery jump that outruns every later frame leaves rows that no
+    // accepted frame ever contained — permanent transparent strips in the
+    // final PNG. `row_coverage` records the filled extent per canvas row.
+    if let Some(stitched) = stitcher.stitched() {
+        if stitched.row_coverage.is_empty() {
+            println!("\ncoverage check: all rows fully covered");
+        } else {
+            let width = stitched.width;
+            let mut holes = 0u32;
+            let mut hole_ranges: Vec<(u32, u32)> = Vec::new();
+            let mut partial = 0u32;
+            for (y, &(start, end)) in stitched.row_coverage.iter().enumerate() {
+                if start >= end {
+                    holes += 1;
+                    match hole_ranges.last_mut() {
+                        Some((_, last)) if *last + 1 == y as u32 => *last = y as u32,
+                        _ => hole_ranges.push((y as u32, y as u32)),
+                    }
+                } else if start > 0 || end < width {
+                    partial += 1;
+                }
+            }
+            println!(
+                "\ncoverage check: {} canvas rows",
+                stitched.row_coverage.len()
+            );
+            println!("  UNCOVERED rows inside the canvas: {holes}");
+            for (lo, hi) in hole_ranges.iter().take(10) {
+                println!("    rows {lo}..={hi}");
+            }
+            println!(
+                "  partially covered rows: {partial}  (expected only for T/L captures)"
+            );
+            uncovered = holes;
+        }
+    }
+
     if let Some(path) = save.as_ref() {
         if let Some(stitched) = stitcher.stitched() {
             let image = Image {
@@ -302,6 +384,15 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!("  no-match  {refused}");
     println!("  duplicate {duplicate}");
     println!("  MISPLACED {misplaced}  (frame pixels do not match the canvas where they were put)");
+    println!("  UNCOVERED {uncovered}  (canvas rows no accepted frame ever contained)");
+    println!("  blended frames written to the canvas {blended_written}  (pairwise cost > {blend_threshold:.2}; smeared pixels baked into the output)");
+    if let Some(top) = stitcher.last_engine_top() {
+        final_drift = Some(top - expected_top);
+        println!(
+            "  chain drift vs truth: max {} px at frame {}, final {} px",
+            max_drift.1, max_drift.0, final_drift.unwrap_or(0)
+        );
+    }
     println!("  delta differs from the pairwise truth {delta_mismatch}  (a recovery gap, not a misplacement)");
     println!("  ambiguous pairs {ambiguous_pairs}  (content matched at several offsets)");
     if oracle_failed > 0 {
@@ -314,6 +405,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Pairwise cost above which the oracle calls a frame a blurred blend of two
+/// scroll positions (the same convention as truth.tsv). Writing such a frame
+/// bakes the smear into the output even when its position is right.
+const ORACLE_BLEND_COST: f64 = 1.0;
 /// Number of worker threads used by the exhaustive searches.
 ///
 /// These are the only two places in this tool that do real work per candidate
