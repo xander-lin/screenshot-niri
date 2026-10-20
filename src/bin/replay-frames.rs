@@ -74,6 +74,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut duplicate = 0u32;
     let mut misplaced = 0u32;
     let mut uncovered = 0u32;
+    let mut torn_written = 0u32;
     let mut oracle_failed = 0u32;
     let mut ambiguous_pairs = 0u32;
     let mut delta_mismatch = 0u32;
@@ -311,6 +312,96 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .collect();
             let jumps = find_isolation(&located);
 
+            // Check 3: band consistency. A frame captured mid-jump — part of
+            // the buffer at the old position, part at the new one — has no
+            // single placement, and whatever rows it writes land displaced
+            // from its own top. Locate each horizontal band independently and
+            // compare with the claimed row. Bands that fit nowhere are not
+            // evidence (low texture fits nothing tightly); a band that fits
+            // well *elsewhere* is content the canvas holds at the wrong rows.
+            let band_work: Vec<(usize, i32, i32, i32)> = {
+                let mut work = Vec::new();
+                for (k, (_, claimed, image, _)) in loaded.iter().enumerate() {
+                    let height = image.height as i32;
+                    let band = (height + BAND_COUNT - 1) / BAND_COUNT;
+                    for b in 0..BAND_COUNT {
+                        let lo = (b * band).min(height);
+                        let hi = ((b + 1) * band).min(height);
+                        // Only bands that sit fully inside the canvas can be
+                        // judged: a band straddling the top or bottom edge has
+                        // its at-claimed cost computed on a sliver, and any
+                        // "better fit elsewhere" is an artifact of comparing a
+                        // full band against a fragment.
+                        if hi - lo > 8
+                            && claimed + lo >= 0
+                            && claimed + hi <= canvas.height as i32
+                        {
+                            work.push((k, *claimed, lo, hi));
+                        }
+                    }
+                }
+                work
+            };
+            let parts = split_range(0, band_work.len() as i32 - 1, worker_count());
+            let displaced: Vec<(usize, i32, i32)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = parts
+                    .iter()
+                    .map(|&(lo, hi)| {
+                        let band_work = &band_work;
+                        let loaded = &loaded;
+                        let canvas = &canvas;
+                        scope.spawn(move || {
+                            let mut local = Vec::new();
+                            for idx in lo..=hi {
+                                let (k, claimed, blo, bhi) = band_work[idx as usize];
+                                let (_, _, image, lum) = &loaded[k];
+                                let at_claimed =
+                                    reprojection_band_cost(&canvas, image, lum, claimed, blo, bhi);
+                                let mut best: Option<(i32, f64)> = None;
+                                for offset in -BAND_WINDOW..=BAND_WINDOW {
+                                    let top = claimed + offset;
+                                    // Only candidates keeping the band fully on
+                                    // the canvas are comparable: outside it the
+                                    // cost function would see no pixels at all
+                                    // and report a perfect fit.
+                                    if top + blo < 0 || top + bhi > canvas.height as i32 {
+                                        continue;
+                                    }
+                                    let cost = reprojection_band_cost(
+                                        &canvas, image, lum, top, blo, bhi,
+                                    );
+                                    if best.map_or(true, |(_, c)| cost < c) {
+                                        best = Some((offset, cost));
+                                    }
+                                }
+                                if let Some((offset, cost)) = best {
+                                    if cost < BAND_FOUND_COST
+                                        && cost + BAND_MARGIN < at_claimed
+                                        && offset.abs() > BAND_TOLERANCE
+                                    {
+                                        local.push((k, blo, offset));
+                                    }
+                                }
+                            }
+                            local
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().expect("band worker panicked"))
+                    .collect::<Vec<_>>()
+            });
+            let mut by_frame: Vec<(usize, Vec<(i32, i32)>)> = Vec::new();
+            for (k, blo, offset) in displaced {
+                let frame = loaded[k].0;
+                match by_frame.last_mut() {
+                    Some((f, list)) if *f == frame => list.push((blo, offset)),
+                    _ => by_frame.push((frame, vec![(blo, offset)])),
+                }
+            }
+            torn_written = by_frame.len() as u32;
+
             println!("\nreprojection check: {} accepted frames ({:?})", placements.len(), started.elapsed());
             println!("  placements whose pixels do not fit the canvas: {}", bad.len());
             for (i, top, cost) in bad.iter().take(20) {
@@ -321,6 +412,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                 println!(
                     "    frame {i} at canvas row {row}, but its neighbours are around {claimed}: gap {gap}"
                 );
+            }
+            println!(
+                "  frames with bands displaced from their own top: {}  (jump-transition content written at wrong rows)",
+                by_frame.len()
+            );
+            for (frame, list) in by_frame.iter().take(20) {
+                let offsets: Vec<String> = list
+                    .iter()
+                    .map(|(blo, off)| format!("row {blo}: {off:+}"))
+                    .collect();
+                println!("    frame {frame}: {}", offsets.join(", "));
             }
             misplaced = misplaced.saturating_add(jumps.len() as u32);
         }
@@ -384,8 +486,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!("  no-match  {refused}");
     println!("  duplicate {duplicate}");
     println!("  MISPLACED {misplaced}  (frame pixels do not match the canvas where they were put)");
+    println!("  frames with displaced bands {torn_written}  (jump-transition frames whose content sits rows away from their own top)");
     println!("  UNCOVERED {uncovered}  (canvas rows no accepted frame ever contained)");
-    println!("  blended frames written to the canvas {blended_written}  (pairwise cost > {blend_threshold:.2}; smeared pixels baked into the output)");
+    println!("  pairwise-outlier frames written {blended_written}  (cost > {blend_threshold:.2}; whether their rows land correctly is decided by the band criterion)");
     if let Some(top) = stitcher.last_engine_top() {
         final_drift = Some(top - expected_top);
         println!(
@@ -675,11 +778,26 @@ fn reprojection_cost(
     frame_lum: &[u8],
     top: i32,
 ) -> f64 {
+    reprojection_band_cost(canvas, frame, frame_lum, top, 0, frame.height as i32)
+}
+
+/// Same as `reprojection_cost`, restricted to frame rows `[lo, hi)`. Band-level
+/// comparison is what exposes a torn write: a frame captured mid-scroll whose
+/// top and bottom halves sit at different scroll positions.
+#[allow(clippy::too_many_arguments)]
+fn reprojection_band_cost(
+    canvas: &CanvasLuma,
+    frame: &Image,
+    frame_lum: &[u8],
+    top: i32,
+    lo: i32,
+    hi: i32,
+) -> f64 {
     let width = frame.width.min(canvas.width);
     let mut sum = 0u64;
     let mut count = 0u64;
-    for row in 0..frame.height {
-        let canvas_row = top + row as i32;
+    for row in lo.max(0)..hi.min(frame.height as i32) {
+        let canvas_row = top + row;
         if canvas_row < 0 || canvas_row >= canvas.height as i32 {
             continue;
         }
@@ -845,6 +963,18 @@ const REPROJECTION_MAX_COST: f64 = 2.0;
 /// best fit anywhere. Blurred frames never fit tightly; comparing against their
 /// own floor keeps the check about *where* the frame went, not how sharp it is.
 const REPROJECTION_MARGIN: f64 = 2.0;
+/// Frames are split into this many horizontal bands for the band check.
+const BAND_COUNT: i32 = 4;
+/// A band found this far from its frame's own top is displaced, not jitter.
+const BAND_TOLERANCE: i32 = 24;
+/// How far around the claimed row a band is searched. Jump-transition frames
+/// in the corpora displace bands by up to ~250 rows.
+const BAND_WINDOW: i32 = 300;
+/// Below this a band counts as found; above it the band fits nothing tightly
+/// (low texture) and is not evidence of anything.
+const BAND_FOUND_COST: f64 = 1.0;
+/// How much better a band must fit elsewhere before displacement counts.
+const BAND_MARGIN: f64 = 1.0;
 
 /// Converts the stitched RGB canvas into the BGRA layout `write_png` expects.
 fn rgba_from_rgb(stitched: &screenshot_rs_rebuild::stitch::StitchedFrame) -> Vec<u8> {
