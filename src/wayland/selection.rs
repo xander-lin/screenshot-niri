@@ -55,8 +55,11 @@ const MIN_SELECTION_SIZE: i32 = 8;
 const OVERLAY_OUTSIDE_MASK_BGRA: [u8; 4] = [0, 0, 0, 110];
 const OVERLAY_SELECTED_TRANSPARENT_BGRA: [u8; 4] = [0, 0, 0, 0];
 const OVERLAY_BORDER_WHITE_BGRA: [u8; 4] = [255, 255, 255, 255];
-/// Warning border for long-mode selections spanning more than one output.
-const OVERLAY_BORDER_RED_BGRA: [u8; 4] = [0, 0, 255, 255];
+/// Warning border: white mixed into red (50/50). Used for a selection the
+/// pointer is dragging across outputs and for stitcher refusals — lighter
+/// than pure red so it reads as "attention", distinct from the plain white
+/// selection border at any background brightness.
+const OVERLAY_BORDER_WHITE_RED_BGRA: [u8; 4] = [128, 128, 255, 255];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectionOutcome {
@@ -231,10 +234,6 @@ struct UiState {
     /// edges have snap targets and can be dragged to resize the box.
     editing: bool,
     edit_drag: Option<EditDrag>,
-    /// Union of every rectangle the current edit drag has passed through.
-    /// While `edit_drag` is active this union excludes the preview from the
-    /// drag trajectory. The visible border follows the current box instead.
-    edit_union: Option<LogicalRect>,
     /// Selection excluded from preview until the pending capture completes.
     capture_pending: Option<LogicalRect>,
     /// Sticky until completion: edits may return to the original rectangle.
@@ -309,7 +308,6 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
             pending_render: None,
         editing: false,
         edit_drag: None,
-        edit_union: None,
         capture_pending: None,
         capture_invalid: false,
         selection_anchor: None,
@@ -386,13 +384,16 @@ enum EditDrag {
 
 /// Border color for the current selection.
 ///
-/// Red means "something needs your attention" and has two causes: a long-mode
-/// selection spanning outputs (cannot be captured as-is), or the stitcher
-/// refusing the current content (a jump it could not place). Both are states
-/// the user can act on; neither is a silent failure.
-fn selection_border_color(long_mode: bool, spans_outputs: bool, stitch_warning: bool) -> [u8; 4] {
-    if stitch_warning || (long_mode && spans_outputs) {
-        OVERLAY_BORDER_RED_BGRA
+/// White-red means "attention" and has three causes: the pointer is dragging
+/// the selection across outputs (live feedback — the border flips the moment
+/// the rect leaves the output where the drag began, and flips back on release:
+/// a settled normal-mode selection may legitimately span outputs because
+/// capture composites the pieces), a long-mode selection spans outputs
+/// (release clamps it to one output), or the stitcher is refusing the current
+/// content. None are silent failures.
+fn selection_border_color(spans_warning: bool, stitch_warning: bool) -> [u8; 4] {
+    if stitch_warning || spans_warning {
+        OVERLAY_BORDER_WHITE_RED_BGRA
     } else {
         OVERLAY_BORDER_WHITE_BGRA
     }
@@ -403,24 +404,40 @@ fn selection_spans_outputs(state: &UiState, rect: LogicalRect) -> bool {
     crate::geometry::rect_spans_outputs(rect, &infos)
 }
 
-/// Border color for the live selection, honoring the long-mode
-/// spans-outputs warning.
+/// Border color for the live selection, honoring the spans-outputs warning.
 fn border_color_for_state(state: &UiState, rect: Option<LogicalRect>) -> [u8; 4] {
     let spans = rect.map_or(false, |rect| selection_spans_outputs(state, rect));
-    selection_border_color(state.long_mode, spans, state.stitch_warning)
+    border_color_for(rect, spans, state.drag, state.edit_drag.is_some(), state.long_mode, state.stitch_warning)
 }
 
-/// Selection rectangle used for overlay rendering. During an edit-mode drag
-/// the overlay hole becomes the union of every rectangle the drag has passed
-/// through: the capture region of an in-flight capture is derived from the
-/// pre-drag rectangle. Border pixels may enter that hole during editing;
-/// those frames are invalidated before they can reach the stitcher.
+/// The colour decision, independent of Wayland state so it can be tested.
+///
+/// A spanning selection warns while the user can still act on it: during the
+/// drag that created it, during an edit drag, and in long mode (which cannot
+/// capture across outputs). Once released in normal mode the warning clears —
+/// that capture is composited from per-output pieces and is valid.
+fn border_color_for(
+    rect: Option<LogicalRect>,
+    spans: bool,
+    drag: DragState,
+    edit_drag: bool,
+    long_mode: bool,
+    stitch_warning: bool,
+) -> [u8; 4] {
+    let dragging = matches!(drag, DragState::Dragging { .. }) || edit_drag;
+    selection_border_color(rect.is_some() && spans && (dragging || long_mode), stitch_warning)
+}
+
+/// Selection rectangle used for overlay rendering: the current box united
+/// with the region of an in-flight capture, so the hole always covers what
+/// a pending frame was prepared from. The dim tracks the box live in both
+/// directions — during an edit drag the border and the dim edge move
+/// together, so shrinking animates as smoothly as enlarging. Correctness of
+/// captured frames is not trusted to the hole: captures pause while an edit
+/// drag is in progress, and any frame exposed to changed geometry is
+/// invalidated before it can reach the stitcher.
 fn ui_render_selection(state: &UiState) -> Option<LogicalRect> {
-    let current = if state.edit_drag.is_some() {
-        state.edit_union.or_else(|| state.drag.current_rect())
-    } else {
-        state.drag.current_rect()
-    };
+    let current = state.drag.current_rect();
     match (current, state.capture_pending) {
         (Some(current), Some(pending)) => Some(rect_union(current, pending)),
         (current, pending) => current.or(pending),
@@ -436,6 +453,17 @@ fn ui_render_border(state: &UiState) -> bool {
 fn invalidate_changed_capture(state: &mut UiState) {
     if state.capture_pending.is_some_and(|pending| state.drag.current_rect() != Some(pending)) {
         state.capture_invalid = true;
+    }
+}
+
+/// During an edit drag, a pending capture prepared from a different rectangle
+/// is already invalid (sticky, see `invalidate_changed_capture`); drop its
+/// region so the hole and the dim edge follow the current box immediately.
+/// Without this the hole stays at the widest point of the drag and shrinking
+/// looks like the border slides while the dim lags behind.
+fn drop_invalid_pending(state: &mut UiState) {
+    if state.capture_pending.is_some() && state.capture_pending != state.drag.current_rect() {
+        state.capture_pending = None;
     }
 }
 
@@ -651,7 +679,6 @@ impl SelectionSession {
             pending_render: None,
             editing: false,
             edit_drag: None,
-            edit_union: None,
             capture_pending: None,
             capture_invalid: false,
             selection_anchor: None,
@@ -737,7 +764,6 @@ impl SelectionSession {
         self.state.long_preview = None;
         self.state.editing = false;
         self.state.edit_drag = None;
-        self.state.edit_union = None;
         self.state.capture_pending = None;
         self.state.capture_invalid = false;
         // Long capture is single-screen: from here on, rendering and the
@@ -1152,6 +1178,21 @@ fn invalidate_overlay_bases(state: &mut UiState) {
     }
 }
 
+/// Abandons the frozen screen images and switches every overlay to the live
+/// render path, so the real screen shows through the selection hole
+/// immediately. Called when long capture is requested: the user pressed L to
+/// capture live content, and a frozen frame must not survive into the handover.
+fn drop_frozen_bases(state: &mut UiState) {
+    state.frozen_outputs.clear();
+    state.frozen_outputs_without_cursor.clear();
+    for overlay in &mut state.overlays {
+        overlay.render_cache = None;
+        overlay.base_pixels = None;
+        overlay.base_key = None;
+    }
+    queue_render(state, true);
+}
+
 fn digit_key_index(key: u32) -> Option<usize> {
     if (KEY_DIGIT_FIRST..=KEY_DIGIT_LAST).contains(&key) {
         Some((key - KEY_DIGIT_FIRST) as usize)
@@ -1253,6 +1294,12 @@ fn apply_key_action(state: &mut UiState, action: KeyAction) -> Option<OverlayInp
                     state.drag = DragState::Finished(clamped);
                 }
             }
+            // Drop the frozen images on the key press itself, not when the
+            // long-capture session starts. Until this point the overlays show
+            // a frozen frame; the user pressed L to capture live content and
+            // should see the real screen (through the selection hole) at once,
+            // with no frozen frame lingering during the session handover.
+            drop_frozen_bases(state);
             None
         }
         KeyAction::ToggleCursorFrame => {
@@ -1433,6 +1480,10 @@ fn render_overlays(state: &mut UiState) -> usize {
     let mut committed = 0;
     let rect = ui_render_selection(state);
     let border_width = state.border_width;
+    // The frozen path must honour the same spans/stall warning colour as the
+    // live path; it used to hardcode white, which is why a drag across outputs
+    // kept the plain border until long mode started.
+    let border = border_color_for_state(state, state.drag.current_rect());
     for overlay in &mut state.overlays {
         // Live overlays always use the same compositor, including edit/input
         // redraws; the frozen-image dirty-region path is normal-mode only.
@@ -1459,9 +1510,9 @@ fn render_overlays(state: &mut UiState) -> usize {
             continue;
         };
         if buffer.initialized {
-            draw_overlay_region(data, render_cache, output.info, rect, damage, border_width);
+            draw_overlay_region(data, render_cache, output.info, rect, damage, border_width, border);
         } else {
-            draw_overlay(data, render_cache, output.info, rect, border_width);
+            draw_overlay(data, render_cache, output.info, rect, border_width, border);
             buffer.initialized = true;
         }
         buffer.last_selected = current_selected;
@@ -1567,7 +1618,7 @@ fn build_overlay_render_cache(width: i32, height: i32, output: OutputInfo, froze
 }
 
 fn composited_overlay_pixel(base: [u8; 4], global_x: i32, global_y: i32, selected: Option<LogicalRect>, border_width: i32) -> [u8; 4] {
-    let overlay = overlay_pixel(global_x, global_y, selected, border_width);
+    let overlay = overlay_pixel(global_x, global_y, selected, border_width, OVERLAY_BORDER_WHITE_BGRA);
     let alpha = overlay[3] as u32;
     if alpha == 0 {
         return base;
@@ -1584,18 +1635,18 @@ fn composited_overlay_pixel(base: [u8; 4], global_x: i32, global_y: i32, selecte
     ]
 }
 
-fn draw_overlay(data: &mut [u8], cache: &OverlayRenderCache, output: OutputInfo, selected: Option<LogicalRect>, border_width: i32) {
-    draw_overlay_region(data, cache, output, selected, LogicalRect { x: 0, y: 0, width: cache.width, height: cache.height }, border_width);
+fn draw_overlay(data: &mut [u8], cache: &OverlayRenderCache, output: OutputInfo, selected: Option<LogicalRect>, border_width: i32, border: [u8; 4]) {
+    draw_overlay_region(data, cache, output, selected, LogicalRect { x: 0, y: 0, width: cache.width, height: cache.height }, border_width, border);
 }
 
-fn draw_overlay_region(data: &mut [u8], cache: &OverlayRenderCache, output: OutputInfo, selected: Option<LogicalRect>, dirty: LogicalRect, border_width: i32) {
+fn draw_overlay_region(data: &mut [u8], cache: &OverlayRenderCache, output: OutputInfo, selected: Option<LogicalRect>, dirty: LogicalRect, border_width: i32, border: [u8; 4]) {
     let width = cache.width.max(0) as usize;
     for local_y in dirty.y as usize..dirty.bottom() as usize {
         for local_x in dirty.x as usize..dirty.right() as usize {
             let global_x = output.logical.x + local_x as i32;
             let global_y = output.logical.y + local_y as i32;
             let offset = (local_y * width + local_x) * 4;
-            let source = match overlay_pixel(global_x, global_y, selected, border_width) {
+            let source = match overlay_pixel(global_x, global_y, selected, border_width, border) {
                 OVERLAY_SELECTED_TRANSPARENT_BGRA => &cache.base,
                 OVERLAY_OUTSIDE_MASK_BGRA => &cache.dimmed,
                 border => {
@@ -1608,11 +1659,11 @@ fn draw_overlay_region(data: &mut [u8], cache: &OverlayRenderCache, output: Outp
     }
 }
 
-fn overlay_pixel(global_x: i32, global_y: i32, selected: Option<LogicalRect>, border_width: i32) -> [u8; 4] {
+fn overlay_pixel(global_x: i32, global_y: i32, selected: Option<LogicalRect>, border_width: i32, border: [u8; 4]) -> [u8; 4] {
     let Some(rect) = selected else {
         return OVERLAY_OUTSIDE_MASK_BGRA;
     };
-    if let Some(border) = selection_border_pixel(global_x, global_y, rect, border_width, OVERLAY_BORDER_WHITE_BGRA) {
+    if let Some(border) = selection_border_pixel(global_x, global_y, rect, border_width, border) {
         return border;
     }
     if global_x < rect.x || global_x >= rect.right() || global_y < rect.y || global_y >= rect.bottom() {
@@ -1913,13 +1964,13 @@ impl Dispatch<WlPointer, ()> for UiState {
                                 *current = updated;
                             }
                             invalidate_changed_capture(state);
-                            // Keep the preview out of the drag trajectory.
-                            // The current border remains visible; the pending
-                            // frame has already been invalidated above.
-                            state.edit_union = Some(match state.edit_union {
-                                Some(union) => rect_union(union, updated),
-                                None => updated,
-                            });
+                            // An in-flight frame prepared from a different
+                            // rectangle is already invalid, so its region does
+                            // not need to stay in the hole. Dropping it here is
+                            // what lets the dim edge follow the box when the
+                            // user shrinks: keeping the old region would hold
+                            // the hole at the widest point of the drag.
+                            drop_invalid_pending(state);
                             invalidate_overlay_bases(state);
                             queue_render(state, false);
                         }
@@ -1950,7 +2001,6 @@ impl Dispatch<WlPointer, ()> for UiState {
                                             .intersection(LogicalRect { x, y, width: 1, height: 1 })
                                             .map(|_| EditDrag::Move { offset_x: x - rect.x, offset_y: y - rect.y }))
                                 });
-                            state.edit_union = state.drag.selected_rect();
                         } else if !state.editing {
                             state.drag.begin(x, y);
                             state.selection_anchor = Some((x, y));
@@ -1958,10 +2008,9 @@ impl Dispatch<WlPointer, ()> for UiState {
                     }
                     wl_pointer::ButtonState::Released => {
                         if state.edit_drag.take().is_some() {
-                            // Finished one edit drag; stay in edit mode. The
-                            // trajectory can be discarded, but capture_pending
-                            // retains the old hole until the worker completes.
-                            state.edit_union = None;
+                            // Finished one edit drag; stay in edit mode.
+                            // capture_pending retains the old hole until the
+                            // worker completes.
                             invalidate_overlay_bases(state);
                         } else if !state.editing {
                             state.drag.finish(x, y);
@@ -2383,7 +2432,7 @@ mod tests {
             let mut state = ui_state();
             state.capture_pending = Some(original);
             state.drag = DragState::Finished(settled);
-            // Release cleared edit_drag/edit_union, but the capture is still pending.
+            // Release cleared edit_drag, but the capture is still pending.
             invalidate_changed_capture(&mut state);
             assert!(state.capture_invalid);
             assert!(ui_render_border(&state));
@@ -2426,7 +2475,7 @@ mod tests {
         draw_live_base(&mut base, 100, 100, Some(hole));
         // Reuse the same border-free cache while preview, border color,
         // thickness, and visibility change between renders.
-        for (color, thickness) in [(OVERLAY_BORDER_WHITE_BGRA, 3), (OVERLAY_BORDER_RED_BGRA, 5)] {
+        for (color, thickness) in [(OVERLAY_BORDER_WHITE_BGRA, 3), (OVERLAY_BORDER_WHITE_RED_BGRA, 5)] {
             let preview_color = [40, 80, 120, 255];
             let preview = LongPreviewSnapshot {
                 image: solid_image(100, 100, &[(0, 100, preview_color)]),
@@ -2472,7 +2521,7 @@ mod tests {
             let cache = build_overlay_render_cache(100, 100, output, &frozen, thickness);
             let mut normal = vec![0; 100 * 100 * 4];
             let mut live = normal.clone();
-            draw_overlay(&mut normal, &cache, output, Some(rect), thickness);
+            draw_overlay(&mut normal, &cache, output, Some(rect), thickness, OVERLAY_BORDER_WHITE_BGRA);
             draw_overlay_dim_with_selection(&mut live, 100, 100, output, Some(rect), thickness, OVERLAY_BORDER_WHITE_BGRA, true);
             for y in 0..100 {
                 for x in 0..100 {
@@ -2500,45 +2549,92 @@ mod tests {
         let frozen = frozen_test_output(output, 100, 100, [20, 30, 40, 255]);
         let cache = build_overlay_render_cache(100, 100, output, &frozen, 16);
         let mut data = vec![0; 100 * 100 * 4];
-        draw_overlay(&mut data, &cache, output, Some(old), 16);
+        draw_overlay(&mut data, &cache, output, Some(old), 16, OVERLAY_BORDER_WHITE_BGRA);
         let dirty = dirty_selected_region(Some(border_bounds(old, 16)), Some(border_bounds(new, 16)), 100, 100).unwrap();
-        draw_overlay_region(&mut data, &cache, output, Some(new), dirty, 16);
+        draw_overlay_region(&mut data, &cache, output, Some(new), dirty, 16, OVERLAY_BORDER_WHITE_BGRA);
         let mut expected = vec![0; data.len()];
-        draw_overlay(&mut expected, &cache, output, Some(new), 16);
+        draw_overlay(&mut expected, &cache, output, Some(new), 16, OVERLAY_BORDER_WHITE_BGRA);
         assert_eq!(data, expected);
     }
 
     #[test]
-    fn render_selection_uses_union_only_while_edit_drag_is_active() {
+    fn render_selection_follows_the_box_in_both_directions() {
         let mut state = ui_state();
         state.drag = DragState::Finished(SELECTED);
         // No drag in progress: the render selection is the live rectangle.
         assert_eq!(ui_render_selection(&state), Some(SELECTED));
         assert!(ui_render_border(&state));
-        // During an edit drag the hole expands, but the border follows the box.
+
+        // During an edit drag the hole is the *current* box, never a union of
+        // the trajectory: shrinking must move the dim edge immediately, or the
+        // border slides while the dim stays behind (the reported stutter).
         state.edit_drag = Some(EditDrag::Move { offset_x: 1, offset_y: 1 });
-        state.edit_union = Some(LogicalRect { x: 0, y: 0, width: 90, height: 90 });
-        assert_eq!(ui_render_selection(&state), Some(LogicalRect { x: 0, y: 0, width: 90, height: 90 }));
+        let shrunk = LogicalRect { x: 20, y: 20, width: 30, height: 30 };
+        state.drag = DragState::Finished(shrunk);
+        assert_eq!(ui_render_selection(&state), Some(shrunk));
         assert!(ui_render_border(&state));
-        assert_eq!(ui_render_border_rect(&state), Some(SELECTED));
+        assert_eq!(ui_render_border_rect(&state), Some(shrunk));
+
+        // A pending capture keeps its region in the hole until it completes,
+        // so an in-flight frame is never exposed by the moving box.
+        let pending = LogicalRect { x: 10, y: 10, width: 60, height: 60 };
+        state.capture_pending = Some(pending);
+        assert_eq!(ui_render_selection(&state), Some(rect_union(shrunk, pending)));
     }
 
     #[test]
-    fn edit_union_grows_monotonically_across_the_drag_trajectory() {
-        // Simulated Motion handler updates: the union must contain every
-        // intermediate rectangle, so the pre-drag capture region always lies
-        // inside the transparent hole.
-        let start = LogicalRect { x: 40, y: 40, width: 20, height: 20 };
-        let mut union = start;
-        for updated in [
-            LogicalRect { x: 45, y: 40, width: 20, height: 20 },
-            LogicalRect { x: 45, y: 48, width: 20, height: 20 },
-            LogicalRect { x: 38, y: 48, width: 20, height: 20 },
-        ] {
-            union = rect_union(union, updated);
-        }
-        assert!(union.intersection(start).map(|i| i == start).unwrap_or(false));
-        assert_eq!(union, LogicalRect { x: 38, y: 40, width: 27, height: 28 });
+    fn shrinking_during_an_edit_drag_does_not_leave_a_dim_trail() {
+        // Regression: the hole used to be the union of every rectangle the
+        // drag had passed through. Enlarging looked continuous because the
+        // union grew with the box; shrinking left the dim edge at the widest
+        // point, so the border moved while the dim did not.
+        let mut state = ui_state();
+        let wide = LogicalRect { x: 10, y: 10, width: 80, height: 80 };
+        let narrow = LogicalRect { x: 40, y: 40, width: 20, height: 20 };
+        state.drag = DragState::Finished(wide);
+        state.edit_drag = Some(EditDrag::Edge(SelectionEdge::Right));
+        // Widest point, then shrunk: the rendered hole must be the narrow box.
+        state.drag = DragState::Finished(narrow);
+        assert_eq!(ui_render_selection(&state), Some(narrow));
+    }
+
+    #[test]
+    fn edit_drag_drops_an_invalid_pending_region_so_the_hole_follows_the_box() {
+        // An in-flight capture prepared from the wide rectangle cannot be
+        // trusted after the box moved, so the motion handler invalidates it
+        // and drops its region. The hole must then be the current box, not
+        // the stale union — otherwise shrinking still lags.
+        let mut state = ui_state();
+        let wide = LogicalRect { x: 10, y: 10, width: 80, height: 80 };
+        let narrow = LogicalRect { x: 40, y: 40, width: 20, height: 20 };
+        state.drag = DragState::Finished(narrow);
+        state.edit_drag = Some(EditDrag::Edge(SelectionEdge::Left));
+        state.capture_pending = Some(wide);
+
+        invalidate_changed_capture(&mut state);
+        drop_invalid_pending(&mut state);
+
+        assert!(state.capture_invalid, "the in-flight frame must stay discarded");
+        assert_eq!(state.capture_pending, None);
+        assert_eq!(ui_render_selection(&state), Some(narrow));
+    }
+
+    #[test]
+    fn edit_drag_keeps_a_matching_pending_region() {
+        // Moving a box and returning it to the pending rectangle leaves the
+        // pending capture valid; its region stays in the hole.
+        let mut state = ui_state();
+        let rect = LogicalRect { x: 20, y: 20, width: 40, height: 40 };
+        state.drag = DragState::Finished(rect);
+        state.edit_drag = Some(EditDrag::Move { offset_x: 1, offset_y: 1 });
+        state.capture_pending = Some(rect);
+
+        invalidate_changed_capture(&mut state);
+        drop_invalid_pending(&mut state);
+
+        assert!(!state.capture_invalid);
+        assert_eq!(state.capture_pending, Some(rect));
+        assert_eq!(ui_render_selection(&state), Some(rect));
     }
 
     #[test]
@@ -2565,16 +2661,56 @@ mod tests {
     }
 
     #[test]
-    fn border_color_warns_red_only_for_long_mode_spanning_selections() {
-        assert_eq!(selection_border_color(true, true, false), OVERLAY_BORDER_RED_BGRA);
-        assert_eq!(selection_border_color(true, false, false), OVERLAY_BORDER_WHITE_BGRA);
-        // Normal (non-long) screenshots may span outputs: always white.
-        assert_eq!(selection_border_color(false, true, false), OVERLAY_BORDER_WHITE_BGRA);
-        assert_eq!(selection_border_color(false, false, false), OVERLAY_BORDER_WHITE_BGRA);
-        // A stitch warning is red on its own: it is about the content, not
+    fn border_color_uses_the_same_warning_color_for_spans_and_stitch_failures() {
+        assert_eq!(selection_border_color(true, false), OVERLAY_BORDER_WHITE_RED_BGRA);
+        assert_eq!(selection_border_color(false, false), OVERLAY_BORDER_WHITE_BGRA);
+        // A stitch warning warns on its own: it is about the content, not
         // about the selection geometry.
-        assert_eq!(selection_border_color(true, false, true), OVERLAY_BORDER_RED_BGRA);
-        assert_eq!(selection_border_color(false, false, true), OVERLAY_BORDER_RED_BGRA);
+        assert_eq!(selection_border_color(false, true), OVERLAY_BORDER_WHITE_RED_BGRA);
+        assert_eq!(selection_border_color(true, true), OVERLAY_BORDER_WHITE_RED_BGRA);
+        // The warning colour must be visibly distinct from the plain border.
+        assert_ne!(OVERLAY_BORDER_WHITE_RED_BGRA, OVERLAY_BORDER_WHITE_BGRA);
+    }
+
+    #[test]
+    fn spanning_drag_warns_live_and_settled_span_does_not() {
+        // While the pointer drags, crossing onto another output flips the
+        // border immediately; it flips back on release.
+        let spanning = LogicalRect { x: 10, y: 10, width: 200, height: 20 };
+        let inside = LogicalRect { x: 10, y: 10, width: 20, height: 20 };
+        let dragging = DragState::Dragging { origin_x: 10, origin_y: 10, current_x: 90, current_y: 90 };
+
+        // Dragging inside one output: plain white.
+        assert_eq!(
+            border_color_for(Some(inside), false, dragging, false, false, false),
+            OVERLAY_BORDER_WHITE_BGRA
+        );
+        // Dragging across outputs: warns immediately.
+        assert_eq!(
+            border_color_for(Some(spanning), true, dragging, false, false, false),
+            OVERLAY_BORDER_WHITE_RED_BGRA
+        );
+        // Released in normal mode: the warning clears (capture composites the
+        // pieces per output, so a settled spanning rect is valid).
+        assert_eq!(
+            border_color_for(Some(spanning), true, DragState::Finished(spanning), false, false, false),
+            OVERLAY_BORDER_WHITE_BGRA
+        );
+        // Editing the box across outputs warns again: the user can still fix it.
+        assert_eq!(
+            border_color_for(Some(spanning), true, DragState::Finished(spanning), true, false, false),
+            OVERLAY_BORDER_WHITE_RED_BGRA
+        );
+        // Long mode keeps warning: it cannot capture a spanning selection.
+        assert_eq!(
+            border_color_for(Some(spanning), true, DragState::Finished(spanning), false, true, false),
+            OVERLAY_BORDER_WHITE_RED_BGRA
+        );
+        // A stitch warning warns regardless of geometry.
+        assert_eq!(
+            border_color_for(Some(inside), false, DragState::Finished(inside), false, true, true),
+            OVERLAY_BORDER_WHITE_RED_BGRA
+        );
     }
 
     #[test]
@@ -2672,7 +2808,6 @@ mod tests {
             pending_render: None,
             editing: false,
             edit_drag: None,
-            edit_union: None,
             capture_pending: None,
             capture_invalid: false,
             selection_anchor: None,
@@ -2799,23 +2934,41 @@ mod tests {
 
     #[test]
     fn overlay_pixel_dims_outside_selection() {
-        assert_eq!(overlay_pixel(6, 20, Some(SELECTED), 3), OVERLAY_OUTSIDE_MASK_BGRA);
-        assert_eq!(overlay_pixel(10, 16, Some(SELECTED), 3), OVERLAY_OUTSIDE_MASK_BGRA);
+        assert_eq!(overlay_pixel(6, 20, Some(SELECTED), 3, OVERLAY_BORDER_WHITE_BGRA), OVERLAY_OUTSIDE_MASK_BGRA);
+        assert_eq!(overlay_pixel(10, 16, Some(SELECTED), 3, OVERLAY_BORDER_WHITE_BGRA), OVERLAY_OUTSIDE_MASK_BGRA);
     }
 
     #[test]
     fn overlay_pixel_keeps_selection_interior_transparent() {
-        assert_eq!(overlay_pixel(13, 23, Some(SELECTED), 3), OVERLAY_SELECTED_TRANSPARENT_BGRA);
+        assert_eq!(overlay_pixel(13, 23, Some(SELECTED), 3, OVERLAY_BORDER_WHITE_BGRA), OVERLAY_SELECTED_TRANSPARENT_BGRA);
     }
 
     #[test]
     fn overlay_pixel_keeps_selection_edge_clear() {
-        assert_eq!(overlay_pixel(10, 20, Some(SELECTED), 3), OVERLAY_SELECTED_TRANSPARENT_BGRA);
+        assert_eq!(overlay_pixel(10, 20, Some(SELECTED), 3, OVERLAY_BORDER_WHITE_BGRA), OVERLAY_SELECTED_TRANSPARENT_BGRA);
     }
 
     #[test]
     fn overlay_pixel_draws_white_adjacent_border() {
-        assert_eq!(overlay_pixel(9, 19, Some(SELECTED), 3), OVERLAY_BORDER_WHITE_BGRA);
+        assert_eq!(overlay_pixel(9, 19, Some(SELECTED), 3, OVERLAY_BORDER_WHITE_BGRA), OVERLAY_BORDER_WHITE_BGRA);
+    }
+
+    #[test]
+    fn overlay_pixel_honours_the_requested_warning_color() {
+        // Regression: the frozen path hardcoded the border colour, so a drag
+        // across outputs kept the plain white border.
+        assert_eq!(
+            overlay_pixel(9, 19, Some(SELECTED), 3, OVERLAY_BORDER_WHITE_RED_BGRA),
+            OVERLAY_BORDER_WHITE_RED_BGRA
+        );
+        assert_eq!(
+            overlay_pixel(13, 23, Some(SELECTED), 3, OVERLAY_BORDER_WHITE_RED_BGRA),
+            OVERLAY_SELECTED_TRANSPARENT_BGRA
+        );
+        assert_eq!(
+            overlay_pixel(6, 20, Some(SELECTED), 3, OVERLAY_BORDER_WHITE_RED_BGRA),
+            OVERLAY_OUTSIDE_MASK_BGRA
+        );
     }
 
     #[test]
@@ -2896,7 +3049,7 @@ mod tests {
         let frozen = frozen_test_output(output_info, output.width, output.height, frozen_pixel);
         let cache = build_overlay_render_cache(output.width, output.height, output_info, &frozen, 3);
 
-        draw_overlay(&mut data, &cache, output_info, Some(selected), 3);
+        draw_overlay(&mut data, &cache, output_info, Some(selected), 3, OVERLAY_BORDER_WHITE_BGRA);
 
         assert_eq!(pixel_at(&data, output.width as usize, 0, 0), OVERLAY_BORDER_WHITE_BGRA);
         // The border is a closed outside ring, including the four corners.
@@ -2924,8 +3077,8 @@ mod tests {
         let frozen = frozen_test_output(output_info, output.width, output.height, frozen_pixel);
         let cache = build_overlay_render_cache(output.width, output.height, output_info, &frozen, 3);
 
-        draw_overlay(&mut data, &cache, output_info, Some(previous), 3);
-        draw_overlay_region(&mut data, &cache, output_info, Some(current), dirty, 3);
+        draw_overlay(&mut data, &cache, output_info, Some(previous), 3, OVERLAY_BORDER_WHITE_BGRA);
+        draw_overlay_region(&mut data, &cache, output_info, Some(current), dirty, 3, OVERLAY_BORDER_WHITE_BGRA);
 
         assert_eq!(pixel_at(&data, output.width as usize, 1, 1), OVERLAY_BORDER_WHITE_BGRA);
         assert_eq!(pixel_at(&data, output.width as usize, 2, 2), OVERLAY_BORDER_WHITE_BGRA);
