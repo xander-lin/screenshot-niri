@@ -88,6 +88,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut expected_top = 0i32;
     let mut max_drift: (usize, i32) = (0, 0);
     let mut final_drift: Option<i32> = None;
+    // Per-frame stitcher wall time (production caliber: the whole push call,
+    // excluding PNG decode and the exhaustive oracle).
+    let mut push_total_ns = 0u64;
+    let mut push_count = 0u32;
+    let mut push_worst = std::time::Duration::ZERO;
+    let mut push_worst_frame = 0usize;
+    let mut push_accepted_ns = 0u64;
+    let mut push_accepted_count = 0u32;
 
     let first = load_image(&frames[0].path)?;
     stitcher.push_frame_with_offset(
@@ -132,17 +140,29 @@ fn run() -> Result<(), Box<dyn Error>> {
             pair_costs.push(o.cost);
         }
 
+        let push_started = std::time::Instant::now();
         let outcome = stitcher.push_frame_with_offset(
             &ImageRgbView::new(&image)?,
             &ImageRgbView::new(&image)?,
             entry.direction,
             entry.offset,
         )?;
+        // Production-caliber timing: everything the stitcher does with a
+        // captured frame, excluding PNG decode and the oracle below.
+        let push_elapsed = push_started.elapsed();
+        push_total_ns += push_elapsed.as_nanos() as u64;
+        push_count += 1;
+        if push_elapsed > push_worst {
+            push_worst = push_elapsed;
+            push_worst_frame = i;
+        }
 
         let mut frame_delta: Option<i32> = None;
         let (label, note, score, err) = match outcome {
             PushResult::Accepted { match_info } => {
                 accepted += 1;
+                push_accepted_ns += push_elapsed.as_nanos() as u64;
+                push_accepted_count += 1;
                 canvas_top += match_info.delta_y;
                 frame_delta = Some(match_info.delta_y);
                 if let Some(top) = stitcher.last_engine_top() {
@@ -505,6 +525,18 @@ fn run() -> Result<(), Box<dyn Error>> {
         println!("  worst misplacements: {worst:?}");
     }
     println!("  canvas height reached: {canvas_top}");
+    if push_count > 0 {
+        let mean = push_total_ns as f64 / push_count as f64 / 1e6;
+        let worst = push_worst.as_secs_f64() * 1e3;
+        let acc = if push_accepted_count > 0 {
+            push_accepted_ns as f64 / push_accepted_count as f64 / 1e6
+        } else {
+            0.0
+        };
+        println!(
+            "  push timing: {push_count} frames, mean {mean:.2} ms (accepted {acc:.2} ms), worst {worst:.2} ms at frame {push_worst_frame}"
+        );
+    }
     Ok(())
 }
 
