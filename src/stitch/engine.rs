@@ -95,15 +95,32 @@ const EDGE_ADJACENT_ROWS: i32 = 2;
 /// One eighth of the viewport is wide enough to cover the peak, and narrow
 /// enough that a repeated pattern one card-height away still counts as a rival.
 const EDGE_BASIN_DIVISOR: i32 = 8;
-/// Impulse window half-width, and its scale with the previous delta.
+/// Impulse window half-width: `max(24, 1.05 x |previous delta|)`.
+///
+/// The window has to cover the *next* step, and the next step is at least as
+/// large as the last one when the page accelerates. Measured on real-1,
+/// widening 0.6 -> 1.0 -> 1.05 moved 20 frames out of the wide stage into this
+/// cheaper one with identical placements (204 accepts, 0 misplaced, 0
+/// displaced bands, drift -257) and cut the mean from 1.50 to 1.43 ms. 1.10 is
+/// where it breaks: 205 accepts but 2 frames with displaced bands and drift
+/// -677, because a window that wide starts catching jump frames that the wide
+/// stage places better.
 const EDGE_IMPULSE_MIN_HALF_WIDTH: i32 = 24;
-const EDGE_IMPULSE_SCALE_NUMERATOR: i32 = 6;
-const EDGE_IMPULSE_SCALE_DENOMINATOR: i32 = 10;
+const EDGE_IMPULSE_SCALE_NUMERATOR: i32 = 21;
+const EDGE_IMPULSE_SCALE_DENOMINATOR: i32 = 20;
 /// Half-width of the wide search around the prediction.
 ///
 /// A displacement, not an overlap bound: the frame may land far from where it
 /// was predicted because the content kept scrolling while the engine refused.
 const EDGE_WIDE_HALF_WIDTH: i32 = 1400;
+/// Near ring of the wide stage, scored before the rest of the reach.
+///
+/// It must cover the plausible displacement, not just a fixed distance: the
+/// last step says how far the page moves per frame, so a jump of that scale
+/// belongs in the near ring and only a recovery belongs outside it.
+const EDGE_WIDE_NEAR_FLOOR: i32 = 300;
+const EDGE_WIDE_NEAR_SCALE_NUMERATOR: i32 = 2;
+const EDGE_WIDE_NEAR_SCALE_DENOMINATOR: i32 = 1;
 /// Maximum single-frame displacement, as a fraction of the viewport height.
 ///
 /// The generic overlap floor (10% of the viewport) is far too permissive for
@@ -1019,6 +1036,16 @@ impl WindowedEdgeMatcher {
         base.saturating_add(extra)
     }
 
+    fn wide_near_half_width(&self) -> i32 {
+        let scaled = self
+            .last_delta
+            .map(|delta| {
+                (delta.abs() * EDGE_WIDE_NEAR_SCALE_NUMERATOR) / EDGE_WIDE_NEAR_SCALE_DENOMINATOR
+            })
+            .unwrap_or(0);
+        scaled.max(EDGE_WIDE_NEAR_FLOOR)
+    }
+
     fn impulse_half_width(&self) -> i32 {
         let scale = self
             .last_delta
@@ -1108,23 +1135,41 @@ impl PlacementEngine for WindowedEdgeMatcher {
             }
         }
 
-        // Stage 2: one wide pass around the same prediction.
+        // Stage 2: the wide reach, in two rings around the same prediction.
         //
-        // This must stay a single pass. Splitting it into widening rings looks
-        // cheaper but changes the answer: each ring only sees its own band, so
-        // a nearby mediocre candidate can be accepted before the ring holding
-        // the true position is ever scored. Measured on real-1 that cost 58
-        // acceptances and introduced 13 misplaced writes.
+        // The near ring covers the displacement the last step makes plausible
+        // (`max(300, 2 x delta)`), and it decided every frame that reached this
+        // stage on all seven corpora: the far ring accepted nothing on real-1,
+        // real-long or lowcontrast-2b. The far ring is the recovery path — after
+        // a refusal the content keeps moving while the canvas is frozen, so the
+        // next clean frame can sit well outside the plausible band.
+        //
+        // The near ring is scaled by the last step rather than fixed, and that
+        // is what separates this from the ring split measured earlier: cutting
+        // the reach into fixed-width bands cost 58 acceptances and introduced 13
+        // misplaced writes on real-1, because a fixed band decides a frame on a
+        // candidate set that excludes competitors the page actually has. A band
+        // that grows with the displacement still contains them.
         //
         // The radius is a *displacement*, not an overlap bound: `top` and the
         // prediction are both canvas coordinates, so the frame may legitimately
         // land many viewport-heights from where it was predicted (the content
         // kept scrolling while the engine refused). Bounding this by the frame
         // height measured 76 acceptances on real-1 instead of 204.
+        let near = self.wide_near_half_width();
         if let DecideOutcome::Accept { top, cost } = self.decide(
             &ladder,
-            predicted_top - EDGE_WIDE_HALF_WIDTH,
-            predicted_top + EDGE_WIDE_HALF_WIDTH,
+            predicted_top - near,
+            predicted_top + near,
+            request,
+        ) {
+            return self.accept(request, ladder.clone(), top, cost);
+        }
+        if let DecideOutcome::Accept { top, cost } = self.decide_ring(
+            &ladder,
+            predicted_top,
+            near,
+            EDGE_WIDE_HALF_WIDTH,
             request,
         ) {
             return self.accept(request, ladder.clone(), top, cost);
@@ -1961,6 +2006,25 @@ mod tests {
         assert!(matches!(engine.place(&req), EngineDecision::Place { .. }));
         assert_eq!(engine.refusals_since_accept, 0);
         assert_eq!(engine.max_displacement(), base);
+    }
+
+    /// The wide stage's near ring must grow with the last step, not be a fixed
+    /// distance: a page that jumps 400 rows per frame is plausible there, and
+    /// cutting the reach into fixed-width bands was measured to lose 58
+    /// acceptances and introduce 13 misplaced writes on real-1, because a fixed
+    /// band decides a frame on a candidate set that excludes competitors the
+    /// page actually has.
+    #[test]
+    fn the_wide_near_ring_scales_with_the_last_step() {
+        let mut engine = WindowedEdgeMatcher::new();
+        // No step yet: the floor keeps a recovery-sized band.
+        assert_eq!(engine.wide_near_half_width(), EDGE_WIDE_NEAR_FLOOR);
+        // A normal step is still below the floor.
+        engine.last_delta = Some(60);
+        assert_eq!(engine.wide_near_half_width(), EDGE_WIDE_NEAR_FLOOR);
+        // A jump of 400 rows is plausible at 2x the step, not at the floor.
+        engine.last_delta = Some(400);
+        assert_eq!(engine.wide_near_half_width(), 800);
     }
 
     #[test]
