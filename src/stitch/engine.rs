@@ -43,15 +43,20 @@ const EDGE_MAX_SCORING_ROWS: usize = 192;
 /// run edges, so a 160-row viewport may carry two or three, and refusing those
 /// frames because the page is not text-dense would be a judgement about content
 /// the stitcher has no business making. Whether one row is *enough* to trust is
-/// decided by the gates below (runner-up separation, rival count, winner vs
-/// median), which are evidence-normalised and do not reward or punish density.
+/// decided by the gates below (winner cost, runner-up ratio, colour), which are
+/// normalised and do not reward or punish density.
 const EDGE_MIN_COMPARABLE_ROWS: u32 = 3;
 /// Absolute ceiling on the winner's cost.
 ///
 /// The cost is already an average over the boundary cells that carried
 /// evidence, so it is comparable across contrast levels and page densities: 0
-/// means every boundary matched, 1 means every one disagreed. No window and no
-/// median enters it.
+/// means every boundary matched, 1 means every one disagreed. No window enters
+/// it, and no typical candidate: this is the winner alone.
+///
+/// Measured accepted winners: real-1 max 0.0548, lowcontrast-2b max 0.0714 —
+/// the low-contrast corpus is the binding case, 12% under the ceiling.
+/// real-long reaches 0.168 on blurred frames and passes on the margin escape
+/// ([`EDGE_CONFIDENT_SECOND_OVER_BEST`]) instead, 18 of its 97 acceptances.
 const EDGE_MAX_ACCEPT_COST: f64 = 0.08;
 /// The runner-up must cost at least this many times the winner.
 ///
@@ -61,12 +66,14 @@ const EDGE_MAX_ACCEPT_COST: f64 = 0.08;
 /// * a repeating page, where several offsets tie because the content really
 ///   does repeat.
 ///
-/// The absolute gate cannot tell them apart (both winners are cheap), and
-/// neither can `median` — it measures the field, not the top. The ratio of the
-/// two best positions can: a real match stands out by a wide margin, a periodic
-/// page has a runner-up at the same cost. When the ratio is small the content
-/// is ambiguous, and the answer is the *nearest* equivalent offset, not a
-/// refusal.
+/// The absolute gate cannot tell them apart (both winners are cheap). The
+/// ratio of the two best positions can: a real match stands out by a wide
+/// margin, a periodic page has a runner-up at the same cost. A small ratio
+/// means the content is ambiguous, and the answer is the *nearest* offset that
+/// also passes the colour check — not a refusal, unless none passes it.
+///
+/// It doubles as the definition of "about as good": the rivals considered in
+/// that tie-break are the candidates costing within this ratio of the winner.
 const EDGE_MIN_SECOND_OVER_BEST: f64 = 1.5;
 /// Mean per-channel colour difference (in 8-bit levels) at which the
 /// structural winner counts as showing the same content as the pixel canvas.
@@ -80,21 +87,8 @@ const EDGE_MAX_COLOUR_DIFFERENCE: f64 = 30.0;
 /// times better than the runner-up, so the match is unmistakable even on
 /// imperfect content.
 const EDGE_CONFIDENT_SECOND_OVER_BEST: f64 = 2.5;
-/// A rival must rest on at least this fraction of the winner's evidence.
-///
-/// Periodic content repeats over the viewport, so a decoy compares as many
-/// boundary rows as the truth: it passes and the frame is refused. A one-row
-/// coincidence on stripe content compares far fewer and is discarded, so
-/// correct placements are not refused for it.
-const EDGE_RIVAL_EVIDENCE_NUMERATOR: u32 = 3;
-const EDGE_RIVAL_EVIDENCE_DENOMINATOR: u32 = 4;
 /// Positions closer than this to the winner are the same peak, not a rival.
 const EDGE_ADJACENT_ROWS: i32 = 2;
-/// A candidate whose cost is within this of the winner is "as good".
-///
-/// Used to count distinct equally-good answers: a periodic page has several,
-/// and choosing one of them would be a silent misplacement.
-const EDGE_RIVAL_COST_MARGIN: f64 = 0.02;
 /// Divisor that turns the frame height into the winner's basin width.
 ///
 /// A rival closer than this is the winner's own shoulder, not a second answer.
@@ -105,7 +99,6 @@ const EDGE_BASIN_DIVISOR: i32 = 8;
 const EDGE_IMPULSE_MIN_HALF_WIDTH: i32 = 24;
 const EDGE_IMPULSE_SCALE_NUMERATOR: i32 = 6;
 const EDGE_IMPULSE_SCALE_DENOMINATOR: i32 = 10;
-/// Wide-window half-width around the impulse prediction.
 /// Half-width of the wide search around the prediction.
 ///
 /// A displacement, not an overlap bound: the frame may land far from where it
@@ -126,7 +119,6 @@ const EDGE_WIDE_HALF_WIDTH: i32 = 1400;
 const EDGE_MAX_DISPLACEMENT_NUMERATOR: i32 = 6;
 const EDGE_MAX_DISPLACEMENT_DENOMINATOR: i32 = 10;
 
-/// Anchor-recovery half-width around the last verified position.
 /// Anchor stage: the search radius starts here and grows by
 /// [`EDGE_ANCHOR_GROWTH`], so a scroll-back is found at the nearest ring first
 /// rather than scanning the whole frozen extent in one pass.
@@ -508,7 +500,9 @@ pub enum RejectReason {
     Uninitialised,
     /// The frame does not look like the canvas anywhere.
     NoCandidate,
-    /// Two positions scored almost the same; refusing beats guessing.
+    /// The frame is supported structurally but not verifiably: either several
+    /// offsets fit equally well and none survived the colour check, or no stage
+    /// could place it at all.
     Ambiguous,
     /// Too little comparable evidence to judge.
     InsufficientEvidence,
@@ -637,11 +631,6 @@ impl WindowedEdgeMatcher {
         Self::default()
     }
 
-    /// Scans `lo..=hi` row by row and applies the three gates.
-    ///
-    /// Deliberately exhaustive inside the window: the correct offset is a
-    /// one-row-wide basin (a one-row shift multiplies the cost ~47x), so any
-    /// coarse step can step over it.
     /// Scores an annulus around `centre`: positions with `inner < |top - centre|
     /// <= outer`.
     ///
@@ -675,9 +664,14 @@ impl WindowedEdgeMatcher {
                 costs.push((score.cost, top, score.used));
             }
         }
-        self.decide_from_costs(ladder, costs, centre, request)
+        self.decide_from_costs(costs, centre, request)
     }
 
+    /// Scans `lo..=hi` row by row and applies the gates.
+    ///
+    /// Deliberately exhaustive inside the window: the correct offset is a
+    /// one-row-wide basin (a one-row shift multiplies the cost ~47x), so any
+    /// coarse step can step over it.
     fn decide(
         &self,
         ladder: &EdgeLadder,
@@ -703,7 +697,7 @@ impl WindowedEdgeMatcher {
         // estimate for this pass: the impulse and wide stages centre on the
         // prediction, the anchor stage on the anchor.
         let centre = lo.saturating_add(hi) / 2;
-        self.decide_from_costs(ladder, costs, centre, request)
+        self.decide_from_costs(costs, centre, request)
     }
 
     /// The gate decision, given the scored candidates for one window.
@@ -713,7 +707,6 @@ impl WindowedEdgeMatcher {
     /// answer to it is the one that keeps the canvas continuous.
     fn decide_from_costs(
         &self,
-        ladder: &EdgeLadder,
         mut costs: Vec<(f64, i32, u32)>,
         centre: i32,
         request: &PlacementRequest<'_>,
@@ -745,7 +738,7 @@ impl WindowedEdgeMatcher {
         if costs.len() < 4 {
             return DecideOutcome::Reject(RejectReason::InsufficientEvidence);
         }
-        let (best_cost, best_top, best_used) = costs[0];
+        let (best_cost, best_top, _) = costs[0];
         // The runner-up is the cheapest candidate outside the winner's basin.
         //
         // Skipping only `EDGE_ADJACENT_ROWS` rows finds the shoulder of the
@@ -755,31 +748,25 @@ impl WindowedEdgeMatcher {
         // widened, so a candidate one period away (a 235-row card grid) counts
         // as the rival it actually is.
         let basin = self.basin_rows();
-        // The runner-up must rest on comparable evidence, for the same reason
-        // as the rival count below: a one-row coincidence is not a competing
-        // answer, and letting it define `second` makes `sep` read 0 on content
-        // where the winner is in fact the only candidate with evidence.
         let second = costs
             .iter()
             .find(|(_, top, _)| (top - best_top).abs() > basin)
             .map(|(cost, _, _)| *cost);
-        // How many distinct places match about as well as the winner.
+        // The other places that match about as well as the winner.
         //
-        // This is the periodic-content guard. A card grid repeats every 235
-        // rows inside a 700-row viewport, so three offsets match at cost 0.000;
-        // the separation gate cannot see it because every other offset is much
-        // worse, so `sep` reads 1.000 while the answer is genuinely ambiguous.
-        // Counting equally-good places refuses those frames instead of picking
-        // one at random. A rival only counts when it rests on comparable
-        // evidence: periodic content repeats over the whole viewport, so the
-        // offset one period away compares as many boundary rows as the truth
-        // and is a genuine second answer. Stripe content has boundaries only at
-        // run edges, so an unrelated offset can tie on cost by agreeing on a
-        // single row while the truth agrees on four — that tie is noise, and
-        // counting it refuses every frame.
+        // "About as well" is the same relative test as the runner-up ratio —
+        // cost within `EDGE_MIN_SECOND_OVER_BEST` of the winner — so one
+        // definition decides both whether the frame is ambiguous and which
+        // positions compete for it. An absolute margin here used to count a
+        // position 20x worse than a near-perfect winner as an equal answer.
+        //
+        // Periodic content is why this exists: a card grid repeats every 235
+        // rows inside a 700-row viewport, so several offsets score the same,
+        // and the ratio alone cannot say which one the scroll meant. The
+        // offsets are collected here and the tie is broken on pixels below.
         let mut rival_tops: Vec<i32> = Vec::new();
         for (cost, top, _) in &costs {
-            if *cost > best_cost + EDGE_RIVAL_COST_MARGIN {
+            if *cost > best_cost * EDGE_MIN_SECOND_OVER_BEST {
                 break;
             }
             if (top - best_top).abs() <= basin {
@@ -790,30 +777,11 @@ impl WindowedEdgeMatcher {
             }
             rival_tops.push(*top);
         }
-        let equally_good_rivals = rival_tops.len();
-
-        if crate::trace::edge_gate_trace_enabled() {
-            crate::trace_log!(
-                "stitch: edge gate window={}..={} best={best_cost:.4}@{best_top} \
-                 second={second:?} rivals={equally_good_rivals} second_over_best={second_over_best:.2} \
-                 max_accept={EDGE_MAX_ACCEPT_COST}",
-                costs.iter().map(|c| c.1).min().unwrap_or(0),
-                costs.iter().map(|c| c.1).max().unwrap_or(0)
-            );
-        }
-        // Several places match about equally well — a repeating pattern whose
-        // period does not divide the scroll step. The content genuinely cannot
-        // say which one is right, so take the one closest to where the scroll
-        // is predicted to be: the user scrolled a little, not a page, and the
-        // nearest explanation of the frame is the one that keeps the canvas
-        // continuous. Refusing instead would drop content the page is happy to
-        // give us, and the nearest answer is exactly as well supported as any
-        // other by the pixels.
         // How far ahead the winner is of the next distinct answer.
         //
-        // This is the gate that separates "the winner is genuinely the one"
-        // from "several offsets fit equally well". It is a property of the two
-        // best positions, so it does not move with the search window.
+        // This is what separates "the winner is genuinely the one" from
+        // "several offsets fit equally well". It is a property of the two best
+        // positions, so it does not move with the search window.
         // `None` means there is no candidate outside the winner's basin — in
         // the narrow impulse window that usually means the window was too
         // narrow to contain one, not that the winner is unopposed. It must not
@@ -827,90 +795,25 @@ impl WindowedEdgeMatcher {
             Some(_) => 1.0,
             None => 0.0,
         };
-        // A small ratio means the content cannot say which offset is right.
-        // That is not a reason to refuse: the nearest equivalent offset keeps
-        // the canvas continuous, and every one of those offsets is equally
-        // supported by the pixels.
-        // Ambiguous: the two best offsets are within the ratio of each other.
-        // The ladder cannot tell them apart — it is colour-blind by design —
-        // so the tie is broken on the actual pixels: a candidate survives if
-        // its colour difference against the pixel canvas is acceptable. If
-        // more than one survives, the nearest wins; if none does, the
-        // structural tie was a coincidence and the frame is refused.
-        let ambiguous = second_over_best < EDGE_MIN_SECOND_OVER_BEST || equally_good_rivals > 0;
-        let chosen = if ambiguous {
-            let target = centre;
-            let candidates: Vec<i32> =
-                std::iter::once(best_top).chain(rival_tops.iter().copied()).collect();
-            let survivors: Vec<(i32, f64)> = candidates
-                .iter()
-                .filter_map(|&top| {
-                    let colour = self.colour_cost_at(request, top)?;
-                    (colour <= EDGE_MAX_COLOUR_DIFFERENCE).then_some((top, colour))
-                })
-                .collect();
-            let pick = match survivors.as_slice() {
-                [] => {
-                    if crate::trace::edge_gate_trace_enabled() {
-                        crate::trace_log!(
-                            "stitch: ambiguous (second/best={second_over_best:.2}) but no \
-                             candidate passes the colour check"
-                        );
-                    }
-                    return DecideOutcome::Reject(RejectReason::NoCandidate);
-                }
-                many => {
-                    let mut pick = (many[0].0, (many[0].0 - target).abs());
-                    for top in many.iter().skip(1).map(|&(t, _)| t) {
-                        let distance = (top - target).abs();
-                        if distance < pick.1 {
-                            pick = (top, distance);
-                        }
-                    }
-                    if crate::trace::edge_gate_trace_enabled() {
-                        crate::trace_log!(
-                            "stitch: ambiguous (second/best={second_over_best:.2}), {} of {} \
-                             candidates pass the colour check, choosing nearest: {} \
-                             (target {target})",
-                            many.len(),
-                            candidates.len(),
-                            pick.0
-                        );
-                    }
-                    pick.0
-                }
-            };
-            pick
-        } else {
-            best_top
-        };
-        // The only absolute gate: how good the winner is on its own.
+
+        if crate::trace::edge_gate_trace_enabled() {
+            crate::trace_log!(
+                "stitch: edge gate window={}..={} best={best_cost:.4}@{best_top} \
+                 second={second:?} rivals={} second_over_best={second_over_best:.2} \
+                 max_accept={EDGE_MAX_ACCEPT_COST}",
+                costs.iter().map(|c| c.1).min().unwrap_or(0),
+                costs.iter().map(|c| c.1).max().unwrap_or(0),
+                rival_tops.len()
+            );
+        }
+
+        // The only absolute gate: how good the winner is on its own, with a
+        // margin-based escape.
         //
         // `median` is gone. It is the typical cost across whatever window was
         // searched, so it moves when the window moves, and a decision that
         // flips with the search radius is not measuring the content. The
         // winner's own cost is a property of the frame and the canvas alone.
-        // The structural winner must also look like the canvas in colour.
-        //
-        // The ladder is colour-blind, and that blindness can be exploited by
-        // content whose *structure* repeats with different colours: measured,
-        // a fabricated canvas produced a confident-looking structural match
-        // (0.073 with a 1.82x runner-up) whose pixels matched nothing. Colour
-        // is checked on every acceptance, not only on ties, because the
-        // confident fake and the genuine tie are the same failure wearing two
-        // different ratios.
-        if let Some(colour) = self.colour_cost_at(request, chosen) {
-            if colour > EDGE_MAX_COLOUR_DIFFERENCE {
-                if crate::trace::edge_gate_trace_enabled() {
-                    crate::trace_log!(
-                        "stitch: structural winner {best_cost:.4}@{chosen} rejected on \
-                         colour: mean difference {colour:.1}"
-                    );
-                }
-                return DecideOutcome::Reject(RejectReason::NoCandidate);
-            }
-        }
-        // The absolute gate, with a margin-based escape.
         //
         // Motion blur genuinely weakens boundaries, so a real match on moving
         // content can cost more than clean content ever does while still being
@@ -918,6 +821,10 @@ impl WindowedEdgeMatcher {
         // that are plainly placeable. The escape requires an *actual* runner-up
         // with a wide margin — `second_over_best` is 0 when there is none, so a
         // window with nothing to compare against cannot use it.
+        //
+        // This runs before the tie-break because it is cheap and decides about
+        // the winner alone; the tie-break below would otherwise sample colour
+        // for frames this gate rejects regardless.
         let confident = second_over_best >= EDGE_CONFIDENT_SECOND_OVER_BEST;
         if best_cost > EDGE_MAX_ACCEPT_COST && !confident {
             if crate::trace::edge_gate_trace_enabled() {
@@ -928,7 +835,99 @@ impl WindowedEdgeMatcher {
             }
             return DecideOutcome::Reject(RejectReason::NoCandidate);
         }
-        DecideOutcome::Accept { top: chosen, cost: best_cost }
+
+        // A small ratio means the content cannot say which offset is right.
+        // That is not a reason to refuse: the user scrolled a little, not a
+        // page, so the nearest candidate keeps the canvas continuous and is
+        // exactly as well supported by the pixels as any other.
+        //
+        // The ladder cannot tell them apart — it is colour-blind by design —
+        // so the tie is broken on the actual pixels: a candidate survives if
+        // its colour difference against the pixel canvas is acceptable. If
+        // more than one survives, the nearest wins; if none does, the
+        // structural tie was a coincidence and the frame is refused.
+        let ambiguous = second_over_best < EDGE_MIN_SECOND_OVER_BEST;
+        let chosen = if ambiguous {
+            let target = centre;
+            let candidates: Vec<i32> =
+                std::iter::once(best_top).chain(rival_tops.iter().copied()).collect();
+            let survivors: Vec<i32> = candidates
+                .iter()
+                .copied()
+                .filter(|&top| {
+                    self.colour_cost_at(request, top)
+                        .is_some_and(|colour| colour <= EDGE_MAX_COLOUR_DIFFERENCE)
+                })
+                .collect();
+            let Some(&first) = survivors.first() else {
+                if crate::trace::edge_gate_trace_enabled() {
+                    crate::trace_log!(
+                        "stitch: ambiguous (second/best={second_over_best:.2}) but no \
+                         candidate passes the colour check"
+                    );
+                }
+                return DecideOutcome::Reject(RejectReason::Ambiguous);
+            };
+            let pick = survivors.iter().fold(first, |best, &top| {
+                if (top - target).abs() < (best - target).abs() {
+                    top
+                } else {
+                    best
+                }
+            });
+            if crate::trace::edge_gate_trace_enabled() {
+                crate::trace_log!(
+                    "stitch: ambiguous (second/best={second_over_best:.2}), {} of {} \
+                     candidates pass the colour check, choosing nearest: {pick} (target {target})",
+                    survivors.len(),
+                    candidates.len()
+                );
+            }
+            pick
+        } else {
+            best_top
+        };
+
+        // Every acceptance is verified against the real pixels, not only the
+        // ties. The ladder is colour-blind, and that blindness can be exploited
+        // by content whose *structure* repeats with different colours:
+        // measured, a fabricated canvas produced a confident-looking
+        // structural match (0.073 with a 1.82x runner-up) whose pixels matched
+        // nothing. The confident fake and the genuine tie are the same failure
+        // wearing two different ratios.
+        // `None` means the two do not overlap in the pixel canvas, so there is
+        // nothing to compare: the placement rests on structure alone. That is
+        // acceptable for a confident winner, and it is not for a tie — the
+        // tie-break above requires positive colour evidence, which is why it
+        // drops unverifiable candidates instead of keeping them.
+        match self.colour_cost_at(request, chosen) {
+            Some(colour) if colour > EDGE_MAX_COLOUR_DIFFERENCE => {
+                if crate::trace::edge_gate_trace_enabled() {
+                    crate::trace_log!(
+                        "stitch: placement {chosen} rejected on colour: mean \
+                         difference {colour:.1}"
+                    );
+                }
+                return DecideOutcome::Reject(RejectReason::NoCandidate);
+            }
+            None => {
+                if crate::trace::edge_gate_trace_enabled() {
+                    crate::trace_log!(
+                        "stitch: placement {chosen} not colour-verified (no overlapping \
+                         canvas rows)"
+                    );
+                }
+            }
+            Some(_) => {}
+        }
+
+        // Report the cost of the position actually accepted: the tie-break may
+        // have picked a rival, and `best_cost` belongs to a different offset.
+        let chosen_cost = costs
+            .iter()
+            .find(|(_, top, _)| *top == chosen)
+            .map_or(best_cost, |(cost, _, _)| *cost);
+        DecideOutcome::Accept { top: chosen, cost: chosen_cost }
     }
 
     /// Mean absolute colour difference between the frame and the pixel canvas
@@ -1109,13 +1108,7 @@ impl PlacementEngine for WindowedEdgeMatcher {
             }
         }
 
-        // Stage 2: wide windows around the same prediction, widening in
-        // rings. Each ring starts where the previous one ended, so no position
-        // is scored twice, and the last ring stops at the largest displacement
-        // the content can support: a frame can only be matched against the
-        // canvas where they still overlap, so a wider window would only add
-        // candidates with no evidence behind them.
-        // One wide pass around the prediction.
+        // Stage 2: one wide pass around the same prediction.
         //
         // This must stay a single pass. Splitting it into widening rings looks
         // cheaper but changes the answer: each ring only sees its own band, so
@@ -1603,8 +1596,7 @@ mod tests {
         let mut first = true;
         for &(top, commit_frame) in committed {
             if first {
-                prev_rect_y = 0;
-                prev_engine_pos = top;
+                // The first frame initialises the canvas at pixel row 0.
                 rows = vec![None; commit_frame.height as usize];
                 for row in 0..commit_frame.height as usize {
                     let src = row * commit_frame.stride as usize;
