@@ -200,11 +200,23 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
   2. 用 `row_texture` 这类恒定梯度纹理做「内容不同必须拒绝」的 fixture 是无效测试：它测的是档位抖动，不是描述符判别力。
   3. 「门限调参救不救得回来」用分布重叠判断（伪匹配 bm 范围 vs 真帧 bm 范围），不要逐点试阈值——重叠即无解，省掉整轮扫描。
 
+### 23. 用「输出里有没有 test result 行」当验证判据，会在编译失败时误报通过
+
+- **Context**：本轮改完门限后跑「三种 feature 组合」验证，命令是 `cargo test --locked --features X 2>&1 | grep -E "^test result" | head -1`。`trace-logs` 组合实际编译失败（`E0425`，trace 里引用了尚未绑定的 `second_over_best`），但输出里仍出现了一行 `test result: ok. 159 passed`——那行来自同一命令序列里的其他 target 或上一次的产物，grep 只看「有没有匹配」，没看「是谁的匹配」。于是交付里写下了「三种 feature 组合全过」，实际 HEAD 根本编不过 `--features trace-logs`。事后 review 时手工 `cargo build --features trace-logs` 才发现。
+- **Root cause**：判据是**文本存在性**，不是**进程成败**。`grep` 与 `cargo` 是两个进程，管道的退出码属于 `grep`；`head -1` 还会在 `cargo` 写完前关闭管道。三件事叠加：失败信息不在 grep 的模式里、成功行可能来自别的 target、退出码被管道吃掉。
+- **Correction**：把判据落在**退出码**上——`cargo test ... || exit 1`，或 `set -o pipefail`；人工确认时看输出里有没有 `error[`，而不是有没有 `test result`。
+- **Prevention**：
+  1. 验证命令的成败只看退出码（`&&` / `|| echo FAIL` / `set -o pipefail`），不要用「输出里出现某行」代替。
+  2. 多 feature 组合要**逐条**跑并各自检查，不要在 for 循环里只 grep 一个模式——循环会把「哪一条失败」抹掉。
+  3. `#[cfg(feature = ...)]` 与「宏丢弃 token」会让默认构建**完全不检查**该路径；改动了 feature 门控代码必须显式构建该 feature。
+
 ---
 
 ---
 
 ## Verification Memory
+
+- **Review pass on the gate rewrite (2026-10-22, 68abd5c)**: self-review found six defects, all fixed. (a) `--features trace-logs` did not compile — the trace printed `second_over_best` above its binding, hidden by the trace macro discarding its tokens (lesson 23). (b) Two definitions of "as good" coexisted: ambiguity by ratio (`second/best < 1.5`) but rivals by absolute margin (`best + 0.02`), so a position 20x worse than a near-perfect winner counted as an equal answer; rivals are now the ≤1.5x set and `EDGE_RIVAL_COST_MARGIN` is gone. Measured on real-1: 9 of 279 windows had rivals and in all 9 the ratio was already <1.5, so the two never disagreed there — latent, not active. (c) The absolute gate ran after the colour tie-break, so 26 lowcontrast-2b windows paid for colour sampling and were then refused on cost; the cheap gate now runs first. (d) `Accept` reported `best_cost` even when the tie-break had placed the frame at a rival. (e) Colour and cost rejections were labelled `Ambiguous`, which now means only "the tie could not be resolved on pixels". (f) `colour_cost_at == None` silently skipped verification; traced now, and it never fires on any corpus. Gate margins measured for the record: real-1 accepts max winner cost 0.0548 (0 escapes), real-long 18 of 97 accepts used the margin escape (max 0.168), lowcontrast-2b max 0.0714 (12% under the 0.08 ceiling — the binding corpus). The tie-break path accepted 37 real-1 frames, 3 at an offset other than the structural winner, all verified correct by the replay's MISPLACED/band/coverage checks.
 
 - **Median gate replaced by absolute + ratio + colour (2026-10-22, e1db844)**: the user drove a full redesign of the decision gates. `best/median` is gone (it measures the search window, not the content: one real-long frame read 0.731 in a ±36 window and 0.488 in ±1400 with the winner unchanged). What decides now, all window-independent: winner cost ceiling (0.08), runner-up ratio ≥2.5x forgiving a high winner (motion blur on real-long reaches 0.168 — below the ratio it must be refused, and `second=None` reads 0 so an empty window cannot claim the escape), and a colour verification of every acceptance against the pixel canvas (ceiling 30, between real motion 40.6 and an unrelated structural fake 82.2; the ladder is colour-blind and that blindness let fabricated content pass structurally at 0.073/1.82x). Ties (<1.5x) resolve by colour first, then nearest to the window centre; a cost-exactly-0 winner reads as infinitely ahead, which wide-narrow selections need. Two engine bugs fixed en route: the displacement guard dropped forbidden candidates instead of letting the first one veto the window (periodic content sorted a far offset first), and the colour check now maps columns through `previous_rect.x`. Engine tests build truthful pixel canvases (`request_on_canvas`, rebase-faithful) — the old `canvas_of` fabricated row-texture rows that the colour check rightly rejected. Calibration data: real-1 winners ≤0.0548 with 2 misplaced at 0.0355/0.0536 (indistinguishable by cost), synthetic fake 0.0729/1.82x/colour 7.3 at a small offset (only the 0.08 ceiling catches it). All seven corpora exact baseline, 159+180 tests ×3 feature combos, 1.53 ms/frame.
 
