@@ -78,6 +78,10 @@ const EDGE_IMPULSE_MIN_HALF_WIDTH: i32 = 24;
 const EDGE_IMPULSE_SCALE_NUMERATOR: i32 = 6;
 const EDGE_IMPULSE_SCALE_DENOMINATOR: i32 = 10;
 /// Wide-window half-width around the impulse prediction.
+/// Half-width of the wide search around the prediction.
+///
+/// A displacement, not an overlap bound: the frame may land far from where it
+/// was predicted because the content kept scrolling while the engine refused.
 const EDGE_WIDE_HALF_WIDTH: i32 = 1400;
 /// Maximum single-frame displacement, as a fraction of the viewport height.
 ///
@@ -95,7 +99,11 @@ const EDGE_MAX_DISPLACEMENT_NUMERATOR: i32 = 6;
 const EDGE_MAX_DISPLACEMENT_DENOMINATOR: i32 = 10;
 
 /// Anchor-recovery half-width around the last verified position.
-const EDGE_ANCHOR_HALF_WIDTH: i32 = 2800;
+/// Anchor stage: the search radius starts here and grows by
+/// [`EDGE_ANCHOR_GROWTH`], so a scroll-back is found at the nearest ring first
+/// rather than scanning the whole frozen extent in one pass.
+const EDGE_ANCHOR_BASE_HALF_WIDTH: i32 = 320;
+const EDGE_ANCHOR_GROWTH: i32 = 4;
 /// How many refusals keep widening the displacement guard, in viewports.
 ///
 /// Three viewports covers the gap a scroll animation can open before the next
@@ -606,6 +614,41 @@ impl WindowedEdgeMatcher {
     /// Deliberately exhaustive inside the window: the correct offset is a
     /// one-row-wide basin (a one-row shift multiplies the cost ~47x), so any
     /// coarse step can step over it.
+    /// Scores an annulus around `centre`: positions with `inner < |top - centre|
+    /// <= outer`.
+    ///
+    /// Rings are how the ladder avoids scoring a position twice. A plain wider
+    /// window re-examines everything the narrower one already rejected, which
+    /// is wasted work and — because the narrower window is the better-informed
+    /// one — cannot change the answer. `inner == 0` covers the centre itself.
+    fn decide_ring(
+        &self,
+        ladder: &EdgeLadder,
+        centre: i32,
+        inner: i32,
+        outer: i32,
+    ) -> DecideOutcome {
+        let lo = centre - outer;
+        let hi = centre + outer;
+        let mut costs: Vec<(f64, i32, u32)> = Vec::new();
+        let Some(canvas) = self.canvas.as_ref() else {
+            return DecideOutcome::Reject(RejectReason::Uninitialised);
+        };
+        if lo > hi {
+            return DecideOutcome::Reject(RejectReason::NoCandidate);
+        }
+        let min_overlap = minimum_overlap(ladder.rows(), ladder.rows()).max(1);
+        for top in lo..=hi {
+            if (top - centre).abs() <= inner {
+                continue;
+            }
+            if let Some(score) = canvas.cost_at(ladder, top, min_overlap) {
+                costs.push((score.cost, top, score.used));
+            }
+        }
+        self.decide_from_costs(ladder, costs, centre)
+    }
+
     fn decide(&self, ladder: &EdgeLadder, lo: i32, hi: i32) -> DecideOutcome {
         let Some(canvas) = self.canvas.as_ref() else {
             return DecideOutcome::Reject(RejectReason::Uninitialised);
@@ -621,23 +664,52 @@ impl WindowedEdgeMatcher {
                 costs.push((score.cost, top, score.used));
             }
         }
+        // The window's own centre is the best available "where should this be"
+        // estimate for this pass: the impulse and wide stages centre on the
+        // prediction, the anchor stage on the anchor.
+        let centre = lo.saturating_add(hi) / 2;
+        self.decide_from_costs(ladder, costs, centre)
+    }
+
+    /// The gate decision, given the scored candidates for one window.
+    ///
+    /// `centre` is what "nearest" means when several offsets tie: the search
+    /// that produced these candidates is centred there, so the closest tied
+    /// answer to it is the one that keeps the canvas continuous.
+    fn decide_from_costs(
+        &self,
+        ladder: &EdgeLadder,
+        mut costs: Vec<(f64, i32, u32)>,
+        centre: i32,
+    ) -> DecideOutcome {
         if costs.len() < 4 {
             return DecideOutcome::Reject(RejectReason::InsufficientEvidence);
         }
 
         costs.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let (best_cost, best_top, best_used) = costs[0];
-        // A candidate further than this from the previous accepted position
-        // leaves too little overlap for the separation gate to mean anything.
+        // Drop candidates the displacement guard forbids *before* picking a
+        // winner.
+        //
+        // Checking only `costs[0]` let one forbidden candidate veto the whole
+        // window. Periodic content makes that concrete: every period-length
+        // offset scores exactly 0, the sort happens to put a far one first,
+        // and the frame was refused even though a nearer equivalent offset sat
+        // inside the guard. The guard exists to stop a *single* bad match from
+        // jumping the canvas, not to discard content that has a legal answer.
         let limit = self.max_displacement();
-        if (best_top - self.pos.unwrap_or(best_top)).abs() > limit {
-            if crate::trace::edge_gate_trace_enabled() {
-                crate::trace_log!(
-                    "stitch: edge candidate {best_cost:.4}@{best_top} refused, displacement over {limit}"
-                );
-            }
-            return DecideOutcome::Reject(RejectReason::Ambiguous);
+        let guard_centre = self.pos.unwrap_or(costs[0].1);
+        let before = costs.len();
+        costs.retain(|(_, top, _)| (top - guard_centre).abs() <= limit);
+        if costs.len() < before && crate::trace::edge_gate_trace_enabled() {
+            crate::trace_log!(
+                "stitch: dropped {} candidate(s) beyond displacement {limit}",
+                before - costs.len()
+            );
         }
+        if costs.len() < 4 {
+            return DecideOutcome::Reject(RejectReason::InsufficientEvidence);
+        }
+        let (best_cost, best_top, best_used) = costs[0];
         // The runner-up is the cheapest candidate outside the winner's basin.
         //
         // Skipping only `EDGE_ADJACENT_ROWS` rows finds the shoulder of the
@@ -695,10 +767,12 @@ impl WindowedEdgeMatcher {
         };
         if crate::trace::edge_gate_trace_enabled() {
             crate::trace_log!(
-                "stitch: edge gate window={lo}..={hi} best={best_cost:.4}@{best_top} \
+                "stitch: edge gate window={}..={} best={best_cost:.4}@{best_top} \
                  second={second:?} rivals={equally_good_rivals} sep={separation:.3} \
                  median={median:.4} best_over_median={:.3}",
-                if median > 0.0 { best_cost / median } else { f64::INFINITY }
+                if median > 0.0 { best_cost / median } else { f64::INFINITY },
+                costs.iter().map(|c| c.1).min().unwrap_or(0),
+                costs.iter().map(|c| c.1).max().unwrap_or(0)
             );
         }
         // Several places match about equally well — a repeating pattern whose
@@ -710,7 +784,7 @@ impl WindowedEdgeMatcher {
         // give us, and the nearest answer is exactly as well supported as any
         // other by the pixels.
         let chosen = if equally_good_rivals > 0 || separation < EDGE_MIN_SEPARATION {
-            let target = self.pos.map(|pos| pos + self.predicted_delta()).unwrap_or(best_top);
+            let target = centre;
             let mut pick = (best_top, (best_top - target).abs());
             for rival in std::iter::once(best_top).chain(rival_tops.iter().copied()) {
                 let distance = (rival - target).abs();
@@ -864,7 +938,25 @@ impl PlacementEngine for WindowedEdgeMatcher {
             }
         }
 
-        // Stage 2: wide window around the same prediction.
+        // Stage 2: wide windows around the same prediction, widening in
+        // rings. Each ring starts where the previous one ended, so no position
+        // is scored twice, and the last ring stops at the largest displacement
+        // the content can support: a frame can only be matched against the
+        // canvas where they still overlap, so a wider window would only add
+        // candidates with no evidence behind them.
+        // One wide pass around the prediction.
+        //
+        // This must stay a single pass. Splitting it into widening rings looks
+        // cheaper but changes the answer: each ring only sees its own band, so
+        // a nearby mediocre candidate can be accepted before the ring holding
+        // the true position is ever scored. Measured on real-1 that cost 58
+        // acceptances and introduced 13 misplaced writes.
+        //
+        // The radius is a *displacement*, not an overlap bound: `top` and the
+        // prediction are both canvas coordinates, so the frame may legitimately
+        // land many viewport-heights from where it was predicted (the content
+        // kept scrolling while the engine refused). Bounding this by the frame
+        // height measured 76 acceptances on real-1 instead of 204.
         if let DecideOutcome::Accept { top, cost } = self.decide(
             &ladder,
             predicted_top - EDGE_WIDE_HALF_WIDTH,
@@ -873,15 +965,27 @@ impl PlacementEngine for WindowedEdgeMatcher {
             return self.accept(request, ladder.clone(), top, cost);
         }
 
-        // Stage 3: anchor recovery. The anchor is frozen across refusals, so a
-        // user who scrolls back finds the content again.
+        // Stage 3: anchor recovery, nearest ring first. The anchor is frozen
+        // across refusals, so a user who scrolls back finds the content again;
+        // searching outward from it means the nearest explanation wins instead
+        // of whichever ring happens to be scanned first.
         if let Some(anchor) = self.anchor {
-            if let DecideOutcome::Accept { top, cost } = self.decide(
-                &ladder,
-                anchor - EDGE_ANCHOR_HALF_WIDTH,
-                anchor + EDGE_ANCHOR_HALF_WIDTH,
-            ) {
-                return self.accept(request, ladder.clone(), top, cost);
+            let limit = (ladder.rows() as i32)
+                .saturating_sub(minimum_overlap(ladder.rows(), ladder.rows()) as i32)
+                .max(1);
+            let mut inner = 0;
+            let mut radius = EDGE_ANCHOR_BASE_HALF_WIDTH.min(limit);
+            loop {
+                if let DecideOutcome::Accept { top, cost } =
+                    self.decide_ring(&ladder, anchor, inner, radius)
+                {
+                    return self.accept(request, ladder.clone(), top, cost);
+                }
+                if radius >= limit {
+                    break;
+                }
+                inner = radius;
+                radius = radius.saturating_mul(EDGE_ANCHOR_GROWTH).min(limit);
             }
         }
 
@@ -1214,6 +1318,67 @@ mod tests {
                 assert_eq!(rect.y, 60, "the frame's true position, got {}", rect.y)
             }
             other => panic!("frame with a high-contrast block refused: {other:?}"),
+        }
+    }
+
+    /// The anchor stage searches outward from the anchor, so when the content
+    /// matches at several distances the nearest one wins.
+    ///
+    /// Periodic content makes that observable: every period-length offset is
+    /// pixel-identical, so a single wide scan returns whichever offset it
+    /// happens to score first (in practice the far end, because ties resolve by
+    /// sort order), while the ring ladder returns the nearest. This is the
+    /// behaviour the ring loop exists for.
+    #[test]
+    fn anchor_stage_prefers_the_nearest_of_equivalent_offsets() {
+        const PERIOD: u32 = 40;
+        let height = 200;
+        // A page that repeats every PERIOD rows.
+        let periodic = |top: i32, height: u32| {
+            let stride = W * 3;
+            let mut data = Vec::with_capacity(stride as usize * height as usize);
+            for row in top..top + height as i32 {
+                let r = ((row.rem_euclid(PERIOD as i32)) as u32) * 5 + 40;
+                let tex = row_texture(r);
+                data.extend_from_slice(&tex);
+            }
+            RgbFrame { width: W, height, stride, data }
+        };
+
+        let mut engine = WindowedEdgeMatcher::new();
+        let first = periodic(0, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
+
+        // Push content far enough that it does not overlap the committed
+        // canvas at all, so the engine refuses and the anchor freezes at 0.
+        // Periodic content cannot produce a refusal on its own — it matches
+        // everywhere — so this uses flat content, which has no boundaries.
+        let flat = {
+            let stride = W * 3;
+            let row = row_texture(0);
+            let mut data = Vec::new();
+            for _ in 0..height {
+                data.extend_from_slice(&row);
+            }
+            RgbFrame { width: W, height, stride, data }
+        };
+        let req = request(&flat, ViewportRect { x: 0, y: 0, width: W, height });
+        assert!(matches!(engine.place(&req), EngineDecision::Reject { .. }));
+
+        // 40 rows down is exactly one period: it matches at 40, 0, -40, ...
+        // The nearest answer to the anchor at 0 is 40 (one period down).
+        let back = periodic(40, height);
+        let req = request(&back, ViewportRect { x: 0, y: 0, width: W, height });
+        match engine.place(&req) {
+            EngineDecision::Place { rect, .. } => {
+                assert!(
+                    rect.y.abs() <= PERIOD as i32,
+                    "the nearest equivalent offset to the anchor must win, got {}",
+                    rect.y
+                );
+                assert_eq!(rect.y % PERIOD as i32, 0, "must land on a period boundary");
+            }
+            other => panic!("expected recovery near the anchor, got {other:?}"),
         }
     }
 
