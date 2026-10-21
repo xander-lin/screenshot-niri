@@ -101,10 +101,15 @@ const EDGE_BASIN_DIVISOR: i32 = 8;
 /// large as the last one when the page accelerates. Measured on real-1,
 /// widening 0.6 -> 1.0 -> 1.05 moved 20 frames out of the wide stage into this
 /// cheaper one with identical placements (204 accepts, 0 misplaced, 0
-/// displaced bands, drift -257) and cut the mean from 1.50 to 1.43 ms. 1.10 is
-/// where it breaks: 205 accepts but 2 frames with displaced bands and drift
-/// -677, because a window that wide starts catching jump frames that the wide
-/// stage places better.
+/// displaced bands, drift -257).
+///
+/// The reason to widen is that the window should contain the next step, not
+/// speed: the extra positions cost about what the avoided wide scans save.
+/// Measured with the graded wide stage, 0.60 -> 1.05 is 204.2M -> 195.3M
+/// boundary cells (-4.4%) and the mean time does not move outside run-to-run
+/// noise. 1.10 is where it breaks: 205 accepts but 2 frames with displaced
+/// bands and drift -677, because a window that wide starts catching jump
+/// frames that the wide stage places better.
 const EDGE_IMPULSE_MIN_HALF_WIDTH: i32 = 24;
 const EDGE_IMPULSE_SCALE_NUMERATOR: i32 = 21;
 const EDGE_IMPULSE_SCALE_DENOMINATOR: i32 = 20;
