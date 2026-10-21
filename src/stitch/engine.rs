@@ -1147,10 +1147,7 @@ impl PlacementEngine for WindowedEdgeMatcher {
         //
         // The near ring covers the displacement the last step makes plausible
         // (`max(300, 2 x delta)`), and it decided every frame that reached this
-        // stage on all seven corpora: the far ring accepted nothing on real-1,
-        // real-long or lowcontrast-2b. The far ring is the recovery path — after
-        // a refusal the content keeps moving while the canvas is frozen, so the
-        // next clean frame can sit well outside the plausible band.
+        // stage on all seven corpora.
         //
         // The near ring is scaled by the last step rather than fixed, and that
         // is what separates this from the ring split measured earlier: cutting
@@ -1158,6 +1155,19 @@ impl PlacementEngine for WindowedEdgeMatcher {
         // misplaced writes on real-1, because a fixed band decides a frame on a
         // candidate set that excludes competitors the page actually has. A band
         // that grows with the displacement still contains them.
+        //
+        // The far ring is not extra *reach*: everything it can place, the
+        // anchor ladder below can also reach (its cap is the largest
+        // displacement that still leaves `minimum_overlap` rows of evidence),
+        // and on a 254-row viewport the near ring alone already covers that
+        // whole range. What the far ring adds is *order*: it evaluates
+        // everything beyond the plausible band as one window, so the cheapest
+        // match out there wins before the anchor's nearest-first ladder gets a
+        // chance to accept a mediocre match closer to home. It runs only when
+        // the near ring rejects (once in 54 wide-stage frames on real-1), so it
+        // costs nothing in the common case. Measured: zero acceptances on all
+        // seven corpora, and deleting it changes no corpus and no test — it is
+        // a safety net for the direction reversal that no corpus exercises.
         //
         // The radius is a *displacement*, not an overlap bound: `top` and the
         // prediction are both canvas coordinates, so the frame may legitimately
@@ -2014,6 +2024,32 @@ mod tests {
         assert!(matches!(engine.place(&req), EngineDecision::Place { .. }));
         assert_eq!(engine.refusals_since_accept, 0);
         assert_eq!(engine.max_displacement(), base);
+    }
+
+    /// A move beyond the near ring's plausible band is still placed: with a
+    /// 600-row viewport the guard is 360 rows while the near ring is 300, so a
+    /// frame that moved 340 rows sits outside the near ring.
+    ///
+    /// The anchor ladder covers it, not the far ring — measured by deleting
+    /// the far ring, which leaves this test passing. The far ring's reach and
+    /// the anchor's are the same band here; what separates them is order, not
+    /// coverage.
+    #[test]
+    fn a_move_beyond_the_near_band_is_still_placed() {
+        let height = 600;
+        let mut engine = WindowedEdgeMatcher::new();
+        let first = frame_from(0, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
+        assert_eq!(engine.wide_near_half_width(), EDGE_WIDE_NEAR_FLOOR);
+
+        // 340 rows: outside the near ring (300), inside the guard (360).
+        let moved = frame_from(340, height);
+        let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first)];
+        let req = request_on_canvas(&moved, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
+        match engine.place(&req) {
+            EngineDecision::Place { rect, .. } => assert_eq!(rect.y, 340),
+            other => panic!("the far ring must place a 340-row move: {other:?}"),
+        }
     }
 
     /// The first anchor ring has no hole: it must be able to answer "the
