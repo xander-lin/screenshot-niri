@@ -1331,6 +1331,16 @@ impl RawStitcher {
     pub fn last_reject_reason(&self) -> Option<RejectReason> {
         self.last_reject_reason
     }
+
+    /// The descriptor the matcher built for the last frame, as a grayscale
+    /// image `(width, height, data)`.
+    ///
+    /// A debug aid for offline analysis: dumping it next to the frame shows
+    /// whether the matcher lost the evidence or merely decided against it.
+    #[allow(dead_code)]
+    pub fn last_descriptor(&self) -> Option<(u32, u32, Vec<u8>)> {
+        self.engine.last_descriptor()
+    }
 }
 
 impl FixedBands {

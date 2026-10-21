@@ -224,6 +224,27 @@ impl EdgeLadder {
         self.bins
     }
 
+    /// The descriptor as a grayscale image: `rows` tall, `bins` wide, one
+    /// byte per cell (0, 85 or 170 for levels 0, 1, 2).
+    ///
+    /// Exists so a human can look at what the matcher actually sees and compare
+    /// it against the frame. When a placement is wrong, the picture answers
+    /// "did the descriptor lose the evidence, or did the decision discard it?"
+    pub fn as_grayscale(&self) -> (u32, u32, Vec<u8>) {
+        let scale = [0u8, 85, 170];
+        let data = self
+            .levels
+            .iter()
+            .map(|level| scale[(*level as usize).min(2)])
+            .collect();
+        (self.bins, self.rows, data)
+    }
+
+    /// Rows that actually participate in scoring.
+    pub fn scoring_rows(&self) -> &[u32] {
+        &self.scoring_rows
+    }
+
     fn row_levels(&self, row: u32) -> &[u8] {
         let start = row as usize * self.bins as usize;
         &self.levels[start..start + self.bins as usize]
@@ -474,6 +495,15 @@ pub(super) trait PlacementEngine {
     /// after any prepend.
     fn commit(&mut self, rect: ViewportRect, requested_top: i32, frame: &dyn RgbSource);
     fn reset(&mut self);
+
+    /// Descriptor of the frame most recently passed to `place`, as a grayscale
+    /// image `(width, height, data)`; `None` when the engine has none.
+    ///
+    /// Debug aid: it lets a human compare what the matcher sees against the
+    /// frame itself.
+    fn last_descriptor(&self) -> Option<(u32, u32, Vec<u8>)> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -512,6 +542,9 @@ pub(super) struct WindowedEdgeMatcher {
     /// always followed by `commit` for the same frame, so rebuilding it there
     /// would double the descriptor cost for no information.
     pending_ladder: Option<EdgeLadder>,
+    /// The ladder of the frame most recently committed, kept for the debug
+    /// descriptor dump (`pending_ladder` is consumed by `commit`).
+    last_committed_ladder: Option<EdgeLadder>,
 }
 
 impl WindowedEdgeMatcher {
@@ -619,16 +652,56 @@ impl WindowedEdgeMatcher {
                 if median > 0.0 { best_cost / median } else { f64::INFINITY }
             );
         }
-        if equally_good_rivals > 0 {
+        // Several places match about equally well — a repeating pattern whose
+        // period does not divide the scroll step. The content genuinely cannot
+        // say which one is right, so take the one closest to where the scroll
+        // is predicted to be: the user scrolled a little, not a page, and the
+        // nearest explanation of the frame is the one that keeps the canvas
+        // continuous. Refusing instead would drop content the page is happy to
+        // give us, and the nearest answer is exactly as well supported as any
+        // other by the pixels.
+        let chosen = if equally_good_rivals > 0 || separation < EDGE_MIN_SEPARATION {
+            let target = self.pos.map(|pos| pos + self.predicted_delta()).unwrap_or(best_top);
+            let mut pick = (best_top, (best_top - target).abs());
+            for rival in std::iter::once(best_top).chain(rival_tops.iter().copied()) {
+                let distance = (rival - target).abs();
+                if distance < pick.1 {
+                    pick = (rival, distance);
+                }
+            }
+            if crate::trace::edge_gate_trace_enabled() {
+                crate::trace_log!(
+                    "stitch: periodic content, choosing nearest of {} candidates: {} (predicted {})",
+                    equally_good_rivals + 1,
+                    pick.0,
+                    target
+                );
+            }
+            pick.0
+        } else {
+            best_top
+        };
+        if separation < EDGE_MIN_SEPARATION && equally_good_rivals == 0 {
             return DecideOutcome::Reject(RejectReason::Ambiguous);
         }
-        if separation < EDGE_MIN_SEPARATION {
-            return DecideOutcome::Reject(RejectReason::Ambiguous);
-        }
-        if median <= 0.0 || best_cost / median > EDGE_MAX_BEST_OVER_MEDIAN {
+        // The "winner must beat a typical candidate" gate. Skipped when the
+        // field is all zeros: that means every candidate matches perfectly,
+        // which is the periodic case already resolved above by choosing the
+        // nearest one. Dividing by a zero median would refuse it for a reason
+        // that says nothing about the content.
+        if median > 0.0 && best_cost / median > EDGE_MAX_BEST_OVER_MEDIAN {
             return DecideOutcome::Reject(RejectReason::NoCandidate);
         }
-        DecideOutcome::Accept { top: best_top, cost: best_cost }
+        DecideOutcome::Accept { top: chosen, cost: best_cost }
+    }
+
+    /// Where the next frame is expected to sit, from the last accepted
+    /// displacement and its trend.
+    fn predicted_delta(&self) -> i32 {
+        match self.last_delta {
+            Some(delta) => (f64::from(delta) + self.trend).round() as i32,
+            None => 0,
+        }
     }
 
     fn basin_rows(&self) -> i32 {
@@ -816,10 +889,18 @@ impl PlacementEngine for WindowedEdgeMatcher {
             self.last_delta = Some(delta);
         }
         self.pending_top = None;
+        self.last_committed_ladder = Some(ladder);
     }
 
     fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    fn last_descriptor(&self) -> Option<(u32, u32, Vec<u8>)> {
+        self.pending_ladder
+            .as_ref()
+            .or(self.last_committed_ladder.as_ref())
+            .map(|ladder| ladder.as_grayscale())
     }
 }
 
@@ -1123,8 +1204,13 @@ mod tests {
     }
 
     #[test]
-    fn periodic_content_is_refused_rather_than_matched_to_a_decoy() {
-        // 12 identical rows repeated: many offsets score identically.
+    fn periodic_content_is_placed_at_the_nearest_of_its_equally_good_offsets() {
+        // 12 identical rows repeated: many offsets score identically. The
+        // content genuinely cannot say which is right, so the engine takes the
+        // one closest to the predicted scroll — the user scrolled a little, not
+        // a page. Every such answer is equally supported by the pixels, so
+        // picking the nearest keeps the canvas continuous instead of dropping
+        // content the page is willing to give us.
         let stride = W * 3;
         let mut data = Vec::new();
         for i in 0..120 {
@@ -1137,19 +1223,24 @@ mod tests {
             0,
             &crop(&page, 0, 60),
         );
+        // The frame sits 24 rows down, but 24 = 2 periods, so 0 also matches.
         let frame = crop(&page, 24, 60);
         let rect = ViewportRect { x: 0, y: 0, width: W, height: 60 };
         let mut req = request(&frame, rect);
         req.stitched = Box::leak(Box::new(canvas_of(60)));
-        let decision = engine.place(&req);
-        assert!(
-            matches!(
-                decision,
-                EngineDecision::Reject { reason: RejectReason::Ambiguous }
-                    | EngineDecision::Reject { reason: RejectReason::NoCandidate }
-            ),
-            "periodic content must not be accepted on a guess, got {decision:?}"
-        );
+        match engine.place(&req) {
+            EngineDecision::Place { rect: placed, .. } => {
+                // Nearest to the zero prediction: 0 is one period closer than
+                // 24, and both are pixel-identical.
+                assert!(
+                    placed.y == 0 || placed.y == 24,
+                    "must land on a period-equivalent offset, got {}",
+                    placed.y
+                );
+                assert_eq!(placed.y % 12, 0, "offset must be a whole number of periods");
+            }
+            other => panic!("periodic content should be placed at the nearest period, got {other:?}"),
+        }
     }
 
     #[test]

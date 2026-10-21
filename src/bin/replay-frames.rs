@@ -46,14 +46,18 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut dir: Option<PathBuf> = None;
     let mut verbose = false;
     let mut save: Option<PathBuf> = None;
+    let mut dump_ladder: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dir" | "-d" => dir = Some(PathBuf::from(args.next().ok_or("--dir needs a path")?)),
             "--verbose" | "-v" => verbose = true,
             "--save" => save = Some(PathBuf::from(args.next().ok_or("--save needs a path")?)),
+            "--dump-ladder" => {
+                dump_ladder = Some(PathBuf::from(args.next().ok_or("--dump-ladder needs a directory")?))
+            }
             "--help" | "-h" => {
-                println!("replay-frames --dir DIR [--verbose] [--save OUT.png]");
+                println!("replay-frames --dir DIR [--verbose] [--save OUT.png] [--dump-ladder DIR]");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument: {other}").into()),
@@ -155,6 +159,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         if push_elapsed > push_worst {
             push_worst = push_elapsed;
             push_worst_frame = i;
+        }
+
+        // Descriptor dump: write the abstract shape the matcher saw next to a
+        // side-by-side of the frame, so a wrong placement can be traced to the
+        // descriptor losing evidence or to the decision discarding it.
+        if let Some(out_dir) = dump_ladder.as_ref() {
+            if let Some((w, h, data)) = stitcher.last_descriptor() {
+                write_descriptor_dump(out_dir, i, w, h, &data, &image)?;
+            }
         }
 
         let mut frame_delta: Option<i32> = None;
@@ -1024,6 +1037,81 @@ fn rgba_from_rgb(stitched: &screenshot_rs_rebuild::stitch::StitchedFrame) -> Vec
         }
     }
     data
+}
+
+/// Writes the descriptor as a grayscale image, plus a side-by-side of the
+/// original frame scaled to the same height.
+///
+/// The descriptor is `bins` wide and `rows` tall — deliberately coarse, because
+/// that is what the matcher compares. Looking at it next to the frame answers
+/// the only question that matters when a placement is wrong: did the descriptor
+/// lose the evidence, or did the decision throw it away?
+fn write_descriptor_dump(
+    out_dir: &Path,
+    index: usize,
+    width: u32,
+    height: u32,
+    data: &[u8],
+    frame: &Image,
+) -> Result<(), Box<dyn Error>> {
+    std::fs::create_dir_all(out_dir)?;
+    if width == 0 || height == 0 || data.len() < (width as usize * height as usize) {
+        return Ok(());
+    }
+    // Descriptor as BGRA, nearest-neighbour scaled so each cell is visible.
+    let scale: u32 = 4;
+    let dw = width * scale;
+    let dh = height;
+    let mut desc = Vec::with_capacity((dw as usize * dh as usize * 4));
+    for y in 0..height {
+        for x in 0..dw {
+            let cell = data[(y * width + x / scale) as usize];
+            desc.extend_from_slice(&[cell, cell, cell, 255]);
+        }
+    }
+    let desc_image = Image {
+        width: dw,
+        height: dh,
+        stride: dw * 4,
+        format: wayland_client::protocol::wl_shm::Format::Xrgb8888,
+        data: desc,
+    };
+    screenshot_rs_rebuild::image::write_png(
+        &out_dir.join(format!("desc-{index:04}.png")),
+        &desc_image,
+    )?;
+
+    // Original frame, nearest-neighbour scaled to the descriptor's height so the
+    // two can be compared row by row.
+    let fw = frame.width.max(1);
+    let fh = frame.height.max(1);
+    let target_h = height;
+    let target_w = (fw * target_h / fh).max(1);
+    let mut orig = Vec::with_capacity((target_w as usize * target_h as usize * 4));
+    for y in 0..target_h {
+        let sy = (y as u64 * fh as u64 / target_h as u64) as u32;
+        for x in 0..target_w {
+            let sx = (x as u64 * fw as u64 / target_w as u64) as u32;
+            let o = (sy * frame.stride as u32 + sx * 4) as usize;
+            if o + 3 < frame.data.len() {
+                orig.extend_from_slice(&frame.data[o..o + 4]);
+            } else {
+                orig.extend_from_slice(&[0, 0, 0, 255]);
+            }
+        }
+    }
+    let orig_image = Image {
+        width: target_w,
+        height: target_h,
+        stride: target_w * 4,
+        format: wayland_client::protocol::wl_shm::Format::Xrgb8888,
+        data: orig,
+    };
+    screenshot_rs_rebuild::image::write_png(
+        &out_dir.join(format!("orig-{index:04}.png")),
+        &orig_image,
+    )?;
+    Ok(())
 }
 
 fn load_image(path: &Path) -> Result<Image, Box<dyn Error>> {
