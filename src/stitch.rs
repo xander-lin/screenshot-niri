@@ -52,6 +52,7 @@ use placement::{find_canvas_placement_match, SearchAxis};
 use engine::{EngineDecision, PlacementEngine, PlacementRequest, WindowedEdgeMatcher};
 use rgb::{
     average_difference_same_source, average_luminance_difference_source, crop_rgb_frame,
+    luminance_range_source,
     pixel_difference_source, pixel_offset, rgb_frame_from_source, validate_rgb_frame,
     validate_rgb_source, CroppedRgbSource,
 };
@@ -697,7 +698,14 @@ impl RawStitcher {
         if let Some(started_at) = duplicate_started_at {
             self.last_profile_breakdown.duplicate_check += started_at.elapsed();
         }
-        if duplicate_difference <= self.duplicate_threshold {
+        // "Identical" is relative to the contrast the content actually has. An
+        // absolute threshold (mean diff <= 2.0) treats real 60 px scrolling on
+        // a two-gray page (delta 2) as a duplicate — every moving frame is
+        // dropped and the canvas never grows. Cap the threshold at the old
+        // absolute value so normal-contrast content behaves exactly as before.
+        let duplicate_threshold = (0.1 * luminance_range_source(&active_compose))
+            .clamp(0.25, self.duplicate_threshold);
+        if duplicate_difference <= duplicate_threshold {
             self.last_duplicate_difference = Some(duplicate_difference);
             if crate::trace::trace_deep_profile_enabled() {
                 if let Some(previous) = self.previous_perceptual_frame.as_ref() {

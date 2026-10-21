@@ -176,6 +176,28 @@ pub(super) fn average_difference_same_source(a: &impl RgbSource, b: &impl RgbSou
     }
 }
 
+/// Luminance range of a source, sampled every 4 px. Near-duplicate detection
+/// uses it to judge "identical" relative to how much contrast the content
+/// actually has: an absolute threshold treats real motion on low-contrast
+/// content as a duplicate frame and silently drops the capture.
+pub(super) fn luminance_range_source(source: &impl RgbSource) -> f64 {
+    let mut lo = 255u32;
+    let mut hi = 0u32;
+    for y in (0..source.height()).step_by(4) {
+        for x in (0..source.width()).step_by(4) {
+            let [r, g, b] = source.pixel_rgb(x, y);
+            let l = (77 * u32::from(r) + 150 * u32::from(g) + 29 * u32::from(b)) >> 8;
+            lo = lo.min(l);
+            hi = hi.max(l);
+        }
+    }
+    if hi >= lo {
+        (hi - lo) as f64
+    } else {
+        0.0
+    }
+}
+
 pub(super) fn average_luminance_difference_source(
     previous: &PerceptualFrame,
     current: &impl RgbSource,

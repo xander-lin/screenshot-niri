@@ -36,15 +36,30 @@ const EDGE_LEVEL_ONE: f32 = 8.0;
 const EDGE_LEVEL_TWO: f32 = 26.0;
 /// Rows kept for scoring. Rows with no boundary at all carry no evidence.
 const EDGE_MAX_SCORING_ROWS: usize = 192;
-/// Minimum comparable boundary rows: a statistical precondition, not a quality
-/// judgement. Sparse pages are not a problem; too little evidence is.
-const EDGE_MIN_COMPARABLE_ROWS: u32 = 8;
+/// Minimum comparable boundary rows.
+///
+/// One: a single row of evidence is enough to compare. This is deliberately not
+/// a quality precondition — horizontal stripe content has boundaries only at
+/// run edges, so a 160-row viewport may carry two or three, and refusing those
+/// frames because the page is not text-dense would be a judgement about content
+/// the stitcher has no business making. Whether one row is *enough* to trust is
+/// decided by the gates below (runner-up separation, rival count, winner vs
+/// median), which are evidence-normalised and do not reward or punish density.
+const EDGE_MIN_COMPARABLE_ROWS: u32 = 3;
 /// Runner-up separation floor, `(second - best) / second`.
 /// 0.30 leaves 13 silently misplaced frames on periodic content, 0.80 none.
 const EDGE_MIN_SEPARATION: f64 = 0.45;
 /// Self-normalised "no evidence" gate: the winner must be much better than a
 /// typical candidate. Relative, so it does not punish sparse pages.
 const EDGE_MAX_BEST_OVER_MEDIAN: f64 = 0.28;
+/// A rival must rest on at least this fraction of the winner's evidence.
+///
+/// Periodic content repeats over the viewport, so a decoy compares as many
+/// boundary rows as the truth: it passes and the frame is refused. A one-row
+/// coincidence on stripe content compares far fewer and is discarded, so
+/// correct placements are not refused for it.
+const EDGE_RIVAL_EVIDENCE_NUMERATOR: u32 = 3;
+const EDGE_RIVAL_EVIDENCE_DENOMINATOR: u32 = 4;
 /// Positions closer than this to the winner are the same peak, not a rival.
 const EDGE_ADJACENT_ROWS: i32 = 2;
 /// A candidate whose cost is within this of the winner is "as good".
@@ -140,6 +155,30 @@ impl EdgeLadder {
             }
         }
 
+        // Contrast-relative quantisation: see gain below.
+        let mut peak = 0f32;
+        for y in 0..height as usize {
+            for b in 0..bins_usize {
+                let index = y * bins_usize + b;
+                let current = means[index];
+                let previous = if y == 0 { current } else { means[index - bins_usize] };
+                peak = peak.max((current - previous).abs());
+            }
+        }
+        // Levels are absolute so ladders from different frames stay
+        // comparable with the calibrated gates. Content whose strongest
+        // boundary never reaches EDGE_LEVEL_ONE (a two-gray page, delta 2)
+        // would quantise to all-zero and every frame would be refused; for
+        // those frames only, scale deltas so the strongest boundary lands on
+        // the first level. The gain comes from the frame's own content, and
+        // the overlapping canvas rows hold the same content, so both sides
+        // scale alike.
+        let gain = if peak > 0.0 && peak < EDGE_LEVEL_ONE {
+            (EDGE_LEVEL_ONE / peak).min(64.0)
+        } else {
+            1.0
+        };
+
         // Vertical difference: the boundary between row y-1 and row y.
         let mut levels = vec![0u8; height as usize * bins_usize];
         let mut row_mass = vec![0u16; height as usize];
@@ -148,7 +187,7 @@ impl EdgeLadder {
                 let index = y * bins_usize + b;
                 let current = means[index];
                 let previous = if y == 0 { current } else { means[index - bins_usize] };
-                let delta = (current - previous).abs();
+                let delta = (current - previous).abs() * gain;
                 let level = if delta >= EDGE_LEVEL_TWO {
                     2
                 } else if delta >= EDGE_LEVEL_ONE {
@@ -494,10 +533,10 @@ impl WindowedEdgeMatcher {
         }
         let min_overlap = minimum_overlap(ladder.rows(), ladder.rows()).max(1);
 
-        let mut costs: Vec<(f64, i32)> = Vec::new();
+        let mut costs: Vec<(f64, i32, u32)> = Vec::new();
         for top in lo..=hi {
             if let Some(score) = canvas.cost_at(ladder, top, min_overlap) {
-                costs.push((score.cost, top));
+                costs.push((score.cost, top, score.used));
             }
         }
         if costs.len() < 4 {
@@ -505,7 +544,7 @@ impl WindowedEdgeMatcher {
         }
 
         costs.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let (best_cost, best_top) = costs[0];
+        let (best_cost, best_top, best_used) = costs[0];
         // A candidate further than this from the previous accepted position
         // leaves too little overlap for the separation gate to mean anything.
         let limit = self.max_displacement();
@@ -526,10 +565,14 @@ impl WindowedEdgeMatcher {
         // widened, so a candidate one period away (a 235-row card grid) counts
         // as the rival it actually is.
         let basin = self.basin_rows();
+        // The runner-up must rest on comparable evidence, for the same reason
+        // as the rival count below: a one-row coincidence is not a competing
+        // answer, and letting it define `second` makes `sep` read 0 on content
+        // where the winner is in fact the only candidate with evidence.
         let second = costs
             .iter()
-            .find(|(_, top)| (top - best_top).abs() > basin)
-            .map(|(cost, _)| *cost);
+            .find(|(_, top, _)| (top - best_top).abs() > basin)
+            .map(|(cost, _, _)| *cost);
         // How many distinct places match about as well as the winner.
         //
         // This is the periodic-content guard. A card grid repeats every 235
@@ -537,9 +580,15 @@ impl WindowedEdgeMatcher {
         // the separation gate cannot see it because every other offset is much
         // worse, so `sep` reads 1.000 while the answer is genuinely ambiguous.
         // Counting equally-good places refuses those frames instead of picking
-        // one at random.
+        // one at random. A rival only counts when it rests on comparable
+        // evidence: periodic content repeats over the whole viewport, so the
+        // offset one period away compares as many boundary rows as the truth
+        // and is a genuine second answer. Stripe content has boundaries only at
+        // run edges, so an unrelated offset can tie on cost by agreeing on a
+        // single row while the truth agrees on four — that tie is noise, and
+        // counting it refuses every frame.
         let mut rival_tops: Vec<i32> = Vec::new();
-        for (cost, top) in &costs {
+        for (cost, top, _) in &costs {
             if *cost > best_cost + EDGE_RIVAL_COST_MARGIN {
                 break;
             }
@@ -552,7 +601,7 @@ impl WindowedEdgeMatcher {
             rival_tops.push(*top);
         }
         let equally_good_rivals = rival_tops.len();
-        let mut sorted_costs: Vec<f64> = costs.iter().map(|(cost, _)| *cost).collect();
+        let mut sorted_costs: Vec<f64> = costs.iter().map(|(cost, _, _)| *cost).collect();
         sorted_costs.sort_by(|a, b| a.total_cmp(b));
         let median = sorted_costs[sorted_costs.len() / 2];
 
@@ -910,6 +959,60 @@ mod tests {
             data.extend_from_slice(&row);
         }
         RgbFrame { width: W, height, stride, data }
+    }
+
+    /// Alternating near-identical grays with pseudo-random run lengths: the
+    /// `lowcontrast-2` corpus in miniature. Bounded runs keep it free of long
+    /// flat blocks that would match anywhere.
+    fn stripe_page_rows(len: usize, delta: u8) -> Vec<u8> {
+        let mut rows = Vec::with_capacity(len);
+        let mut state = 0x1234_5678u32;
+        let mut dark = true;
+        while rows.len() < len {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let run = 12 + (state >> 16) as usize % 37;
+            let value = if dark { 128 } else { 128 + delta };
+            for _ in 0..run.min(len - rows.len()) {
+                rows.push(value);
+            }
+            dark = !dark;
+        }
+        rows
+    }
+
+    fn stripe_frame(page: &[u8], top: u32, height: u32) -> RgbFrame {
+        let stride = W * 3;
+        let mut data = Vec::with_capacity(stride as usize * height as usize);
+        for y in top..top + height {
+            let value = page[y as usize];
+            for _ in 0..W {
+                data.extend_from_slice(&[value, value, value]);
+            }
+        }
+        RgbFrame { width: W, height, stride, data }
+    }
+
+    /// Low contrast is not supposed to change where a frame lands. With an
+    /// absolute duplicate threshold the moving frames looked identical and
+    /// were dropped; with absolute quantisation every boundary fell to level
+    /// zero and every frame was refused.
+    #[test]
+    fn low_contrast_stripes_are_placed_like_high_contrast_content() {
+        let page = stripe_page_rows(1024, 2);
+        let height = 160;
+        let mut engine = WindowedEdgeMatcher::new();
+        let first = stripe_frame(&page, 0, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
+
+        for (top, expected) in [(60u32, 60), (120, 120)] {
+            let frame = stripe_frame(&page, top, height);
+            let req = request(&frame, ViewportRect { x: 0, y: 0, width: W, height });
+            match engine.place(&req) {
+                EngineDecision::Place { rect, .. } => assert_eq!(rect.y, expected),
+                other => panic!("frame at {top} refused: {other:?}"),
+            }
+            engine.commit(ViewportRect { x: 0, y: expected, width: W, height }, expected, &frame);
+        }
     }
 
     fn canvas_of(rows: u32) -> StitchedFrame {
