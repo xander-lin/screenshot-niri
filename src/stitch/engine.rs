@@ -679,7 +679,10 @@ impl WindowedEdgeMatcher {
         }
         let min_overlap = minimum_overlap(ladder.rows(), ladder.rows()).max(1);
         for top in lo..=hi {
-            if (top - centre).abs() <= inner {
+            // `inner == 0` means "no hole": the ring includes the centre. The
+            // doc below promised that while the code skipped it, so the first
+            // anchor ring could never answer "the content did not move".
+            if inner > 0 && (top - centre).abs() <= inner {
                 continue;
             }
             if let Some(score) = canvas.cost_at(ladder, top, min_overlap) {
@@ -2011,6 +2014,26 @@ mod tests {
         assert!(matches!(engine.place(&req), EngineDecision::Place { .. }));
         assert_eq!(engine.refusals_since_accept, 0);
         assert_eq!(engine.max_displacement(), base);
+    }
+
+    /// The first anchor ring has no hole: it must be able to answer "the
+    /// content did not move". The code skipped the centre (`|top - centre| <=
+    /// inner` with `inner == 0`), which turned the first ring into an annulus
+    /// and contradicted the ring's own contract.
+    #[test]
+    fn the_first_anchor_ring_includes_its_centre() {
+        let height = 60;
+        let mut engine = WindowedEdgeMatcher::new();
+        let first = frame_from(0, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
+        let same = frame_from(0, height);
+        let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first)];
+        let req = request_on_canvas(&same, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
+        let ladder = EdgeLadder::from_source(&same, engine.session_gain).unwrap();
+        match engine.decide_ring(&ladder, 0, 0, 40, &req) {
+            DecideOutcome::Accept { top, .. } => assert_eq!(top, 0, "the centre must win"),
+            DecideOutcome::Reject(_) => panic!("the centre must be a candidate at all"),
+        }
     }
 
     /// The wide stage's near ring must grow with the last step, not be a fixed
