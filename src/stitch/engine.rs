@@ -1096,6 +1096,71 @@ mod tests {
         }
     }
 
+    /// Control for the test below: same page, same scroll, no high-contrast
+    /// block anywhere. Both frames share one gain, so the placement is exact.
+    /// If this passes while the block test fails, the block's effect on `gain`
+    /// is the cause.
+    #[test]
+    fn low_contrast_only_content_is_placed_without_a_block_in_view() {
+        let height = 160;
+        let page = stripe_page_rows(2048, 2);
+        let mut engine = WindowedEdgeMatcher::new();
+        let first = stripe_frame(&page, 0, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
+        let second = stripe_frame(&page, 60, height);
+        let req = request(&second, ViewportRect { x: 0, y: 0, width: W, height });
+        match engine.place(&req) {
+            EngineDecision::Place { rect, .. } => assert_eq!(rect.y, 60),
+            other => panic!("low-contrast-only frame refused: {other:?}"),
+        }
+    }
+
+    /// A page that is mostly two grays two levels apart, with one high-contrast
+    /// block that scrolls into view. The block sets the frame's own peak, and
+    /// the peak sets the quantisation gain, so the *unchanged* low-contrast rows
+    /// land on different levels depending on whether the block is in view.
+    ///
+    /// KNOWN FAILURE, kept as the reproduction. `gain` is derived from the
+    /// frame's own peak, but the canvas rows were written by an earlier frame
+    /// that had a different peak, so the two sides quantise the same content
+    /// differently. Here frame one (peak 2) stores the low-contrast rows as
+    /// level 1; frame two (peak 128, because the block is in view) quantises
+    /// the same rows to level 0 and scores only the block edges, which land on
+    /// canvas rows that were never committed. The frame ends up with one
+    /// comparable row that disagrees, and is refused as ambiguous.
+    ///
+    /// No corpus catches this because every corpus has a constant gain: all
+    /// high-contrast corpora sit at 1.0, lowcontrast-2b at 4.0 throughout.
+    #[ignore = "known defect: per-frame gain makes the two sides quantise differently"]
+    #[test]
+    fn a_high_contrast_block_does_not_erase_the_low_contrast_rows() {
+        let height = 160;
+        let mut page: Vec<u8> = stripe_page_rows(2048, 2);
+        // A black block below the first frame's viewport, so only the second
+        // frame contains it. 160..220 is outside frame one (0..160) and inside
+        // frame two (60..220).
+        for row in 160..220 {
+            page[row] = 0;
+        }
+
+        let mut engine = WindowedEdgeMatcher::new();
+        // First frame: pure low contrast, peak 2, gain 4.
+        let first = stripe_frame(&page, 0, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
+
+        // Second frame: the black block is in view, so peak 128 and gain 1.
+        // The overlapping low-contrast rows are the same content as in frame
+        // one; only their quantisation changed.
+        let second = stripe_frame(&page, 60, height);
+        let req = request(&second, ViewportRect { x: 0, y: 0, width: W, height });
+        match engine.place(&req) {
+            EngineDecision::Place { rect, .. } => {
+                assert_eq!(rect.y, 60, "the frame's true position, got {}", rect.y)
+            }
+            other => panic!("frame with a high-contrast block refused: {other:?}"),
+        }
+    }
+
     fn canvas_of(rows: u32) -> StitchedFrame {
         let frame = frame_from(0, rows);
         StitchedFrame::from_first_frame_with_layout(
