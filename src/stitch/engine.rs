@@ -46,12 +46,40 @@ const EDGE_MAX_SCORING_ROWS: usize = 192;
 /// decided by the gates below (runner-up separation, rival count, winner vs
 /// median), which are evidence-normalised and do not reward or punish density.
 const EDGE_MIN_COMPARABLE_ROWS: u32 = 3;
-/// Runner-up separation floor, `(second - best) / second`.
-/// 0.30 leaves 13 silently misplaced frames on periodic content, 0.80 none.
-const EDGE_MIN_SEPARATION: f64 = 0.45;
-/// Self-normalised "no evidence" gate: the winner must be much better than a
-/// typical candidate. Relative, so it does not punish sparse pages.
-const EDGE_MAX_BEST_OVER_MEDIAN: f64 = 0.28;
+/// Absolute ceiling on the winner's cost.
+///
+/// The cost is already an average over the boundary cells that carried
+/// evidence, so it is comparable across contrast levels and page densities: 0
+/// means every boundary matched, 1 means every one disagreed. No window and no
+/// median enters it.
+const EDGE_MAX_ACCEPT_COST: f64 = 0.08;
+/// The runner-up must cost at least this many times the winner.
+///
+/// Two different failures look like "everything scores low":
+///
+/// * genuinely good content, where the winner is far ahead of the runner-up;
+/// * a repeating page, where several offsets tie because the content really
+///   does repeat.
+///
+/// The absolute gate cannot tell them apart (both winners are cheap), and
+/// neither can `median` — it measures the field, not the top. The ratio of the
+/// two best positions can: a real match stands out by a wide margin, a periodic
+/// page has a runner-up at the same cost. When the ratio is small the content
+/// is ambiguous, and the answer is the *nearest* equivalent offset, not a
+/// refusal.
+const EDGE_MIN_SECOND_OVER_BEST: f64 = 1.5;
+/// Mean per-channel colour difference (in 8-bit levels) at which the
+/// structural winner counts as showing the same content as the pixel canvas.
+///
+/// Calibrated from both sides: real content in motion (the blurred frames of
+/// real-long) reaches 40.6, while a structural fake on unrelated colourful
+/// texture measures 82.2. The threshold sits between them with margin on both
+/// sides.
+const EDGE_MAX_COLOUR_DIFFERENCE: f64 = 30.0;
+/// Margin at which a high absolute cost is forgiven: the winner is this many
+/// times better than the runner-up, so the match is unmistakable even on
+/// imperfect content.
+const EDGE_CONFIDENT_SECOND_OVER_BEST: f64 = 2.5;
 /// A rival must rest on at least this fraction of the winner's evidence.
 ///
 /// Periodic content repeats over the viewport, so a decoy compares as many
@@ -627,6 +655,7 @@ impl WindowedEdgeMatcher {
         centre: i32,
         inner: i32,
         outer: i32,
+        request: &PlacementRequest<'_>,
     ) -> DecideOutcome {
         let lo = centre - outer;
         let hi = centre + outer;
@@ -646,10 +675,16 @@ impl WindowedEdgeMatcher {
                 costs.push((score.cost, top, score.used));
             }
         }
-        self.decide_from_costs(ladder, costs, centre)
+        self.decide_from_costs(ladder, costs, centre, request)
     }
 
-    fn decide(&self, ladder: &EdgeLadder, lo: i32, hi: i32) -> DecideOutcome {
+    fn decide(
+        &self,
+        ladder: &EdgeLadder,
+        lo: i32,
+        hi: i32,
+        request: &PlacementRequest<'_>,
+    ) -> DecideOutcome {
         let Some(canvas) = self.canvas.as_ref() else {
             return DecideOutcome::Reject(RejectReason::Uninitialised);
         };
@@ -668,7 +703,7 @@ impl WindowedEdgeMatcher {
         // estimate for this pass: the impulse and wide stages centre on the
         // prediction, the anchor stage on the anchor.
         let centre = lo.saturating_add(hi) / 2;
-        self.decide_from_costs(ladder, costs, centre)
+        self.decide_from_costs(ladder, costs, centre, request)
     }
 
     /// The gate decision, given the scored candidates for one window.
@@ -681,6 +716,7 @@ impl WindowedEdgeMatcher {
         ladder: &EdgeLadder,
         mut costs: Vec<(f64, i32, u32)>,
         centre: i32,
+        request: &PlacementRequest<'_>,
     ) -> DecideOutcome {
         if costs.len() < 4 {
             return DecideOutcome::Reject(RejectReason::InsufficientEvidence);
@@ -755,22 +791,12 @@ impl WindowedEdgeMatcher {
             rival_tops.push(*top);
         }
         let equally_good_rivals = rival_tops.len();
-        let mut sorted_costs: Vec<f64> = costs.iter().map(|(cost, _, _)| *cost).collect();
-        sorted_costs.sort_by(|a, b| a.total_cmp(b));
-        let median = sorted_costs[sorted_costs.len() / 2];
 
-        let separation = match second {
-            Some(second) if second > 0.0 => (second - best_cost) / second,
-            // A rival scoring exactly zero means two identical answers exist.
-            Some(_) => 0.0,
-            None => 0.0,
-        };
         if crate::trace::edge_gate_trace_enabled() {
             crate::trace_log!(
                 "stitch: edge gate window={}..={} best={best_cost:.4}@{best_top} \
-                 second={second:?} rivals={equally_good_rivals} sep={separation:.3} \
-                 median={median:.4} best_over_median={:.3}",
-                if median > 0.0 { best_cost / median } else { f64::INFINITY },
+                 second={second:?} rivals={equally_good_rivals} second_over_best={second_over_best:.2} \
+                 max_accept={EDGE_MAX_ACCEPT_COST}",
                 costs.iter().map(|c| c.1).min().unwrap_or(0),
                 costs.iter().map(|c| c.1).max().unwrap_or(0)
             );
@@ -783,48 +809,193 @@ impl WindowedEdgeMatcher {
         // continuous. Refusing instead would drop content the page is happy to
         // give us, and the nearest answer is exactly as well supported as any
         // other by the pixels.
-        let chosen = if equally_good_rivals > 0 || separation < EDGE_MIN_SEPARATION {
+        // How far ahead the winner is of the next distinct answer.
+        //
+        // This is the gate that separates "the winner is genuinely the one"
+        // from "several offsets fit equally well". It is a property of the two
+        // best positions, so it does not move with the search window.
+        // `None` means there is no candidate outside the winner's basin — in
+        // the narrow impulse window that usually means the window was too
+        // narrow to contain one, not that the winner is unopposed. It must not
+        // read as an infinite margin, or the absolute gate is bypassed and a
+        // 0.71-cost "winner" gets written.
+        let second_over_best = match second {
+            // A perfect winner (cost exactly 0) is as confident as it gets.
+            Some(second) if second > 0.0 && best_cost <= 0.0 => f64::INFINITY,
+            Some(second) if best_cost > 0.0 => second / best_cost,
+            // A rival scoring exactly zero: two identical answers exist.
+            Some(_) => 1.0,
+            None => 0.0,
+        };
+        // A small ratio means the content cannot say which offset is right.
+        // That is not a reason to refuse: the nearest equivalent offset keeps
+        // the canvas continuous, and every one of those offsets is equally
+        // supported by the pixels.
+        // Ambiguous: the two best offsets are within the ratio of each other.
+        // The ladder cannot tell them apart — it is colour-blind by design —
+        // so the tie is broken on the actual pixels: a candidate survives if
+        // its colour difference against the pixel canvas is acceptable. If
+        // more than one survives, the nearest wins; if none does, the
+        // structural tie was a coincidence and the frame is refused.
+        let ambiguous = second_over_best < EDGE_MIN_SECOND_OVER_BEST || equally_good_rivals > 0;
+        let chosen = if ambiguous {
             let target = centre;
-            let mut pick = (best_top, (best_top - target).abs());
-            for rival in std::iter::once(best_top).chain(rival_tops.iter().copied()) {
-                let distance = (rival - target).abs();
-                if distance < pick.1 {
-                    pick = (rival, distance);
+            let candidates: Vec<i32> =
+                std::iter::once(best_top).chain(rival_tops.iter().copied()).collect();
+            let survivors: Vec<(i32, f64)> = candidates
+                .iter()
+                .filter_map(|&top| {
+                    let colour = self.colour_cost_at(request, top)?;
+                    (colour <= EDGE_MAX_COLOUR_DIFFERENCE).then_some((top, colour))
+                })
+                .collect();
+            let pick = match survivors.as_slice() {
+                [] => {
+                    if crate::trace::edge_gate_trace_enabled() {
+                        crate::trace_log!(
+                            "stitch: ambiguous (second/best={second_over_best:.2}) but no \
+                             candidate passes the colour check"
+                        );
+                    }
+                    return DecideOutcome::Reject(RejectReason::NoCandidate);
                 }
-            }
-            if crate::trace::edge_gate_trace_enabled() {
-                crate::trace_log!(
-                    "stitch: periodic content, choosing nearest of {} candidates: {} (predicted {})",
-                    equally_good_rivals + 1,
-                    pick.0,
-                    target
-                );
-            }
-            pick.0
+                many => {
+                    let mut pick = (many[0].0, (many[0].0 - target).abs());
+                    for top in many.iter().skip(1).map(|&(t, _)| t) {
+                        let distance = (top - target).abs();
+                        if distance < pick.1 {
+                            pick = (top, distance);
+                        }
+                    }
+                    if crate::trace::edge_gate_trace_enabled() {
+                        crate::trace_log!(
+                            "stitch: ambiguous (second/best={second_over_best:.2}), {} of {} \
+                             candidates pass the colour check, choosing nearest: {} \
+                             (target {target})",
+                            many.len(),
+                            candidates.len(),
+                            pick.0
+                        );
+                    }
+                    pick.0
+                }
+            };
+            pick
         } else {
             best_top
         };
-        if separation < EDGE_MIN_SEPARATION && equally_good_rivals == 0 {
-            return DecideOutcome::Reject(RejectReason::Ambiguous);
+        // The only absolute gate: how good the winner is on its own.
+        //
+        // `median` is gone. It is the typical cost across whatever window was
+        // searched, so it moves when the window moves, and a decision that
+        // flips with the search radius is not measuring the content. The
+        // winner's own cost is a property of the frame and the canvas alone.
+        // The structural winner must also look like the canvas in colour.
+        //
+        // The ladder is colour-blind, and that blindness can be exploited by
+        // content whose *structure* repeats with different colours: measured,
+        // a fabricated canvas produced a confident-looking structural match
+        // (0.073 with a 1.82x runner-up) whose pixels matched nothing. Colour
+        // is checked on every acceptance, not only on ties, because the
+        // confident fake and the genuine tie are the same failure wearing two
+        // different ratios.
+        if let Some(colour) = self.colour_cost_at(request, chosen) {
+            if colour > EDGE_MAX_COLOUR_DIFFERENCE {
+                if crate::trace::edge_gate_trace_enabled() {
+                    crate::trace_log!(
+                        "stitch: structural winner {best_cost:.4}@{chosen} rejected on \
+                         colour: mean difference {colour:.1}"
+                    );
+                }
+                return DecideOutcome::Reject(RejectReason::NoCandidate);
+            }
         }
-        // The "winner must beat a typical candidate" gate. Skipped when the
-        // field is all zeros: that means every candidate matches perfectly,
-        // which is the periodic case already resolved above by choosing the
-        // nearest one. Dividing by a zero median would refuse it for a reason
-        // that says nothing about the content.
-        if median > 0.0 && best_cost / median > EDGE_MAX_BEST_OVER_MEDIAN {
+        // The absolute gate, with a margin-based escape.
+        //
+        // Motion blur genuinely weakens boundaries, so a real match on moving
+        // content can cost more than clean content ever does while still being
+        // unmistakable: the runner-up is far worse. Refusing those drops frames
+        // that are plainly placeable. The escape requires an *actual* runner-up
+        // with a wide margin — `second_over_best` is 0 when there is none, so a
+        // window with nothing to compare against cannot use it.
+        let confident = second_over_best >= EDGE_CONFIDENT_SECOND_OVER_BEST;
+        if best_cost > EDGE_MAX_ACCEPT_COST && !confident {
+            if crate::trace::edge_gate_trace_enabled() {
+                crate::trace_log!(
+                    "stitch: winner {best_cost:.4}@{best_top} over absolute cost \
+                     {EDGE_MAX_ACCEPT_COST} and only {second_over_best:.2}x ahead"
+                );
+            }
             return DecideOutcome::Reject(RejectReason::NoCandidate);
         }
         DecideOutcome::Accept { top: chosen, cost: best_cost }
     }
 
-    /// Where the next frame is expected to sit, from the last accepted
-    /// displacement and its trend.
-    fn predicted_delta(&self) -> i32 {
-        match self.last_delta {
-            Some(delta) => (f64::from(delta) + self.trend).round() as i32,
-            None => 0,
+    /// Mean absolute colour difference between the frame and the pixel canvas
+    /// at a candidate offset, sampled on a grid.
+    ///
+    /// The boundary ladder is deliberately blind to colour and absolute
+    /// brightness — that is what makes it robust. The blindness has a cost:
+    /// content whose *structure* repeats with different colours ties in the
+    /// ladder, and the ladder alone cannot break the tie. This check can, by
+    /// reading the actual pixels both sides are made of.
+    fn colour_cost_at(
+        &self,
+        request: &PlacementRequest<'_>,
+        top: i32,
+    ) -> Option<f64> {
+        let stitched = request.stitched;
+        let frame = request.frame;
+        // Engine row `top + y` is canvas row `anchor + y` where `anchor` maps
+        // the engine's logical space onto the stitched pixel space.
+        let engine_pos = self.pos?;
+        let canvas_anchor = request.previous_rect.y + (top - engine_pos);
+        let mut total = 0u64;
+        let mut samples = 0u64;
+        let fw = frame.width();
+        let fh = frame.height();
+        let step_x = (fw / 8).max(1);
+        let step_y = (fh / 12).max(1);
+        for y in (0..fh).step_by(step_y as usize) {
+            // `stitched` rows are addressed directly by canvas coordinate:
+            // when the canvas grows upward the stitcher rebases the data *and*
+            // the viewport rects together, so `previous_rect.y + (top -
+            // engine_pos)` already lands on the right row without an origin
+            // adjustment. (Subtracting an origin here measurably broke real-1,
+            // whose canvas prepends throughout.)
+            let canvas_y = canvas_anchor + y as i32;
+            if canvas_y < 0 || canvas_y >= stitched.height as i32 {
+                continue;
+            }
+            for x in (0..fw).step_by(step_x as usize) {
+                // The frame's left edge sits at `previous_rect.x` in the
+                // canvas; a selection that does not start at x=0 has to be
+                // shifted before its pixels can be compared.
+                let canvas_x = request.previous_rect.x + x as i32;
+                if canvas_x < 0 || canvas_x >= stitched.width as i32 {
+                    continue;
+                }
+                let f = frame.pixel_rgb(x, y);
+                let so = canvas_y as usize * stitched.stride as usize
+                    + canvas_x as usize * 3;
+                if so + 2 >= stitched.data.len() {
+                    continue;
+                }
+                let c = [
+                    stitched.data[so],
+                    stitched.data[so + 1],
+                    stitched.data[so + 2],
+                ];
+                total += u64::from(f[0].abs_diff(c[0]))
+                    + u64::from(f[1].abs_diff(c[1]))
+                    + u64::from(f[2].abs_diff(c[2]));
+                samples += 3;
+            }
         }
+        if samples == 0 {
+            return None;
+        }
+        Some(total as f64 / samples as f64)
     }
 
     fn basin_rows(&self) -> i32 {
@@ -932,7 +1103,7 @@ impl PlacementEngine for WindowedEdgeMatcher {
         if self.last_delta.is_some() {
             let half = self.impulse_half_width();
             if let DecideOutcome::Accept { top, cost } =
-                self.decide(&ladder, predicted_top - half, predicted_top + half)
+                self.decide(&ladder, predicted_top - half, predicted_top + half, request)
             {
                 return self.accept(request, ladder.clone(), top, cost);
             }
@@ -961,6 +1132,7 @@ impl PlacementEngine for WindowedEdgeMatcher {
             &ladder,
             predicted_top - EDGE_WIDE_HALF_WIDTH,
             predicted_top + EDGE_WIDE_HALF_WIDTH,
+            request,
         ) {
             return self.accept(request, ladder.clone(), top, cost);
         }
@@ -977,7 +1149,7 @@ impl PlacementEngine for WindowedEdgeMatcher {
             let mut radius = EDGE_ANCHOR_BASE_HALF_WIDTH.min(limit);
             loop {
                 if let DecideOutcome::Accept { top, cost } =
-                    self.decide_ring(&ladder, anchor, inner, radius)
+                    self.decide_ring(&ladder, anchor, inner, radius, request)
                 {
                     return self.accept(request, ladder.clone(), top, cost);
                 }
@@ -1245,14 +1417,20 @@ mod tests {
         let first = stripe_frame(&page, 0, height);
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
 
+        let first_frame = first.clone();
+        let mut committed: Vec<(i32, RgbFrame)> = vec![(0, first_frame)];
         for (top, expected) in [(60u32, 60), (120, 120)] {
             let frame = stripe_frame(&page, top, height);
-            let req = request(&frame, ViewportRect { x: 0, y: 0, width: W, height });
+            let refs: Vec<(i32, &RgbFrame)> =
+                committed.iter().map(|(y, f)| (*y, f)).collect();
+            let req =
+                request_on_canvas(&frame, ViewportRect { x: 0, y: 0, width: W, height }, &refs);
             match engine.place(&req) {
                 EngineDecision::Place { rect, .. } => assert_eq!(rect.y, expected),
                 other => panic!("frame at {top} refused: {other:?}"),
             }
             engine.commit(ViewportRect { x: 0, y: expected, width: W, height }, expected, &frame);
+            committed.push((expected, frame.clone()));
         }
     }
 
@@ -1268,7 +1446,8 @@ mod tests {
         let first = stripe_frame(&page, 0, height);
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
         let second = stripe_frame(&page, 60, height);
-        let req = request(&second, ViewportRect { x: 0, y: 0, width: W, height });
+        let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first)];
+        let req = request_on_canvas(&second, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
         match engine.place(&req) {
             EngineDecision::Place { rect, .. } => assert_eq!(rect.y, 60),
             other => panic!("low-contrast-only frame refused: {other:?}"),
@@ -1312,7 +1491,8 @@ mod tests {
         // The overlapping low-contrast rows are the same content as in frame
         // one; only their quantisation changed.
         let second = stripe_frame(&page, 60, height);
-        let req = request(&second, ViewportRect { x: 0, y: 0, width: W, height });
+        let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first)];
+        let req = request_on_canvas(&second, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
         match engine.place(&req) {
             EngineDecision::Place { rect, .. } => {
                 assert_eq!(rect.y, 60, "the frame's true position, got {}", rect.y)
@@ -1362,13 +1542,15 @@ mod tests {
             }
             RgbFrame { width: W, height, stride, data }
         };
-        let req = request(&flat, ViewportRect { x: 0, y: 0, width: W, height });
+        let committed_flat: Vec<(i32, &RgbFrame)> = vec![(0, &first)];
+        let req = request_on_canvas(&flat, ViewportRect { x: 0, y: 0, width: W, height }, &committed_flat);
         assert!(matches!(engine.place(&req), EngineDecision::Reject { .. }));
 
         // 40 rows down is exactly one period: it matches at 40, 0, -40, ...
         // The nearest answer to the anchor at 0 is 40 (one period down).
         let back = periodic(40, height);
-        let req = request(&back, ViewportRect { x: 0, y: 0, width: W, height });
+        let committed_back: Vec<(i32, &RgbFrame)> = vec![(0, &first)];
+        let req = request_on_canvas(&back, ViewportRect { x: 0, y: 0, width: W, height }, &committed_back);
         match engine.place(&req) {
             EngineDecision::Place { rect, .. } => {
                 assert!(
@@ -1394,6 +1576,102 @@ mod tests {
     fn request<'a>(frame: &'a dyn RgbSource, rect: ViewportRect) -> PlacementRequest<'a> {
         PlacementRequest {
             stitched: Box::leak(Box::new(canvas_of(frame.height()))),
+            previous_rect: rect,
+            frame,
+            search_direction: None,
+        }
+    }
+
+    /// [`Self::request`] with a pixel canvas built from the frames the test
+    /// actually committed, rebased the way the stitcher does it.
+    ///
+    /// The colour check reads `stitched` to verify a structural match against
+    /// real pixels. A fabricated canvas there (`canvas_of`, which always holds
+    /// row-texture rows 0..n) makes content the test committed look unrelated,
+    /// and the check rightly rejects it. This mirrors what production does:
+    /// rows are addressed directly by canvas coordinate, and a frame that
+    /// lands above row 0 rebases the whole canvas (data *and* rects) instead of
+    /// shifting an origin.
+    fn request_on_canvas<'a>(
+        frame: &'a dyn RgbSource,
+        rect: ViewportRect,
+        committed: &[(i32, &RgbFrame)],
+    ) -> PlacementRequest<'a> {
+        let mut rows: Vec<Option<Vec<u8>>> = Vec::new();
+        let mut prev_rect_y = 0i32;
+        let mut prev_engine_pos = 0i32;
+        let mut first = true;
+        for &(top, commit_frame) in committed {
+            if first {
+                prev_rect_y = 0;
+                prev_engine_pos = top;
+                rows = vec![None; commit_frame.height as usize];
+                for row in 0..commit_frame.height as usize {
+                    let src = row * commit_frame.stride as usize;
+                    rows[row] =
+                        Some(commit_frame.data[src..src + W as usize * 3].to_vec());
+                }
+                prev_rect_y = 0;
+                prev_engine_pos = top;
+                first = false;
+                continue;
+            }
+            let mut anchor = prev_rect_y + (top - prev_engine_pos);
+            if anchor < 0 {
+                // Prepend: everything moves down by -anchor; rects rebase too.
+                let shift = (-anchor) as usize;
+                let mut rebased = vec![None; shift];
+                rebased.extend(rows);
+                rows = rebased;
+                anchor = 0;
+                prev_rect_y = 0;
+            } else {
+                prev_rect_y = anchor;
+            }
+            prev_engine_pos = top;
+            if rows.len() < anchor as usize + commit_frame.height as usize {
+                rows.resize(anchor as usize + commit_frame.height as usize, None);
+            }
+            for row in 0..commit_frame.height as usize {
+                let index = anchor as usize + row;
+                if rows[index].is_some() {
+                    continue; // first write wins, mirroring EdgeCanvas::write
+                }
+                let src = row * commit_frame.stride as usize;
+                rows[index] =
+                    Some(commit_frame.data[src..src + W as usize * 3].to_vec());
+            }
+        }
+        let height = rows.len().max(1) as u32;
+        let mut data = vec![0u8; W as usize * 3 * height as usize];
+        for (row, content) in rows.iter().enumerate() {
+            if let Some(content) = content {
+                let dst = row * W as usize * 3;
+                data[dst..dst + content.len()].copy_from_slice(content);
+            }
+        }
+        let stitched = StitchedFrame {
+            width: W,
+            height,
+            stride: W * 3,
+            data,
+            current_origin_x: 0,
+            current_origin_y: 0,
+            anchor_origin_x: 0,
+            anchor_origin_y: 0,
+            compose_width: W,
+            compose_height: height,
+            active_crop: crate::stitch::ComposeCrop {
+                x: 0,
+                y: 0,
+                width: W,
+                height,
+            },
+            fixed_bands: crate::stitch::FixedBands::default(),
+            row_coverage: Vec::new(),
+        };
+        PlacementRequest {
+            stitched: Box::leak(Box::new(stitched)),
             previous_rect: rect,
             frame,
             search_direction: None,
@@ -1513,8 +1791,9 @@ mod tests {
         // The frame sits 24 rows down, but 24 = 2 periods, so 0 also matches.
         let frame = crop(&page, 24, 60);
         let rect = ViewportRect { x: 0, y: 0, width: W, height: 60 };
-        let mut req = request(&frame, rect);
-        req.stitched = Box::leak(Box::new(canvas_of(60)));
+        let committed_crop = crop(&page, 0, 60);
+        let committed: Vec<(i32, &RgbFrame)> = vec![(0, &committed_crop)];
+        let mut req = request_on_canvas(&frame, rect, &committed);
         match engine.place(&req) {
             EngineDecision::Place { rect: placed, .. } => {
                 // Nearest to the zero prediction: 0 is one period closer than
@@ -1593,8 +1872,9 @@ mod tests {
         // canvas grows upward, so it prepends 17 rows and this frame lands at
         // pixel row 0 while the engine asked for -17.
         let upward = frame_from_signed(83, height);
-        let mut req = request(&upward, ViewportRect { x: 0, y: 0, width: W, height });
-        req.stitched = Box::leak(Box::new(canvas_of(height)));
+        let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first)];
+        let mut req =
+            request_on_canvas(&upward, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
         let EngineDecision::Place { match_info, .. } = engine.place(&req) else {
             panic!("expected the upward frame to be placed");
         };
@@ -1607,9 +1887,12 @@ mod tests {
         assert_eq!(engine.pos, Some(-17));
 
         // A further upward frame must be found 17 rows above that, at -34.
+        // The pixel canvas has been rebased by the prepend: both committed
+        // frames live in it, the upward one at row 0 and the first 17 below.
         let further = frame_from_signed(66, height);
-        let mut req = request(&further, ViewportRect { x: 0, y: 0, width: W, height });
-        req.stitched = Box::leak(Box::new(canvas_of(height)));
+        let committed2: Vec<(i32, &RgbFrame)> = vec![(-17, &upward), (0, &first)];
+        let mut req =
+            request_on_canvas(&further, ViewportRect { x: 0, y: 0, width: W, height }, &committed2);
         let EngineDecision::Place { match_info, .. } = engine.place(&req) else {
             panic!("expected the second upward frame to be placed");
         };
@@ -1628,8 +1911,9 @@ mod tests {
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
 
         let upward = frame_from_signed(83, height);
-        let mut req = request(&upward, ViewportRect { x: 0, y: 0, width: W, height });
-        req.stitched = Box::leak(Box::new(canvas_of(height)));
+        let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first)];
+        let mut req =
+            request_on_canvas(&upward, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
         assert!(matches!(engine.place(&req), EngineDecision::Place { .. }));
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, -17, &upward);
 
