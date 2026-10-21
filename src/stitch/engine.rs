@@ -119,7 +119,65 @@ impl EdgeLadder {
     ///
     /// The margin exists so a moving scrollbar never enters the comparison; it
     /// is a fixed fraction, not a detection step.
-    pub(super) fn from_source(frame: &dyn RgbSource) -> Option<Self> {
+    /// The gain a session should use, from the first frame committed.
+    ///
+    /// Low-contrast content (peak below the first level's threshold) needs its
+    /// deltas amplified or it produces no boundaries at all; everything else
+    /// uses the neutral 1.0. See `from_source` for why this is decided once
+    /// per session rather than per frame.
+    pub(super) fn session_gain(frame: &dyn RgbSource) -> f32 {
+        let peak = Self::peak_delta(frame);
+        if peak > 0.0 && peak < EDGE_LEVEL_ONE {
+            (EDGE_LEVEL_ONE / peak).min(64.0)
+        } else {
+            1.0
+        }
+    }
+
+    /// The strongest vertical bin-mean delta in a frame, in luminance levels.
+    fn peak_delta(frame: &dyn RgbSource) -> f32 {
+        let width = frame.width();
+        let height = frame.height();
+        if width == 0 || height == 0 {
+            return 0.0;
+        }
+        let margin = width * EDGE_MARGIN_NUMERATOR / EDGE_MARGIN_DENOMINATOR;
+        let body_start = margin.min(width);
+        let body_end = width.saturating_sub(margin).max(body_start);
+        let body_width = body_end - body_start;
+        if body_width == 0 {
+            return 0.0;
+        }
+        let bins = EDGE_BINS.min(body_width as usize) as u32;
+        let bin_width = body_width / bins;
+        let mut previous: Option<Vec<f32>> = None;
+        let mut peak = 0f32;
+        for y in 0..height {
+            let mut row = vec![0f32; bins as usize];
+            for b in 0..bins {
+                let x0 = body_start + b * bin_width;
+                let x1 = if b + 1 == bins { body_end } else { x0 + bin_width };
+                let mut sum = 0u32;
+                let mut count = 0u32;
+                for x in x0..x1 {
+                    let [r, g, bl] = frame.pixel_rgb(x, y);
+                    sum += 77 * u32::from(r) + 150 * u32::from(g) + 29 * u32::from(bl);
+                    count += 1;
+                }
+                row[b as usize] =
+                    if count == 0 { 0.0 } else { (sum >> 8) as f32 / count as f32 };
+            }
+            if let Some(prev) = previous.as_ref() {
+                for b in 0..bins as usize {
+                    peak = peak.max((row[b] - prev[b]).abs());
+                }
+            }
+            previous = Some(row);
+        }
+        peak
+    }
+
+    pub(super) fn from_source(frame: &dyn RgbSource, gain: f32) -> Option<Self> {
         let width = frame.width();
         let height = frame.height();
         if width == 0 || height == 0 {
@@ -156,28 +214,15 @@ impl EdgeLadder {
         }
 
         // Contrast-relative quantisation: see gain below.
-        let mut peak = 0f32;
-        for y in 0..height as usize {
-            for b in 0..bins_usize {
-                let index = y * bins_usize + b;
-                let current = means[index];
-                let previous = if y == 0 { current } else { means[index - bins_usize] };
-                peak = peak.max((current - previous).abs());
-            }
-        }
-        // Levels are absolute so ladders from different frames stay
-        // comparable with the calibrated gates. Content whose strongest
-        // boundary never reaches EDGE_LEVEL_ONE (a two-gray page, delta 2)
-        // would quantise to all-zero and every frame would be refused; for
-        // those frames only, scale deltas so the strongest boundary lands on
-        // the first level. The gain comes from the frame's own content, and
-        // the overlapping canvas rows hold the same content, so both sides
-        // scale alike.
-        let gain = if peak > 0.0 && peak < EDGE_LEVEL_ONE {
-            (EDGE_LEVEL_ONE / peak).min(64.0)
-        } else {
-            1.0
-        };
+        // The gain comes from the *session*, not from this frame. It exists so
+        // low-contrast content (a two-gray page, delta 2, below the first
+        // level's threshold) still produces boundaries. Deriving it per frame
+        // made the two sides of a comparison disagree about unchanged content:
+        // the canvas rows were written by an earlier frame whose peak — and
+        // therefore gain — differed, so the same boundary landed on different
+        // levels on the two sides. One gain for the whole session keeps every
+        // ladder on the scale the canvas was built with; a boundary stronger
+        // than the scale simply saturates at level 2, which compares fine.
 
         // Vertical difference: the boundary between row y-1 and row y.
         let mut levels = vec![0u8; height as usize * bins_usize];
@@ -545,6 +590,10 @@ pub(super) struct WindowedEdgeMatcher {
     /// The ladder of the frame most recently committed, kept for the debug
     /// descriptor dump (`pending_ladder` is consumed by `commit`).
     last_committed_ladder: Option<EdgeLadder>,
+    /// The one quantisation gain for the whole session, set when the canvas is
+    /// initialised. Every ladder is built with it, so a frame and the canvas
+    /// rows it is compared against always share one scale.
+    session_gain: f32,
 }
 
 impl WindowedEdgeMatcher {
@@ -783,7 +832,7 @@ impl PlacementEngine for WindowedEdgeMatcher {
 
     fn place(&mut self, request: &PlacementRequest<'_>) -> EngineDecision {
         self.pending_ladder = None;
-        let Some(ladder) = EdgeLadder::from_source(request.frame) else {
+        let Some(ladder) = EdgeLadder::from_source(request.frame, self.session_gain) else {
             return EngineDecision::Reject { reason: RejectReason::Invalid };
         };
         let Some(pos) = self.pos else {
@@ -844,9 +893,16 @@ impl PlacementEngine for WindowedEdgeMatcher {
     }
 
     fn commit(&mut self, rect: ViewportRect, requested_top: i32, frame: &dyn RgbSource) {
+        // The session's one gain is decided by the frame that initialises the
+        // canvas, before that frame's own ladder is built: every ladder —
+        // including the first — must share the scale the canvas is written
+        // with.
+        if self.canvas.is_none() {
+            self.session_gain = EdgeLadder::session_gain(frame);
+        }
         let ladder = match self.pending_ladder.take() {
             Some(ladder) => ladder,
-            None => match EdgeLadder::from_source(frame) {
+            None => match EdgeLadder::from_source(frame, self.session_gain) {
                 Some(ladder) => ladder,
                 None => return,
             },
@@ -1120,18 +1176,18 @@ mod tests {
     /// the peak sets the quantisation gain, so the *unchanged* low-contrast rows
     /// land on different levels depending on whether the block is in view.
     ///
-    /// KNOWN FAILURE, kept as the reproduction. `gain` is derived from the
-    /// frame's own peak, but the canvas rows were written by an earlier frame
-    /// that had a different peak, so the two sides quantise the same content
-    /// differently. Here frame one (peak 2) stores the low-contrast rows as
-    /// level 1; frame two (peak 128, because the block is in view) quantises
-    /// the same rows to level 0 and scores only the block edges, which land on
-    /// canvas rows that were never committed. The frame ends up with one
-    /// comparable row that disagrees, and is refused as ambiguous.
+    /// `gain` is a session-wide constant, decided by the frame that
+    /// initialises the canvas. It used to be derived per frame, which made the
+    /// two sides of a comparison disagree about unchanged content: frame one
+    /// (peak 2, gain 4) stored the low-contrast rows as level 1, while frame
+    /// two (peak 128 because the block was in view, gain 1) quantised the same
+    /// rows to level 0 and scored only the block's edges, which landed on
+    /// canvas rows never committed. With one session gain, frame two quantises
+    /// on frame one's scale: the block saturates at level 2 and the
+    /// low-contrast rows stay level 1 on both sides.
     ///
     /// No corpus catches this because every corpus has a constant gain: all
     /// high-contrast corpora sit at 1.0, lowcontrast-2b at 4.0 throughout.
-    #[ignore = "known defect: per-frame gain makes the two sides quantise differently"]
     #[test]
     fn a_high_contrast_block_does_not_erase_the_low_contrast_rows() {
         let height = 160;
@@ -1198,7 +1254,7 @@ mod tests {
             data.extend_from_slice(&row_texture(120));
         }
         let frame = RgbFrame { width: W, height: 20, stride, data };
-        let ladder = EdgeLadder::from_source(&frame).unwrap();
+        let ladder = EdgeLadder::from_source(&frame, EdgeLadder::session_gain(&frame)).unwrap();
         assert_eq!(ladder.rows(), 20);
         assert_eq!(ladder.scoring_rows, vec![10]);
     }
@@ -1254,8 +1310,9 @@ mod tests {
         // The basin is one row wide; this asserts the descriptor keeps it.
         let a = frame_from(100, 80);
         let b = frame_from(117, 80);
-        let la = EdgeLadder::from_source(&a).unwrap();
-        let lb = EdgeLadder::from_source(&b).unwrap();
+        let ga = EdgeLadder::session_gain(&a);
+        let la = EdgeLadder::from_source(&a, ga).unwrap();
+        let lb = EdgeLadder::from_source(&b, ga).unwrap();
         let mut canvas = EdgeCanvas::new(la.bins, 0);
         canvas.write(0, &la);
 
@@ -1412,7 +1469,8 @@ mod tests {
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, -17, &upward);
 
         let canvas = engine.canvas.as_ref().expect("canvas exists");
-        let ladder = EdgeLadder::from_source(&upward).unwrap();
+        let ladder =
+            EdgeLadder::from_source(&upward, EdgeLadder::session_gain(&upward)).unwrap();
         let cost = canvas.cost_at(&ladder, -17, 1).expect("evidence at -17");
         assert!(
             cost.cost < 0.01,
@@ -1420,7 +1478,7 @@ mod tests {
             cost.cost
         );
         // The rows it did not cover must still hold the older content.
-        let old = EdgeLadder::from_source(&first).unwrap();
+        let old = EdgeLadder::from_source(&first, EdgeLadder::session_gain(&first)).unwrap();
         let cost = canvas.cost_at(&old, 0, 1).expect("evidence at 0");
         assert!(
             cost.cost < 0.01,
