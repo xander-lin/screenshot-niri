@@ -38,15 +38,24 @@ const EDGE_LEVEL_ONE: f32 = 8.0;
 const EDGE_LEVEL_TWO: f32 = 26.0;
 /// Rows kept for scoring. Rows with no boundary at all carry no evidence.
 const EDGE_MAX_SCORING_ROWS: usize = 192;
-/// Minimum comparable boundary rows.
+/// Comparable boundary rows a frame must show before its cost means anything.
 ///
-/// One: a single row of evidence is enough to compare. This is deliberately not
-/// a quality precondition — horizontal stripe content has boundaries only at
-/// run edges, so a 160-row viewport may carry two or three, and refusing those
-/// frames because the page is not text-dense would be a judgement about content
-/// the stitcher has no business making. Whether one row is *enough* to trust is
-/// decided by the gates below (winner cost, runner-up ratio, colour), which are
-/// normalised and do not reward or punish density.
+/// The gate asks for `min(this, the frame's own boundary rows)`: a frame cannot
+/// be asked for more evidence than it contains. That distinction is the whole
+/// point. A page whose only feature is the boundary between two flat colours
+/// carries exactly one boundary row, so an absolute demand of three makes it
+/// unstitchable however unambiguous that row is — while a dense frame that
+/// merely overlaps the canvas by a sliver must still show three of its many
+/// rows, which is what refuses a jump frame whose single comparable row happens
+/// to line up with a canvas boundary.
+///
+/// Lowering the constant instead is not equivalent, and was measured: at 1,
+/// real-1 went from 204 accepted / 0 misplaced to 201 / 6 with 20 displaced
+/// bands, because the jump frames above were then accepted.
+///
+/// Density is not a quality judgement. Whether the rows a frame *can* show are
+/// enough to trust is decided by the gates below (winner cost, runner-up ratio,
+/// colour), which are normalised and do not reward or punish density.
 const EDGE_MIN_COMPARABLE_ROWS: u32 = 3;
 /// Absolute ceiling on the winner's cost.
 ///
@@ -461,7 +470,14 @@ impl EdgeCanvas {
             }
             used += 1;
         }
-        if used < EDGE_MIN_COMPARABLE_ROWS || denominator == 0 {
+        // A frame cannot be asked for more boundary rows than it has. A page
+        // whose only feature is the boundary between two flat colours offers
+        // exactly one, and demanding three makes it unstitchable however
+        // unambiguous that row is; a dense frame that merely overlaps the canvas
+        // by a sliver still has to show three of its many rows, which is what
+        // refuses jump frames whose only comparable row happens to line up.
+        let required = EDGE_MIN_COMPARABLE_ROWS.min(ladder.scoring_rows.len() as u32);
+        if used < required || denominator == 0 {
             return None;
         }
         Some(Score {

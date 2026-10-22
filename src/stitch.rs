@@ -4692,4 +4692,88 @@ mod tests {
         let expected = &page[250][150 * 3..150 * 3 + 3];
         assert_eq!(rgb(150, 50), [expected[0], expected[1], expected[2]]);
     }
+
+    /// A page whose only feature is a single horizontal boundary between two
+    /// grays: no texture, no second edge, nothing else to match on.
+    ///
+    /// The boundary row is the entire evidence budget — one scoring row. Every
+    /// frame that contains it must be placed at the row it really occupies,
+    /// including the frame where it sits on the first row. A frame that is
+    /// entirely one gray carries no evidence at all, and refusing it is the
+    /// only honest answer; the test asserts that too, so a future "fix" that
+    /// invents a placement out of nothing fails here.
+    ///
+    /// Gated off for `LegacyPipeline`: the old canvas scan does not use the
+    /// boundary-row evidence gate at all, so this says nothing about it.
+    #[cfg(not(feature = "stitch-legacy"))]
+    #[test]
+    fn a_single_gray_boundary_is_enough_to_stitch() {
+        const WIDTH: u32 = 64;
+        const HEIGHT: u32 = 120;
+        const BOUNDARY: u32 = 600;
+        let page_row = |row: u32| if row < BOUNDARY { 90u8 } else { 170 };
+        let frame_at = |top: u32| -> RgbFrame {
+            let stride = WIDTH * 3;
+            let mut data = Vec::with_capacity((stride * HEIGHT) as usize);
+            for y in 0..HEIGHT {
+                let gray = page_row(top + y);
+                for _ in 0..WIDTH {
+                    data.extend_from_slice(&[gray, gray, gray]);
+                }
+            }
+            RgbFrame {
+                width: WIDTH,
+                height: HEIGHT,
+                stride,
+                data,
+            }
+        };
+
+        let mut stitcher = RawStitcher::new();
+        // The first frame must contain the boundary: it is the only frame that
+        // is not matched against anything.
+        assert!(matches!(
+            stitcher.push_frame(frame_at(520), Some(LongDirection::Down)).unwrap(),
+            PushResult::Initialized
+        ));
+
+        // The boundary walks up through the frame, ending one row below its
+        // top — the least evidence a frame can carry and still have any.
+        let mut deltas = Vec::new();
+        for top in [540u32, 560, 580, 599] {
+            match stitcher.push_frame(frame_at(top), Some(LongDirection::Down)).unwrap() {
+                PushResult::Accepted { match_info } => deltas.push(match_info.delta_y),
+                other => panic!("the boundary is inside the frame at {top}, got {other:?}"),
+            }
+        }
+        assert_eq!(deltas, vec![20, 20, 20, 19], "each step must land on its real row");
+
+        // The boundary has just left the top of the frame: rows 600..720 are
+        // one flat gray. There is nothing to compare, so this is refused once
+        // the patience runs out — and that is the correct answer, not a bug.
+        let flat = frame_at(600);
+        assert_eq!(
+            push_until_refused(&mut stitcher, &flat, Some(LongDirection::Down)),
+            PushResult::NoMatch
+        );
+
+        // Scroll back up: the boundary re-enters the frame. The canvas still
+        // holds it, so placement resumes even though eight frames were refused.
+        let mut back = Vec::new();
+        for top in [580u32, 560, 540] {
+            match stitcher.push_frame(frame_at(top), Some(LongDirection::Up)).unwrap() {
+                PushResult::Accepted { match_info } => back.push(match_info.delta_y),
+                other => panic!("the boundary is back in view at {top}, got {other:?}"),
+            }
+        }
+        assert_eq!(back, vec![-19, -20, -20]);
+
+        // The canvas row really is the page row: frame 520 initialised it, so
+        // page row 600 is canvas row 80.
+        let stitched = stitcher.stitched().unwrap();
+        assert_eq!((stitched.width, stitched.height), (WIDTH, 199));
+        assert!(stitched.row_coverage.iter().all(|row| row == &RowCoverage::Full));
+        assert_eq!(stitched_pixel_rgb(stitched, 10, 79), [90, 90, 90]);
+        assert_eq!(stitched_pixel_rgb(stitched, 10, 80), [170, 170, 170]);
+    }
 }
