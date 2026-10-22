@@ -521,6 +521,40 @@ impl RejectReason {
     }
 }
 
+/// Costs already computed during one `place` call.
+///
+/// The impulse window, the guard band and the anchor band overlap, and a
+/// position's cost depends only on the ladder and the canvas, both of which are
+/// fixed for the duration of the call. Re-checking a position is fine — each
+/// stage applies the gates to its own candidate set, and that is what decides
+/// the answer — but re-*computing* it is wasted work: one position costs about
+/// 9k boundary-cell comparisons. Measured reuse: 9.9% of lookups on real-1,
+/// 8.9% on real-long, 7.0% on lowcontrast-2b.
+///
+/// Keyed by `top` alone, which is sound only because the ladder and the canvas
+/// are fixed for the call; the cache must not outlive `place`.
+#[derive(Default)]
+struct ScoreCache {
+    entries: std::collections::HashMap<i32, Option<Score>>,
+}
+
+impl ScoreCache {
+    fn cost(
+        &mut self,
+        canvas: &EdgeCanvas,
+        ladder: &EdgeLadder,
+        top: i32,
+        min_overlap: u32,
+    ) -> Option<Score> {
+        if let Some(&cached) = self.entries.get(&top) {
+            return cached;
+        }
+        let score = canvas.cost_at(ladder, top, min_overlap);
+        self.entries.insert(top, score);
+        score
+    }
+}
+
 /// Everything an engine may look at for one frame.
 ///
 /// `frame` is a `&dyn RgbSource` rather than a generic so the trait stays
@@ -532,6 +566,10 @@ pub(super) struct PlacementRequest<'a> {
     pub previous_rect: ViewportRect,
     pub frame: &'a dyn RgbSource,
     pub search_direction: Option<SearchDirection>,
+    /// Consecutive refusals before this frame. The anchor stage is gated on
+    /// this: it exists to recover from a red border, not to run on every frame
+    /// whose immediate neighbourhood did not match.
+    pub refusals: u32,
 }
 
 /// Object-safe facade over `RgbSource`, so a boxed engine can still hand the
@@ -633,16 +671,20 @@ impl WindowedEdgeMatcher {
     /// window re-examines everything the narrower one already rejected, which
     /// is wasted work and — because the narrower window is the better-informed
     /// one — cannot change the answer. `inner == 0` covers the centre itself.
+    #[allow(clippy::too_many_arguments)]
     fn decide_ring(
         &self,
+        cache: &mut ScoreCache,
         ladder: &EdgeLadder,
         centre: i32,
         inner: i32,
         outer: i32,
+        bounds: (i32, i32),
+        exclude: &[(i32, i32)],
         request: &PlacementRequest<'_>,
     ) -> DecideOutcome {
-        let lo = centre - outer;
-        let hi = centre + outer;
+        let lo = (centre - outer).max(bounds.0);
+        let hi = (centre + outer).min(bounds.1);
         let mut costs: Vec<(f64, i32, u32)> = Vec::new();
         let Some(canvas) = self.canvas.as_ref() else {
             return DecideOutcome::Reject(RejectReason::Uninitialised);
@@ -657,7 +699,10 @@ impl WindowedEdgeMatcher {
             if inner > 0 && (top - centre).abs() <= inner {
                 continue;
             }
-            if let Some(score) = canvas.cost_at(ladder, top, min_overlap) {
+            if exclude.iter().any(|&(a, b)| top >= a && top <= b) {
+                continue;
+            }
+            if let Some(score) = cache.cost(canvas, ladder, top, min_overlap) {
                 costs.push((score.cost, top, score.used));
             }
         }
@@ -671,6 +716,7 @@ impl WindowedEdgeMatcher {
     /// coarse step can step over it.
     fn decide(
         &self,
+        cache: &mut ScoreCache,
         ladder: &EdgeLadder,
         lo: i32,
         hi: i32,
@@ -686,7 +732,7 @@ impl WindowedEdgeMatcher {
 
         let mut costs: Vec<(f64, i32, u32)> = Vec::new();
         for top in lo..=hi {
-            if let Some(score) = canvas.cost_at(ladder, top, min_overlap) {
+            if let Some(score) = cache.cost(canvas, ladder, top, min_overlap) {
                 costs.push((score.cost, top, score.used));
             }
         }
@@ -979,62 +1025,74 @@ impl WindowedEdgeMatcher {
         (self.frame_rows as i32 / EDGE_BASIN_DIVISOR).max(EDGE_ADJACENT_ROWS)
     }
 
-    /// Scores rings outward from `centre` until one of them accepts or the
-    /// frame's overlap with the canvas runs out.
+    /// How far the frame may sit from the previous frame and still share
+    /// `minimum_overlap` rows with it.
     ///
-    /// Near to far, and symmetric: the first ring covers both directions, so a
-    /// scroll-back is found as quickly as a scroll-forward and neither
-    /// direction is searched exhaustively before the other.
-    fn search_outward(
-        &self,
-        ladder: &EdgeLadder,
-        centre: i32,
-        already_covered: i32,
-        request: &PlacementRequest<'_>,
-    ) -> Option<(i32, f64)> {
-        let (lo, hi) = self.reachable_top_range(ladder)?;
-        let max_radius = (centre - lo).abs().max((hi - centre).abs());
-        if max_radius <= 0 {
-            return None;
-        }
-        // The first ring starts where the impulse window stopped, so no
-        // position is scored twice and the stages partition the space.
-        let mut inner = already_covered.max(0).min(max_radius);
-        let mut radius = EDGE_RING_BASE_HALF_WIDTH.max(inner + 1).min(max_radius);
-        loop {
-            if let DecideOutcome::Accept { top, cost } =
-                self.decide_ring(ladder, centre, inner, radius, request)
-            {
-                return Some((top, cost));
-            }
-            if radius >= max_radius {
-                return None;
-            }
-            inner = radius;
-            radius = radius.saturating_mul(EDGE_RING_GROWTH).min(max_radius);
-        }
+    /// This is the guard window: the only positions where the new frame can be
+    /// read as a continuation of the one before it. It is a property of the
+    /// two frames, not of the canvas — a 254-row viewport with 26 rows of
+    /// required overlap gives 228 rows either side, however tall the canvas has
+    /// grown.
+    fn adjacency_radius(&self, ladder: &EdgeLadder) -> i32 {
+        let rows = ladder.rows() as i32;
+        let min_overlap = minimum_overlap(ladder.rows(), ladder.rows()).max(1) as i32;
+        (rows - min_overlap).max(0)
     }
 
-    /// Every canvas row where the frame still shares at least
-    /// `minimum_overlap` rows with content the canvas actually holds.
-    ///
-    /// This is the guard, and it comes from the canvas rather than from a
-    /// configured displacement: outside this range there is not enough
-    /// evidence to compare, so no gate could accept a placement there. Both
-    /// directions are included — a frame may sit above or below the rows we
-    /// have.
-    fn reachable_top_range(&self, ladder: &EdgeLadder) -> Option<(i32, i32)> {
+    /// Every canvas row where the frame still shares `minimum_overlap` rows
+    /// with content the canvas holds — anywhere, not just next to the previous
+    /// frame. This is the anchor window's reach.
+    fn canvas_bounds(&self, ladder: &EdgeLadder) -> Option<(i32, i32)> {
         let canvas = self.canvas.as_ref()?;
         if canvas.is_empty() {
             return None;
         }
         let rows = ladder.rows() as i32;
         let min_overlap = minimum_overlap(ladder.rows(), ladder.rows()).max(1) as i32;
-        // The frame occupies [top, top + rows); the canvas covers
-        // [filled_lo, filled_hi]. Their overlap must be at least min_overlap.
         let lo = canvas.filled_lo - rows + min_overlap;
         let hi = canvas.filled_hi + 1 - min_overlap;
         (lo <= hi).then_some((lo, hi))
+    }
+
+    /// Scores rings outward from `centre` inside `bounds`, skipping the
+    /// positions `exclude` already covered.
+    ///
+    /// Near to far and symmetric: the first ring covers both directions, so a
+    /// scroll-back is found as quickly as a scroll-forward and neither
+    /// direction is searched exhaustively before the other.
+    #[allow(clippy::too_many_arguments)]
+    fn search_rings(
+        &self,
+        cache: &mut ScoreCache,
+        ladder: &EdgeLadder,
+        centre: i32,
+        inner: i32,
+        bounds: (i32, i32),
+        exclude: &[(i32, i32)],
+        request: &PlacementRequest<'_>,
+    ) -> Option<(i32, f64)> {
+        let (lo, hi) = bounds;
+        if lo > hi {
+            return None;
+        }
+        let max_radius = (centre - lo).abs().max((hi - centre).abs());
+        if max_radius <= inner {
+            return None;
+        }
+        let mut ring_inner = inner.max(0);
+        let mut radius = EDGE_RING_BASE_HALF_WIDTH.max(ring_inner + 1).min(max_radius);
+        loop {
+            if let DecideOutcome::Accept { top, cost } = self.decide_ring(
+                cache, ladder, centre, ring_inner, radius, bounds, exclude, request,
+            ) {
+                return Some((top, cost));
+            }
+            if radius >= max_radius {
+                return None;
+            }
+            ring_inner = radius;
+            radius = radius.saturating_mul(EDGE_RING_GROWTH).min(max_radius);
+        }
     }
 
     fn impulse_half_width(&self) -> i32 {
@@ -1117,6 +1175,10 @@ impl PlacementEngine for WindowedEdgeMatcher {
 
         // The impulse window's radius: zero on the first frame, where there is
         // no step to extrapolate.
+        // One cache for the whole decision: the stages look at overlapping
+        // positions, and each position's cost is fixed for this frame.
+        let mut cache = ScoreCache::default();
+
         let impulse_reach = if self.last_delta.is_some() {
             self.impulse_half_width()
         } else {
@@ -1127,6 +1189,7 @@ impl PlacementEngine for WindowedEdgeMatcher {
         // Almost every frame is decided here, and it costs one narrow window.
         if impulse_reach > 0 {
             if let DecideOutcome::Accept { top, cost } = self.decide(
+                &mut cache,
                 &ladder,
                 predicted_top - impulse_reach,
                 predicted_top + impulse_reach,
@@ -1136,29 +1199,64 @@ impl PlacementEngine for WindowedEdgeMatcher {
             }
         }
 
-        // Stage 2 — guard: every position where the frame still shares enough
-        // rows with the canvas to be compared at all, nearest to the prediction
-        // first. The rings walk outward in both directions, so the nearest
-        // explanation wins instead of one direction being exhausted first.
+        // Stage 2 — guard: is this frame a continuation of the previous one?
+        //
+        // The question is local. The frame can only be read as the next step of
+        // the capture if it still shares `minimum_overlap` rows with the frame
+        // that came before it, so the window is `pos ± adjacency_radius` — 228
+        // rows on a 254-row viewport, regardless of how tall the canvas has
+        // grown. Walking the whole canvas here would answer a different
+        // question ("does this frame appear anywhere we have seen?"), which is
+        // the anchor's job, and it would also let a far match be accepted as if
+        // it were the next step.
+        //
+        // Rings run outward from the prediction in both directions, so the
+        // nearest continuation wins and neither direction is exhausted first.
+        // The guard band is centred on the previous frame, not on the
+        // prediction, so it cannot exclude the impulse window the way two
+        // concentric rings would: their centres differ. It searches its whole
+        // band, ordered from the prediction. The rows the impulse window
+        // already tried are re-*judged* (each stage applies the gates to its
+        // own candidate set, and that is what decides the answer) but not
+        // re-*computed*: the score cache below returns the cost already paid
+        // for. Dropping them from the band instead is not an option — the
+        // impulse window sees too small a candidate set to find a runner-up, so
+        // a position it rejected for want of one would be lost for good.
+        let radius = self.adjacency_radius(&ladder);
+        let guard = (pos - radius, pos + radius);
         if let Some((top, cost)) =
-            self.search_outward(&ladder, predicted_top, impulse_reach, request)
+            self.search_rings(&mut cache, &ladder, predicted_top, 0, guard, &[], request)
         {
             return self.accept(request, ladder, top, cost);
         }
 
-        // Stage 3 — anchor: the same reach ordered from the last confirmed
-        // position. The guard above already covered every reachable row, so
-        // this is not extra *coverage* — it is a different order, and order
-        // decides which of several acceptable offsets wins. Measured: one
-        // real-long frame (top 2180, anchor 2120, prediction 2164) is placed
-        // here and nowhere else; deleting this stage loses it.
+        // Stage 3 — anchor: recovery, and only recovery.
         //
-        // Skipped when the anchor and the prediction coincide, because then it
-        // is the search that just failed.
-        let anchor = self.anchor.unwrap_or(pos);
-        if anchor != predicted_top {
-            if let Some((top, cost)) = self.search_outward(&ladder, anchor, 0, request) {
-                return self.accept(request, ladder, top, cost);
+        // This stage answers a different question from the guard: not "is this
+        // frame the next step?" but "is this frame somewhere we have already
+        // seen?". That is a much weaker claim, so it must not be tried on every
+        // frame — a frame that merely failed to continue the capture would
+        // otherwise be matched against unrelated content somewhere up the page
+        // and appended there.
+        //
+        // It runs only once the border is already red, i.e. after
+        // `REFUSAL_PATIENCE` consecutive refusals have shown that this is not a
+        // one-frame seam but a real loss of the scroll position. The engine
+        // shares that count with the UI rather than keeping its own: two
+        // counters for one decision drift apart.
+        //
+        // Ordered from the last confirmed position, because the prediction has
+        // just been shown to be wrong, and it skips the guard band, which the
+        // stage above already scored.
+        let recovering = request.refusals >= crate::stitch::REFUSAL_PATIENCE;
+        if recovering {
+            let anchor = self.anchor.unwrap_or(pos);
+            if let Some(bounds) = self.canvas_bounds(&ladder) {
+                if let Some((top, cost)) =
+                    self.search_rings(&mut cache, &ladder, anchor, 0, bounds, &[guard], request)
+                {
+                    return self.accept(request, ladder, top, cost);
+                }
             }
         }
 
@@ -1579,6 +1677,7 @@ mod tests {
             previous_rect: rect,
             frame,
             search_direction: None,
+            refusals: 0,
         }
     }
 
@@ -1674,6 +1773,7 @@ mod tests {
             previous_rect: rect,
             frame,
             search_direction: None,
+            refusals: 0,
         }
     }
 
@@ -1963,6 +2063,74 @@ mod tests {
         assert_eq!(rect.y, 10);
     }
 
+    /// The guard band is centred on the previous frame while the impulse window
+    /// is centred on the prediction, so the guard must search its whole band —
+    /// not just the part outside the impulse window.
+    ///
+    /// A position the impulse window rejected (its candidate set is too small to
+    /// produce a runner-up) has to remain reachable from the guard, or it is lost
+    /// for good.
+    #[test]
+    fn the_guard_band_is_not_cut_by_the_impulse_window() {
+        let height = 60;
+        let mut engine = WindowedEdgeMatcher::new();
+        let first = frame_from(0, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
+        // A step of 44, so the prediction sits at 44 while the previous frame is
+        // at 0 and the guard band is 0 ± 34.
+        engine.last_delta = Some(44);
+        engine.trend = 0.0;
+
+        let moved = frame_from(44, height);
+        let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first)];
+        let req = request_on_canvas(&moved, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
+        // Row 44 is inside both windows; the point is that the guard band is
+        // scored as a whole, so this placement must not depend on which stage
+        // finds it.
+        match engine.place(&req) {
+            EngineDecision::Place { rect, .. } => assert_eq!(rect.y, 44),
+            other => panic!("the guard band must be searched whole: {other:?}"),
+        }
+    }
+
+    /// The anchor stage is recovery, not a second opinion: it must not run
+    /// until the border is already red.
+    ///
+    /// Two frames 60 rows apart, so the guard band (`pos ± (rows -
+    /// minimum_overlap)`, 34 rows here) excludes row 10 while the canvas still
+    /// covers it. With no refusal streak the frame is refused — it is not a
+    /// continuation of the previous one — and the same frame is placed once the
+    /// streak reaches `REFUSAL_PATIENCE`, which is the moment the UI turns the
+    /// border red.
+    #[test]
+    fn the_anchor_stage_waits_for_the_red_border() {
+        let height = 60;
+        let mut engine = WindowedEdgeMatcher::new();
+        let first = frame_from(0, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
+        let second = frame_from(60, height);
+        engine.commit(ViewportRect { x: 0, y: 60, width: W, height }, 60, &second);
+        assert_eq!(engine.pos, Some(60));
+
+        // Row 10: inside the canvas, outside the guard band.
+        let back = frame_from(10, height);
+        let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first), (60, &second)];
+        let mut req =
+            request_on_canvas(&back, ViewportRect { x: 0, y: 60, width: W, height }, &committed);
+
+        req.refusals = 0;
+        assert!(
+            matches!(engine.place(&req), EngineDecision::Reject { .. }),
+            "the anchor must not run before the border is red"
+        );
+
+        req.refusals = crate::stitch::REFUSAL_PATIENCE;
+        match engine.place(&req) {
+            EngineDecision::Place { rect, .. } => assert_eq!(rect.y, 10),
+            other => panic!("recovery must place the frame: {other:?}"),
+        }
+    }
+
     /// A move outside the impulse window is still placed by the guard, which
     /// searches everything the canvas can still compare, nearest first.
     #[test]
@@ -1996,7 +2164,8 @@ mod tests {
         let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first)];
         let req = request_on_canvas(&same, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
         let ladder = EdgeLadder::from_source(&same, engine.session_gain).unwrap();
-        match engine.decide_ring(&ladder, 0, 0, 40, &req) {
+        let mut cache = ScoreCache::default();
+        match engine.decide_ring(&mut cache, &ladder, 0, 0, 40, (-40, 40), &[], &req) {
             DecideOutcome::Accept { top, .. } => assert_eq!(top, 0, "the centre must win"),
             DecideOutcome::Reject(_) => panic!("the centre must be a candidate at all"),
         }

@@ -117,7 +117,7 @@ const NOMATCH_RECOVERY_CLEAN_MATCH_SCORE: f64 = 0.02;
 /// The border turns red only once the failure has repeated this many times in a
 /// row, which at 30 fps is about a quarter of a second — long enough to ride out
 /// a rendering seam, short enough that a real jump is still reported promptly.
-const REFUSAL_PATIENCE: u32 = 8;
+pub(super) const REFUSAL_PATIENCE: u32 = 8;
 
 #[cfg(feature = "stitch-legacy")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -747,6 +747,7 @@ impl RawStitcher {
                 previous_rect,
                 frame: &active_compose,
                 search_direction,
+                refusals: self.consecutive_refusals,
             })
         };
 
@@ -4011,6 +4012,7 @@ mod tests {
             previous_rect,
             frame: &target,
             search_direction: Some(SearchDirection::Down),
+            refusals: 0,
         };
         let first = engine.place(&request);
         let second = engine.place(&request);
