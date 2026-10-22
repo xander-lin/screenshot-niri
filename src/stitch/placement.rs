@@ -647,6 +647,15 @@ fn score_canvas_overlap_with_rect(
     let mut samples = 0u32;
     for stitched_y in (y0..y1).step_by(sample_step as usize) {
         for stitched_x in (x0..x1).step_by(sample_step as usize) {
+            // A ragged canvas has never-captured pixels *inside* its bounding
+            // box, and those bytes are zero. Comparing a frame against them
+            // measures it against black, which inflates the cost of the one
+            // correct placement — the same rule the vertical colour check
+            // follows. On a rectangular canvas every pixel is captured and this
+            // is a no-op.
+            if !stitched.captured(stitched_x, stitched_y) {
+                continue;
+            }
             let frame_px = u32::try_from(stitched_x as i32 - frame_x).ok()?;
             let frame_py = u32::try_from(stitched_y as i32 - frame_y).ok()?;
             total += pixel_difference_stitched_source(

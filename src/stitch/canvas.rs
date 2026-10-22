@@ -40,6 +40,19 @@ impl StitchedFrame {
             row_coverage: vec![RowCoverage::Full; frame.height as usize],
         }
     }
+
+    /// Whether the canvas actually captured this pixel.
+    ///
+    /// The coverage map is `Full` on every row of a rectangular canvas, so this
+    /// is the cheap common case. On a ragged one it is what separates content
+    /// from the zero bytes of a region that was never captured.
+    pub fn captured(&self, x: u32, y: u32) -> bool {
+        match self.row_coverage.get(y as usize) {
+            Some(row) => row.contains(x),
+            // An empty map is a rectangular canvas: every pixel is captured.
+            None => self.row_coverage.is_empty(),
+        }
+    }
 }
 
 /// Inserts `[start, end)` into a sorted, disjoint interval list, merging any

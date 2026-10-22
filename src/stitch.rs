@@ -831,10 +831,25 @@ impl RawStitcher {
                 None,
                 match_info.direction,
             );
-            self.last_engine_top = Some(candidate_rect.y);
-            self.canvas_origin = candidate_rect.y - applied.y;
-            self.engine
-                .commit(applied, candidate_rect.y, &active_compose_frame);
+            if horizontal {
+                // The engine's canvas is one column of rows: every row's
+                // descriptor was built from whichever column happened to
+                // capture it first, and the engine has no x dimension to tell
+                // the columns apart. A horizontal scroll changes the column, so
+                // those rows are no longer comparable — keeping them would make
+                // the next vertical step read the new column against the old
+                // one and refuse. Re-seed from the frame the horizontal matcher
+                // just verified against the pixel canvas.
+                self.engine.reset();
+                self.last_engine_top = Some(applied.y);
+                self.canvas_origin = 0;
+                self.engine.commit(applied, applied.y, &active_compose_frame);
+            } else {
+                self.last_engine_top = Some(candidate_rect.y);
+                self.canvas_origin = candidate_rect.y - applied.y;
+                self.engine
+                    .commit(applied, candidate_rect.y, &active_compose_frame);
+            }
             return Ok(PushResult::Accepted { match_info });
         }
 
@@ -4775,5 +4790,195 @@ mod tests {
         assert!(stitched.row_coverage.iter().all(|row| row == &RowCoverage::Full));
         assert_eq!(stitched_pixel_rgb(stitched, 10, 79), [90, 90, 90]);
         assert_eq!(stitched_pixel_rgb(stitched, 10, 80), [170, 170, 170]);
+    }
+
+    /// The large-scale structure of the page used by the snake tests:
+    /// random-height brightness bands down the page, random-width bands across
+    /// it.
+    ///
+    /// `assert_snake_path` combines them with a hashed 8×8 block texture, and
+    /// that texture is not decoration. The vertical descriptor keeps `|dL/dy|`
+    /// per bin and nothing else, so a page that is only a sum of a row term and
+    /// a column term has the *same* vertical descriptor in every column — a
+    /// vertical step would then match a column it never captured. Real pages
+    /// carry text and images whose row boundaries differ across columns.
+    fn snake_page(page_w: u32, page_h: u32) -> (Vec<u8>, Vec<u8>) {
+        fn lcg(state: &mut u32) -> u32 {
+            *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *state >> 16
+        }
+        let mut state = 0x5eed_1234u32;
+        let mut row_band = Vec::with_capacity(page_h as usize);
+        while (row_band.len() as u32) < page_h {
+            let run = 3 + lcg(&mut state) % 10;
+            let value = 50 + lcg(&mut state) % 150;
+            for _ in 0..run.min(page_h - row_band.len() as u32) {
+                row_band.push(value as u8);
+            }
+        }
+        let mut col_band = Vec::with_capacity(page_w as usize);
+        while (col_band.len() as u32) < page_w {
+            let run = 5 + lcg(&mut state) % 9;
+            let value = 50 + lcg(&mut state) % 150;
+            for _ in 0..run.min(page_w - col_band.len() as u32) {
+                col_band.push(value as u8);
+            }
+        }
+        (row_band, col_band)
+    }
+
+    /// Start positions of a serpentine walk: uniform steps, plus the page edge
+    /// when the last uniform step would stop short of it.
+    fn snake_positions(page: u32, view: u32, step: u32) -> Vec<u32> {
+        let last = page - view;
+        let mut positions: Vec<u32> = (0..)
+            .map(|index| index * step)
+            .take_while(|&position| position < last)
+            .collect();
+        positions.push(last);
+        positions
+    }
+
+    /// Walks a serpentine path over `snake_page` and asserts that every step
+    /// lands on its true delta and that the finished canvas is the page itself.
+    fn assert_snake_path(
+        label: &str,
+        page_w: u32,
+        page_h: u32,
+        view_w: u32,
+        view_h: u32,
+        step_x: u32,
+        step_y: u32,
+    ) {
+        let (row_band, col_band) = snake_page(page_w, page_h);
+        let page = |x: u32, y: u32| -> u8 {
+            // Large-scale brightness bands on both axes, plus a hashed 8x8 block
+            // texture. The bands give the walk its structure; the texture is
+            // what makes one column's vertical descriptor unlike another's. A
+            // page that is merely the *sum* of a row term and a column term has
+            // the same `|dL/dy|` in every column, and a vertical step would then
+            // match a column it never captured — real pages carry text and
+            // images, whose row boundaries differ across columns.
+            let band = (u16::from(row_band[y as usize]) + u16::from(col_band[x as usize])) / 2;
+            let mut hash = (x / 8).wrapping_mul(0x9E37_79B1) ^ (y / 8).wrapping_mul(0x85EB_CA77);
+            hash ^= hash >> 15;
+            hash = hash.wrapping_mul(0x2545_F491);
+            hash ^= hash >> 13;
+            (band + (hash & 63) as u16).min(255) as u8
+        };
+        let frame_at = |frame_x: u32, frame_y: u32| -> RgbFrame {
+            let stride = view_w * 3;
+            let mut data = Vec::with_capacity((stride * view_h) as usize);
+            for y in 0..view_h {
+                for x in 0..view_w {
+                    let value = page(frame_x + x, frame_y + y);
+                    data.extend_from_slice(&[value, value, value]);
+                }
+            }
+            RgbFrame {
+                width: view_w,
+                height: view_h,
+                stride,
+                data,
+            }
+        };
+
+        let xs = snake_positions(page_w, view_w, step_x);
+        let ys = snake_positions(page_h, view_h, step_y);
+        assert_eq!(
+            (xs.last(), ys.last()),
+            (Some(&(page_w - view_w)), Some(&(page_h - view_h))),
+            "{label}: the walk must reach the bottom-right corner"
+        );
+        let mut path: Vec<(u32, u32)> = Vec::new();
+        for (row_index, &y) in ys.iter().enumerate() {
+            let mut row = xs.clone();
+            if row_index % 2 == 1 {
+                row.reverse();
+            }
+            for x in row {
+                path.push((x, y));
+            }
+        }
+
+        let mut stitcher = RawStitcher::new();
+        for (index, &(x, y)) in path.iter().enumerate() {
+            let direction = if index == 0 {
+                LongDirection::Down
+            } else {
+                let (previous_x, previous_y) = path[index - 1];
+                if y != previous_y {
+                    LongDirection::Down
+                } else if x > previous_x {
+                    LongDirection::Right
+                } else {
+                    LongDirection::Left
+                }
+            };
+            let result = stitcher
+                .push_frame(frame_at(x, y), Some(direction))
+                .unwrap();
+            if index == 0 {
+                assert!(
+                    matches!(result, PushResult::Initialized),
+                    "{label}: the first frame must initialise, got {result:?}"
+                );
+                continue;
+            }
+            let (previous_x, previous_y) = path[index - 1];
+            let expected = (
+                x as i32 - previous_x as i32,
+                y as i32 - previous_y as i32,
+            );
+            match result {
+                PushResult::Accepted { match_info } => assert_eq!(
+                    (match_info.delta_x, match_info.delta_y),
+                    expected,
+                    "{label}: step {index} from ({previous_x},{previous_y}) to ({x},{y})"
+                ),
+                other => panic!(
+                    "{label}: step {index} from ({previous_x},{previous_y}) to ({x},{y}) \
+                     must be placed, got {other:?}"
+                ),
+            }
+        }
+
+        let stitched = stitcher.stitched().unwrap();
+        assert_eq!(
+            (
+                stitched.width,
+                stitched.height,
+                stitched.anchor_origin_x,
+                stitched.anchor_origin_y
+            ),
+            (page_w, page_h, 0, 0),
+            "{label}: the finished canvas must be the page"
+        );
+        for y in 0..page_h {
+            for x in 0..page_w {
+                let expected = page(x, y);
+                assert_eq!(
+                    stitched_pixel_rgb(stitched, x, y),
+                    [expected, expected, expected],
+                    "{label}: canvas pixel ({x},{y})"
+                );
+            }
+        }
+    }
+
+    /// Serpentine capture over a page wider than the viewport: right along the
+    /// top, down, left, down, right again. The canvas has to grow in both axes
+    /// and the two scroll axes have to hand over to each other.
+    #[test]
+    fn a_snake_path_reconstructs_a_page_wider_than_the_viewport() {
+        assert_snake_path("half overlap", 1600, 1200, 640, 480, 320, 240);
+    }
+
+    /// The same walk on a wider page where consecutive frames overlap by only a
+    /// quarter of the viewport. Overlap is the only thing that makes a step
+    /// placeable, so this is the tighter case, not a bigger one.
+    #[test]
+    fn a_snake_path_works_on_a_wider_page_with_quarter_overlap() {
+        assert_snake_path("quarter overlap", 1920, 1200, 640, 480, 480, 240);
     }
 }
