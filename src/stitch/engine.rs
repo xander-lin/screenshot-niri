@@ -24,8 +24,7 @@ use std::collections::VecDeque;
 
 use super::rgb::RgbSource;
 use super::{
-    minimum_overlap, AppendDirection, FrameMatch, RowCoverage, SearchDirection, StitchedFrame,
-    ViewportRect,
+    minimum_overlap, AppendDirection, FrameMatch, SearchDirection, StitchedFrame, ViewportRect,
 };
 
 /// Column bins per row. Measured floor, not a preference: 8 bins leave 42
@@ -1455,7 +1454,7 @@ impl PlacementEngine for ScriptedEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stitch::RgbFrame;
+    use crate::stitch::{RgbFrame, RowCoverage};
 
     const W: u32 = 192;
 
