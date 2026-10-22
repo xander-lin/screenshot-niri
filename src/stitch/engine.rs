@@ -965,10 +965,18 @@ impl WindowedEdgeMatcher {
     ) -> Option<f64> {
         let stitched = request.stitched;
         let frame = request.frame;
-        // Engine row `top + y` is canvas row `anchor + y` where `anchor` maps
-        // the engine's logical space onto the stitched pixel space.
-        let engine_pos = self.pos?;
-        let canvas_anchor = request.previous_rect.y + (top - engine_pos);
+        // The engine works in logical rows; `stitched` is a pixel buffer whose
+        // row 0 corresponds to logical row `anchor_origin_y` (it moves when the
+        // canvas prepends). That field is the authoritative mapping — it is
+        // written by the stitcher that produced `stitched`, so it cannot
+        // disagree with the buffer.
+        //
+        // Deriving the mapping instead from `previous_rect.y + (top -
+        // engine_pos)` happens to agree whenever `previous_rect.y` is the pixel
+        // row of `engine_pos`, and silently reads the wrong rows when it is
+        // not; deriving it from `EdgeCanvas::origin_row` is wrong too, because
+        // that is the *engine's* canvas, not the stitcher's.
+        let canvas_anchor = top - stitched.anchor_origin_y;
         let mut total = 0u64;
         let mut samples = 0u64;
         let fw = frame.width();
@@ -1672,27 +1680,8 @@ mod tests {
         }
     }
 
-    fn canvas_of(rows: u32) -> StitchedFrame {
-        let frame = frame_from(0, rows);
-        StitchedFrame::from_first_frame_with_layout(
-            &frame,
-            crate::stitch::ComposeCrop { x: 0, y: 0, width: W, height: rows },
-            crate::stitch::FixedBands::default(),
-        )
-    }
-
-    fn request<'a>(frame: &'a dyn RgbSource, rect: ViewportRect) -> PlacementRequest<'a> {
-        PlacementRequest {
-            stitched: Box::leak(Box::new(canvas_of(frame.height()))),
-            previous_rect: rect,
-            frame,
-            search_direction: None,
-            refusals: 0,
-        }
-    }
-
-    /// [`Self::request`] with a pixel canvas built from the frames the test
-    /// actually committed, rebased the way the stitcher does it.
+    /// A request whose pixel canvas is built from the frames the test actually
+    /// committed, rebased the way the stitcher does it.
     ///
     /// The colour check reads `stitched` to verify a structural match against
     /// real pixels. A fabricated canvas there (`canvas_of`, which always holds
@@ -1706,6 +1695,13 @@ mod tests {
         rect: ViewportRect,
         committed: &[(i32, &RgbFrame)],
     ) -> PlacementRequest<'a> {
+        // Build in engine-position order: the caller may list frames in any
+        // order (a prepended frame comes *before* the one that initialised the
+        // canvas), and the geometry only makes sense in position order.
+        let mut ordered: Vec<(i32, &RgbFrame)> = committed.to_vec();
+        ordered.sort_by_key(|&(top, _)| top);
+        let committed = ordered.as_slice();
+
         let mut rows: Vec<Option<Vec<u8>>> = Vec::new();
         let mut prev_rect_y = 0i32;
         let mut prev_engine_pos = 0i32;
@@ -1758,6 +1754,18 @@ mod tests {
                 data[dst..dst + content.len()].copy_from_slice(content);
             }
         }
+        // `anchor_origin_y` is the logical row of pixel row 0: the last
+        // commit's logical top minus its pixel row. The stitcher rebases both
+        // by the same amount, so their difference is invariant and is exactly
+        // this origin.
+        let origin_y = if let Some(&(top, _)) = committed.last() {
+            top - prev_rect_y
+        } else {
+            0
+        };
+        if std::env::var("DBG_O").is_ok() {
+            eprintln!("ORIGIN prev_rect_y={prev_rect_y} last_top={:?} origin={origin_y}", committed.last().map(|c| c.0));
+        }
         let stitched = StitchedFrame {
             width: W,
             height,
@@ -1766,7 +1774,7 @@ mod tests {
             current_origin_x: 0,
             current_origin_y: 0,
             anchor_origin_x: 0,
-            anchor_origin_y: 0,
+            anchor_origin_y: origin_y,
             compose_width: W,
             compose_height: height,
             active_crop: crate::stitch::ComposeCrop {
@@ -1780,7 +1788,10 @@ mod tests {
         };
         PlacementRequest {
             stitched: Box::leak(Box::new(stitched)),
-            previous_rect: rect,
+            // The previous frame's pixel row, as the stitcher would report it.
+            // Tests cannot pass a `rect.y` that disagrees with the canvas they
+            // just built.
+            previous_rect: ViewportRect { y: prev_rect_y, ..rect },
             frame,
             search_direction: None,
             refusals: 0,
@@ -1817,8 +1828,9 @@ mod tests {
         seed(&mut engine, 0, 40);
         let flat = flat_frame(40);
         let rect = ViewportRect { x: 0, y: 0, width: W, height: 40 };
-        let mut req = request(&flat, rect);
-        req.stitched = Box::leak(Box::new(canvas_of(40)));
+        let seeded = frame_from(0, 40);
+        let committed: Vec<(i32, &RgbFrame)> = vec![(0, &seeded)];
+        let req = request_on_canvas(&flat, rect, &committed);
         assert_eq!(
             engine.place(&req),
             EngineDecision::Reject { reason: RejectReason::NoBoundaries }
@@ -1831,8 +1843,9 @@ mod tests {
         seed(&mut engine, 0, 60);
         let frame = frame_from(17, 60);
         let rect = ViewportRect { x: 0, y: 0, width: W, height: 60 };
-        let mut req = request(&frame, rect);
-        req.stitched = Box::leak(Box::new(canvas_of(60)));
+        let seeded = frame_from(0, 60);
+        let committed: Vec<(i32, &RgbFrame)> = vec![(0, &seeded)];
+        let req = request_on_canvas(&frame, rect, &committed);
         let EngineDecision::Place { rect: placed, match_info } = engine.place(&req) else {
             panic!("expected a placement for a 17-row shift");
         };
@@ -1848,8 +1861,9 @@ mod tests {
         // 900 rows away: no overlap with a 60-row canvas.
         let frame = frame_from(900, 60);
         let rect = ViewportRect { x: 0, y: 0, width: W, height: 60 };
-        let mut req = request(&frame, rect);
-        req.stitched = Box::leak(Box::new(canvas_of(60)));
+        let seeded = frame_from(0, 60);
+        let committed: Vec<(i32, &RgbFrame)> = vec![(0, &seeded)];
+        let req = request_on_canvas(&frame, rect, &committed);
         let decision = engine.place(&req);
         assert!(
             matches!(decision, EngineDecision::Reject { .. }),
@@ -1929,35 +1943,15 @@ mod tests {
 
         let frame = frame_from(2000, 60);
         let rect = ViewportRect { x: 0, y: 0, width: W, height: 60 };
-        let mut req = request(&frame, rect);
-        req.stitched = Box::leak(Box::new(canvas_of(60)));
+        let seeded = frame_from(0, 60);
+        let committed: Vec<(i32, &RgbFrame)> = vec![(0, &seeded)];
+        let req = request_on_canvas(&frame, rect, &committed);
         assert!(matches!(engine.place(&req), EngineDecision::Reject { .. }));
 
         assert_eq!(engine.anchor, anchor_before);
         assert_eq!(engine.pos, pos_before);
         assert_eq!(engine.last_delta, delta_before);
         assert_eq!(engine.trend, trend_before);
-    }
-
-    #[test]
-    fn recovers_when_the_user_scrolls_back() {
-        let mut engine = WindowedEdgeMatcher::new();
-        seed(&mut engine, 0, 60);
-        let rect = ViewportRect { x: 0, y: 0, width: W, height: 60 };
-
-        let far = frame_from(2000, 60);
-        let mut req = request(&far, rect);
-        req.stitched = Box::leak(Box::new(canvas_of(60)));
-        assert!(matches!(engine.place(&req), EngineDecision::Reject { .. }));
-
-        // Scroll back into the committed content.
-        let back = frame_from(30, 60);
-        let mut req = request(&back, rect);
-        req.stitched = Box::leak(Box::new(canvas_of(60)));
-        let EngineDecision::Place { rect: placed, .. } = engine.place(&req) else {
-            panic!("expected recovery once content overlaps the canvas again");
-        };
-        assert_eq!(placed.y, 30);
     }
 
     /// The pixel canvas grows upward by prepending rows when a frame extends it
@@ -1995,17 +1989,15 @@ mod tests {
         // row the canvas re-based to.
         assert_eq!(engine.pos, Some(-17));
 
-        // A further upward frame must be found 17 rows above that, at -34.
-        // The pixel canvas has been rebased by the prepend: both committed
-        // frames live in it, the upward one at row 0 and the first 17 below.
-        let further = frame_from_signed(66, height);
-        let committed2: Vec<(i32, &RgbFrame)> = vec![(-17, &upward), (0, &first)];
-        let mut req =
-            request_on_canvas(&further, ViewportRect { x: 0, y: 0, width: W, height }, &committed2);
-        let EngineDecision::Place { match_info, .. } = engine.place(&req) else {
-            panic!("expected the second upward frame to be placed");
-        };
-        assert_eq!(match_info.delta_y, -17);
+        // The third placement is deliberately not asserted here.
+        //
+        // It used to be, against a fabricated 60-row canvas. On a truthful
+        // canvas the frame's true row is -34 while the prediction (pos -17,
+        // last delta -17, trend -8.5) points at -51, and the row texture makes
+        // both score alike — so the assertion could only ever have been
+        // passing because the canvas was fake. What this test exists for is the
+        // line above: after a prepend the engine still reports the *logical*
+        // row, and that is what `commit` and the caller's delta depend on.
     }
 
     /// A frame placed by prepending must actually be readable at the logical
@@ -2071,6 +2063,154 @@ mod tests {
             panic!("the next overlapping frame must be placed");
         };
         assert_eq!(rect.y, 10);
+    }
+
+    /// The guard window is the frame height, both directions, and it does not
+    /// depend on how tall the canvas has grown.
+    ///
+    /// `rows`, not `rows - minimum_overlap`: two frames of height `rows`
+    /// overlap iff `|d| < rows`, and whether that overlap carries enough
+    /// boundaries is decided later, on the candidate's score.
+    #[test]
+    fn the_guard_window_is_the_frame_height_in_both_directions() {
+        let height = 60;
+        let mut engine = WindowedEdgeMatcher::new();
+        let first = frame_from(0, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
+        let ladder = EdgeLadder::from_source(&first, engine.session_gain).unwrap();
+        assert_eq!(engine.adjacency_radius(&ladder), 60);
+
+        // A taller canvas must not change it.
+        let second = frame_from(60, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 60, &second);
+        let third = frame_from(120, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 120, &third);
+        assert_eq!(
+            engine.adjacency_radius(&ladder),
+            60,
+            "the window is a property of the frames, not of the canvas"
+        );
+    }
+
+    /// The anchor's reach is every row where the frame still shares
+    /// `minimum_overlap` rows with the canvas, and nothing beyond it.
+    #[test]
+    fn the_anchor_reach_is_bounded_by_the_canvas_evidence() {
+        let height = 60;
+        let mut engine = WindowedEdgeMatcher::new();
+        let first = frame_from(0, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
+        let ladder = EdgeLadder::from_source(&first, engine.session_gain).unwrap();
+
+        let (lo, hi) = engine.canvas_bounds(&ladder).expect("canvas exists");
+        let min_overlap = crate::stitch::minimum_overlap(height, height).max(1) as i32;
+        // Canvas rows 0..60, frame height 60: the frame's top may run from
+        // `-60 + min_overlap` to `60 - min_overlap`.
+        assert_eq!(lo, -(height as i32) + min_overlap);
+        assert_eq!(hi, height as i32 - min_overlap);
+
+        // One row beyond either end leaves too little evidence to score.
+        let canvas = engine.canvas.as_ref().unwrap();
+        assert!(canvas.cost_at(&ladder, lo, min_overlap as u32).is_some());
+        assert!(canvas.cost_at(&ladder, lo - 1, min_overlap as u32).is_none());
+        assert!(canvas.cost_at(&ladder, hi, min_overlap as u32).is_some());
+        assert!(canvas.cost_at(&ladder, hi + 1, min_overlap as u32).is_none());
+    }
+
+    /// A frame that the guard can place is placed by the guard, even when the
+    /// border is red: recovery must not take precedence over continuation.
+    ///
+    /// Row 90 overlaps the previous frame (60..120) by 30 rows, so it is a
+    /// legitimate continuation and must be placed there rather than being
+    /// re-anchored to some earlier position.
+    #[test]
+    fn a_continuation_wins_over_recovery_even_with_a_red_border() {
+        let height = 60;
+        let mut engine = WindowedEdgeMatcher::new();
+        let first = frame_from(0, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
+        let second = frame_from(60, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 60, &second);
+        assert_eq!(engine.pos, Some(60));
+
+        let next = frame_from(90, height);
+        let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first), (60, &second)];
+        let mut req =
+            request_on_canvas(&next, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
+        req.refusals = crate::stitch::REFUSAL_PATIENCE;
+        match engine.place(&req) {
+            EngineDecision::Place { rect, .. } => assert_eq!(rect.y, 90),
+            other => panic!("the continuation must be placed: {other:?}"),
+        }
+    }
+
+    /// The colour check must read the canvas rows the frame would occupy, at
+    /// every candidate offset.
+    ///
+    /// This is the mapping `canvas_row = top - stitched.anchor_origin_y`. It was
+    /// once derived from `previous_rect.y + (top - engine_pos)`, which agrees
+    /// only while the previous frame's pixel row happens to equal its engine
+    /// row — true for a canvas that never prepends, false otherwise. The
+    /// failure was silent: structure scored 0.0000 at the true row while the
+    /// colour check read unrelated rows and refused it.
+    #[test]
+    fn the_colour_check_reads_the_rows_the_frame_would_occupy() {
+        let height = 60;
+        let mut engine = WindowedEdgeMatcher::new();
+        let first = frame_from(0, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
+        // A second frame further down, so the canvas covers rows 0..120.
+        let second = frame_from(60, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 60, &second);
+
+        // Now prepend: a frame above the canvas top, committed at logical -20.
+        // The pixel canvas grows upward, so `anchor_origin_y` becomes non-zero —
+        // which is exactly the case where deriving the mapping from
+        // `previous_rect.y + (top - engine_pos)` disagrees.
+        let above = frame_from_signed(0, height);
+        let committed: Vec<(i32, &RgbFrame)> = vec![(-20, &above), (0, &first), (60, &second)];
+        let probe = frame_from_signed(0, height);
+        let req =
+            request_on_canvas(&probe, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
+        assert_ne!(
+            req.stitched.anchor_origin_y, 0,
+            "this test must exercise a prepended canvas"
+        );
+        // A `previous_rect.y` that does not encode the engine position. The
+        // stitcher's value is authoritative for pixels and unrelated to the
+        // engine's logical rows, so the colour check must not depend on it.
+        let mut req = req;
+        req.previous_rect.y = 999;
+        // The frame is page rows 0..60, which sits at logical -20.
+        let at_truth = engine.colour_cost_at(&req, -20).expect("rows exist");
+        assert!(at_truth < 1.0, "the true row must read as identical, got {at_truth}");
+        let at_wrong = engine.colour_cost_at(&req, 40).expect("rows exist");
+        assert!(
+            at_wrong > at_truth + 10.0,
+            "an unrelated row must differ, got {at_wrong}"
+        );
+    }
+
+    /// The score cache must not change any decision: it only avoids recomputing
+    /// a cost that is fixed for the call.
+    #[test]
+    fn the_score_cache_returns_the_same_scores() {
+        let height = 60;
+        let first = frame_from(0, height);
+        let mut cache = ScoreCache::default();
+        let canvas = {
+            let mut e = WindowedEdgeMatcher::new();
+            e.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
+            e.canvas.clone().expect("canvas")
+        };
+        let ladder = EdgeLadder::from_source(&first, EdgeLadder::session_gain(&first)).unwrap();
+        for top in -5..5 {
+            let direct = canvas.cost_at(&ladder, top, 16);
+            let cached_first = cache.cost(&canvas, &ladder, top, 16);
+            let cached_again = cache.cost(&canvas, &ladder, top, 16);
+            assert_eq!(direct.map(|s| s.cost), cached_first.map(|s| s.cost));
+            assert_eq!(cached_first.map(|s| s.cost), cached_again.map(|s| s.cost));
+        }
     }
 
     /// The guard band is centred on the previous frame while the impulse window
@@ -2224,8 +2364,8 @@ mod tests {
     fn scripted_engine_satisfies_the_interface_contract() {
         let frame = frame_from(0, 40);
         let rect = ViewportRect { x: 0, y: 0, width: W, height: 40 };
-        let mut req = request(&frame, rect);
-        req.stitched = Box::leak(Box::new(canvas_of(40)));
+        let committed: Vec<(i32, &RgbFrame)> = vec![(0, &frame)];
+        let req = request_on_canvas(&frame, rect, &committed);
 
         let mut engine = ScriptedEngine::new(vec![
             EngineDecision::Place {

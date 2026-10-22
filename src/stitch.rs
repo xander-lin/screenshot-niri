@@ -3451,7 +3451,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_motion_ranked_scan_orders_lower_scores_first() {
+    fn fast_motion_scan_ranks_candidates_by_comparison_order() {
         let previous = PerceptualFrame::from_source(&textured_frame(160, 80));
         let current = PerceptualFrame::from_source(&shifted_bottom(&textured_frame(160, 80), 11));
 
@@ -3467,7 +3467,7 @@ mod tests {
     }
 
     #[test]
-    fn progressive_perceptual_search_accepts_fast_top_candidate() {
+    fn fast_motion_scan_accepts_its_top_candidate() {
         let previous = textured_frame(160, 80);
         let current = shifted_bottom_with_difference(&previous, 12, 6);
         let previous_frame = PerceptualFrame::from_source(&previous);
@@ -3499,7 +3499,7 @@ mod tests {
     }
 
     #[test]
-    fn progressive_perceptual_search_falls_back_when_top_candidates_miss() {
+    fn fast_motion_scan_falls_back_when_top_candidates_miss() {
         let previous = textured_frame(160, 80);
         let current = shifted_bottom_with_difference(&previous, 12, 6);
         let previous_frame = PerceptualFrame::from_source(&previous);
@@ -3525,7 +3525,7 @@ mod tests {
     }
 
     #[test]
-    fn progressive_perceptual_search_falls_back_when_partial_is_ambiguous() {
+    fn fast_motion_scan_falls_back_when_partial_is_ambiguous() {
         let previous = periodic_textured_frame(160, 80, 10);
         let current = shifted_bottom_with_difference(&previous, 12, 6);
         let previous_frame = PerceptualFrame::from_source(&previous);
