@@ -384,13 +384,10 @@ enum EditDrag {
 
 /// Border color for the current selection.
 ///
-/// White-red means "attention" and has three causes: the pointer is dragging
-/// the selection across outputs (live feedback — the border flips the moment
-/// the rect leaves the output where the drag began, and flips back on release:
-/// a settled normal-mode selection may legitimately span outputs because
-/// capture composites the pieces), a long-mode selection spans outputs
-/// (release clamps it to one output), or the stitcher is refusing the current
-/// content. None are silent failures.
+/// White-red means "attention" and has two causes: a long-mode selection spans
+/// outputs (release clamps it to one output, because a long capture is a single
+/// screen by construction), or the stitcher is refusing the current content.
+/// Neither is a silent failure.
 fn selection_border_color(spans_warning: bool, stitch_warning: bool) -> [u8; 4] {
     if stitch_warning || spans_warning {
         OVERLAY_BORDER_WHITE_RED_BGRA
@@ -407,25 +404,24 @@ fn selection_spans_outputs(state: &UiState, rect: LogicalRect) -> bool {
 /// Border color for the live selection, honoring the spans-outputs warning.
 fn border_color_for_state(state: &UiState, rect: Option<LogicalRect>) -> [u8; 4] {
     let spans = rect.map_or(false, |rect| selection_spans_outputs(state, rect));
-    border_color_for(rect, spans, state.drag, state.edit_drag.is_some(), state.long_mode, state.stitch_warning)
+    border_color_for(rect, spans, state.long_mode, state.stitch_warning)
 }
 
 /// The colour decision, independent of Wayland state so it can be tested.
 ///
-/// A spanning selection warns while the user can still act on it: during the
-/// drag that created it, during an edit drag, and in long mode (which cannot
-/// capture across outputs). Once released in normal mode the warning clears —
-/// that capture is composited from per-output pieces and is valid.
+/// Only long mode warns about a spanning selection: a long capture is a single
+/// screen by construction, so a spanning rect there is a real problem the user
+/// must fix (release clamps it to the drag's anchor output and enters edit
+/// mode). Normal mode composites a spanning selection from per-output pieces,
+/// which is a supported capture — warning about it would flag a working
+/// selection as an error, during the drag and in edit mode alike.
 fn border_color_for(
     rect: Option<LogicalRect>,
     spans: bool,
-    drag: DragState,
-    edit_drag: bool,
     long_mode: bool,
     stitch_warning: bool,
 ) -> [u8; 4] {
-    let dragging = matches!(drag, DragState::Dragging { .. }) || edit_drag;
-    selection_border_color(rect.is_some() && spans && (dragging || long_mode), stitch_warning)
+    selection_border_color(rect.is_some() && spans && long_mode, stitch_warning)
 }
 
 /// Selection rectangle used for overlay rendering: the current box united
@@ -2673,43 +2669,41 @@ mod tests {
     }
 
     #[test]
-    fn spanning_drag_warns_live_and_settled_span_does_not() {
-        // While the pointer drags, crossing onto another output flips the
-        // border immediately; it flips back on release.
+    fn only_long_mode_warns_about_a_spanning_selection() {
+        // Normal mode composites a spanning selection from per-output pieces,
+        // so it is a supported capture and must never be flagged — not while
+        // dragging, not after release, not in edit mode.
         let spanning = LogicalRect { x: 10, y: 10, width: 200, height: 20 };
         let inside = LogicalRect { x: 10, y: 10, width: 20, height: 20 };
-        let dragging = DragState::Dragging { origin_x: 10, origin_y: 10, current_x: 90, current_y: 90 };
 
-        // Dragging inside one output: plain white.
         assert_eq!(
-            border_color_for(Some(inside), false, dragging, false, false, false),
+            border_color_for(Some(spanning), true, false, false),
+            OVERLAY_BORDER_WHITE_BGRA,
+            "a spanning normal-mode selection is a valid capture"
+        );
+        assert_eq!(
+            border_color_for(Some(inside), false, false, false),
             OVERLAY_BORDER_WHITE_BGRA
         );
-        // Dragging across outputs: warns immediately.
+        // Long mode cannot capture a spanning selection: it warns.
         assert_eq!(
-            border_color_for(Some(spanning), true, dragging, false, false, false),
+            border_color_for(Some(spanning), true, true, false),
             OVERLAY_BORDER_WHITE_RED_BGRA
         );
-        // Released in normal mode: the warning clears (capture composites the
-        // pieces per output, so a settled spanning rect is valid).
+        // A stitch warning warns regardless of mode or geometry: it is about
+        // the content, not the selection.
         assert_eq!(
-            border_color_for(Some(spanning), true, DragState::Finished(spanning), false, false, false),
+            border_color_for(Some(inside), false, true, true),
+            OVERLAY_BORDER_WHITE_RED_BGRA
+        );
+        assert_eq!(
+            border_color_for(Some(inside), false, false, true),
+            OVERLAY_BORDER_WHITE_RED_BGRA
+        );
+        // No rect, nothing to warn about.
+        assert_eq!(
+            border_color_for(None, true, true, false),
             OVERLAY_BORDER_WHITE_BGRA
-        );
-        // Editing the box across outputs warns again: the user can still fix it.
-        assert_eq!(
-            border_color_for(Some(spanning), true, DragState::Finished(spanning), true, false, false),
-            OVERLAY_BORDER_WHITE_RED_BGRA
-        );
-        // Long mode keeps warning: it cannot capture a spanning selection.
-        assert_eq!(
-            border_color_for(Some(spanning), true, DragState::Finished(spanning), false, true, false),
-            OVERLAY_BORDER_WHITE_RED_BGRA
-        );
-        // A stitch warning warns regardless of geometry.
-        assert_eq!(
-            border_color_for(Some(inside), false, DragState::Finished(inside), false, true, true),
-            OVERLAY_BORDER_WHITE_RED_BGRA
         );
     }
 
