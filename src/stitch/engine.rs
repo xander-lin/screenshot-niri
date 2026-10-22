@@ -112,20 +112,16 @@ const EDGE_BASIN_DIVISOR: i32 = 8;
 const EDGE_IMPULSE_MIN_HALF_WIDTH: i32 = 24;
 const EDGE_IMPULSE_SCALE_NUMERATOR: i32 = 21;
 const EDGE_IMPULSE_SCALE_DENOMINATOR: i32 = 20;
-/// Ring ladder: first ring half-width, and the factor each further ring grows
-/// by.
+/// Factor each further anchor ring grows by.
 ///
-/// The guard and anchor searches walk outward from their centre one ring at a
-/// time, in both directions at once. The nearest explanation is therefore tried
-/// before a distant one, and the common case never scores the whole canvas: on
-/// real-1 the guard runs 53 times and only 3 rings are ever opened beyond the
-/// first (real-long, where the viewport is tall enough for the extent to be
-/// wider than one ring).
+/// The anchor walks outward from the last confirmed position one ring at a
+/// time, so the nearest explanation is tried before a distant one and the
+/// common case never scores the whole canvas. The first ring is one viewport
+/// (`rows`), which is derived from the frame rather than configured: it is the
+/// smallest distance at which "somewhere else in the canvas" starts.
 ///
-/// A ring is a symmetric band `inner < |top - centre| <= radius`; the first one
-/// includes the centre. Rings exist so no position is scored twice, and so a
-/// far answer is only reachable after every nearer one has been rejected.
-const EDGE_RING_BASE_HALF_WIDTH: i32 = 320;
+/// The guard needs no ladder at all — its window is `pos ± rows`, a single
+/// interval — so rings exist only here.
 const EDGE_RING_GROWTH: i32 = 4;
 
 /// A frame reduced to "where does luminance change, per row".
@@ -665,12 +661,15 @@ impl WindowedEdgeMatcher {
     }
 
     /// Scores an annulus around `centre`: positions with `inner < |top - centre|
-    /// <= outer`.
+    /// <= outer`, clipped to `bounds` and skipping `exclude`.
     ///
-    /// Rings are how the ladder avoids scoring a position twice. A plain wider
+    /// A ring is how a ladder avoids scoring a position twice. A plain wider
     /// window re-examines everything the narrower one already rejected, which
     /// is wasted work and — because the narrower window is the better-informed
     /// one — cannot change the answer. `inner == 0` covers the centre itself.
+    ///
+    /// The guard calls this once with `inner = 0` and `outer = rows`; only the
+    /// anchor walks a ladder.
     #[allow(clippy::too_many_arguments)]
     fn decide_ring(
         &self,
@@ -1060,16 +1059,17 @@ impl WindowedEdgeMatcher {
     /// Scores rings outward from `centre` inside `bounds`, skipping the
     /// positions `exclude` already covered.
     ///
-    /// Near to far and symmetric: the first ring covers both directions, so a
+    /// Near to far and symmetric: each ring covers both directions, so a
     /// scroll-back is found as quickly as a scroll-forward and neither
-    /// direction is searched exhaustively before the other.
+    /// direction is searched exhaustively before the other. The first ring is
+    /// one viewport wide, so the size comes from the frame, not from a tuned
+    /// constant.
     #[allow(clippy::too_many_arguments)]
     fn search_rings(
         &self,
         cache: &mut ScoreCache,
         ladder: &EdgeLadder,
         centre: i32,
-        inner: i32,
         bounds: (i32, i32),
         exclude: &[(i32, i32)],
         request: &PlacementRequest<'_>,
@@ -1079,11 +1079,11 @@ impl WindowedEdgeMatcher {
             return None;
         }
         let max_radius = (centre - lo).abs().max((hi - centre).abs());
-        if max_radius <= inner {
+        if max_radius <= 0 {
             return None;
         }
-        let mut ring_inner = inner.max(0);
-        let mut radius = EDGE_RING_BASE_HALF_WIDTH.max(ring_inner + 1).min(max_radius);
+        let mut ring_inner = 0;
+        let mut radius = (ladder.rows() as i32).min(max_radius);
         loop {
             if let DecideOutcome::Accept { top, cost } = self.decide_ring(
                 cache, ladder, centre, ring_inner, radius, bounds, exclude, request,
@@ -1227,9 +1227,16 @@ impl PlacementEngine for WindowedEdgeMatcher {
         // a position it rejected for want of one would be lost for good.
         let radius = self.adjacency_radius(&ladder);
         let guard = (pos - radius, pos + radius);
-        if let Some((top, cost)) =
-            self.search_rings(&mut cache, &ladder, predicted_top, 0, guard, &[], request)
-        {
+        if let DecideOutcome::Accept { top, cost } = self.decide_ring(
+            &mut cache,
+            &ladder,
+            predicted_top,
+            0,
+            radius,
+            guard,
+            &[],
+            request,
+        ) {
             return self.accept(request, ladder, top, cost);
         }
 
@@ -1256,7 +1263,7 @@ impl PlacementEngine for WindowedEdgeMatcher {
             let anchor = self.anchor.unwrap_or(pos);
             if let Some(bounds) = self.canvas_bounds(&ladder) {
                 if let Some((top, cost)) =
-                    self.search_rings(&mut cache, &ladder, anchor, 0, bounds, &[guard], request)
+                    self.search_rings(&mut cache, &ladder, anchor, bounds, &[guard], request)
                 {
                     return self.accept(request, ladder, top, cost);
                 }
