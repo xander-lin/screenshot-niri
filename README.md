@@ -108,7 +108,7 @@ border_width = 3
 3. The overlay dims except for the selected region. Capture is inset one logical pixel where the box is large enough. The closed border remains visible while selecting, resizing, and moving. Capture pauses during dragging; any unfinished frame exposed to a moved/resized border is discarded before stitching.
 4. **Scroll** the content within the selected region.
    The selection border is always drawn above the stitched preview, with the same appearance before and after selection.
-5. Press **↑** / **↓** / **←** / **→** to hint the scroll direction for better stitching.
+5. Press **↑** / **↓** / **←** / **→** to hint the scroll direction for better stitching. The hint can change mid-session: a **serpentine** path — right, down, left, down — stitches into one image, as long as consecutive frames still overlap. Each turn is matched against what is already on the canvas, so a wide page can be walked column by column.
 6. Press **E** during capture to enter selection-box **editing mode**: the box edges can be dragged to resize it and the box interior can be dragged to move it; wheel events are blocked (the displayed content cannot scroll while editing). Resizing is stitched at the exact edited position, which enables:
    - capturing content that is narrower on top and wider on the bottom (T-shaped captures),
    - scrolling vertically first and horizontally afterwards (L-shaped captures, hint with **←** / **→**),
