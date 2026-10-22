@@ -473,14 +473,15 @@ fn run() -> Result<(), Box<dyn Error>> {
             let mut holes = 0u32;
             let mut hole_ranges: Vec<(u32, u32)> = Vec::new();
             let mut partial = 0u32;
-            for (y, &(start, end)) in stitched.row_coverage.iter().enumerate() {
-                if start >= end {
+            for (y, coverage) in stitched.row_coverage.iter().enumerate() {
+                let covered = coverage.captured_width(width);
+                if covered == 0 {
                     holes += 1;
                     match hole_ranges.last_mut() {
                         Some((_, last)) if *last + 1 == y as u32 => *last = y as u32,
                         _ => hole_ranges.push((y as u32, y as u32)),
                     }
-                } else if start > 0 || end < width {
+                } else if covered < width {
                     partial += 1;
                 }
             }
@@ -493,7 +494,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 println!("    rows {lo}..={hi}");
             }
             println!(
-                "  partially covered rows: {partial}  (expected only for T/L captures)"
+                "  partially covered rows: {partial}  (expected only for T/L/arch captures)"
             );
             uncovered = holes;
         }

@@ -23,7 +23,10 @@
 use std::collections::VecDeque;
 
 use super::rgb::RgbSource;
-use super::{minimum_overlap, AppendDirection, FrameMatch, SearchDirection, StitchedFrame, ViewportRect};
+use super::{
+    minimum_overlap, AppendDirection, FrameMatch, RowCoverage, SearchDirection, StitchedFrame,
+    ViewportRect,
+};
 
 /// Column bins per row. Measured floor, not a preference: 8 bins leave 42
 /// silently misplaced frames on periodic content, 48 leave none.
@@ -965,18 +968,16 @@ impl WindowedEdgeMatcher {
     ) -> Option<f64> {
         let stitched = request.stitched;
         let frame = request.frame;
-        // The engine works in logical rows; `stitched` is a pixel buffer whose
-        // row 0 corresponds to logical row `anchor_origin_y` (it moves when the
-        // canvas prepends). That field is the authoritative mapping — it is
-        // written by the stitcher that produced `stitched`, so it cannot
-        // disagree with the buffer.
-        //
-        // Deriving the mapping instead from `previous_rect.y + (top -
-        // engine_pos)` happens to agree whenever `previous_rect.y` is the pixel
-        // row of `engine_pos`, and silently reads the wrong rows when it is
-        // not; deriving it from `EdgeCanvas::origin_row` is wrong too, because
-        // that is the *engine's* canvas, not the stitcher's.
-        let canvas_anchor = top - stitched.anchor_origin_y;
+        // The engine works in logical rows; `stitched` is a pixel buffer. The
+        // mapping is the previous frame's pixel row plus the row difference the
+        // engine decided on — both halves come from the same `commit`, so the
+        // pair is consistent by construction. `pos` is that frame's logical
+        // row and `previous_rect.y` its pixel row; using their difference keeps
+        // the formula independent of how either coordinate space is anchored
+        // (a geometry change re-seeds the engine's logical space, a prepend
+        // re-bases the pixel buffer, and neither disturbs the difference).
+        let engine_pos = self.pos?;
+        let canvas_anchor = request.previous_rect.y + (top - engine_pos);
         let mut total = 0u64;
         let mut samples = 0u64;
         let fw = frame.width();
@@ -1001,6 +1002,19 @@ impl WindowedEdgeMatcher {
                 let canvas_x = request.previous_rect.x + x as i32;
                 if canvas_x < 0 || canvas_x >= stitched.width as i32 {
                     continue;
+                }
+                // Compare only pixels the canvas actually captured. A ragged
+                // canvas has never-captured regions inside its buffer — the
+                // space between the legs of an arch, the strip a wider
+                // selection has not reached yet — and those bytes are zero.
+                // Reading them as content reports a colour difference of the
+                // frame's own brightness against black and refuses a placement
+                // that is in fact correct. The rule is the same one the output
+                // uses to decide transparency.
+                if let Some(coverage) = stitched.row_coverage.get(canvas_y as usize) {
+                    if !coverage.contains(canvas_x as u32) {
+                        continue;
+                    }
                 }
                 let f = frame.pixel_rgb(x, y);
                 let so = canvas_y as usize * stitched.stride as usize
@@ -1695,13 +1709,10 @@ mod tests {
         rect: ViewportRect,
         committed: &[(i32, &RgbFrame)],
     ) -> PlacementRequest<'a> {
-        // Build in engine-position order: the caller may list frames in any
-        // order (a prepended frame comes *before* the one that initialised the
-        // canvas), and the geometry only makes sense in position order.
-        let mut ordered: Vec<(i32, &RgbFrame)> = committed.to_vec();
-        ordered.sort_by_key(|&(top, _)| top);
-        let committed = ordered.as_slice();
-
+        // `committed` is in *commit order*, which is what the engine's canvas
+        // reflects: the first entry initialises it at pixel row 0 and each
+        // later one prepends or appends as its position requires. Sorting by
+        // position would describe a canvas the engine never built.
         let mut rows: Vec<Option<Vec<u8>>> = Vec::new();
         let mut prev_rect_y = 0i32;
         let mut prev_engine_pos = 0i32;
@@ -1763,9 +1774,6 @@ mod tests {
         } else {
             0
         };
-        if std::env::var("DBG_O").is_ok() {
-            eprintln!("ORIGIN prev_rect_y={prev_rect_y} last_top={:?} origin={origin_y}", committed.last().map(|c| c.0));
-        }
         let stitched = StitchedFrame {
             width: W,
             height,
@@ -1784,7 +1792,18 @@ mod tests {
                 height,
             },
             fixed_bands: crate::stitch::FixedBands::default(),
-            row_coverage: Vec::new(),
+            // Mirror the stitcher: prepended rows carry no pixels, so the
+            // colour check must not compare the frame against them.
+            row_coverage: rows
+                .iter()
+                .map(|row| {
+                    if row.is_some() {
+                        RowCoverage::Full
+                    } else {
+                        RowCoverage::Empty
+                    }
+                })
+                .collect(),
         };
         PlacementRequest {
             stitched: Box::leak(Box::new(stitched)),
@@ -2157,34 +2176,36 @@ mod tests {
     fn the_colour_check_reads_the_rows_the_frame_would_occupy() {
         let height = 60;
         let mut engine = WindowedEdgeMatcher::new();
+        // Canvas initialised at logical 0, then grown upward: the second commit
+        // prepends rows, so pixel row 0 stops being logical row 0. That is the
+        // case a mapping derived from anything but the commit pair gets wrong.
         let first = frame_from(0, height);
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
-        // A second frame further down, so the canvas covers rows 0..120.
-        let second = frame_from(60, height);
-        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 60, &second);
-
-        // Now prepend: a frame above the canvas top, committed at logical -20.
-        // The pixel canvas grows upward, so `anchor_origin_y` becomes non-zero —
-        // which is exactly the case where deriving the mapping from
-        // `previous_rect.y + (top - engine_pos)` disagrees.
-        let above = frame_from_signed(0, height);
-        let committed: Vec<(i32, &RgbFrame)> = vec![(-20, &above), (0, &first), (60, &second)];
-        let probe = frame_from_signed(0, height);
-        let req =
-            request_on_canvas(&probe, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
-        assert_ne!(
-            req.stitched.anchor_origin_y, 0,
-            "this test must exercise a prepended canvas"
+        let above = frame_from_signed(-60, height); // page rows -60..0
+        // Committed the way the stitcher does it after a prepend: the engine is
+        // told the *logical* row (-60) while the pixel rect is re-based to 0.
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, -60, &above);
+        let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first), (-60, &above)];
+        let req = request_on_canvas(
+            &above,
+            ViewportRect { x: 0, y: 0, width: W, height },
+            &committed,
         );
-        // A `previous_rect.y` that does not encode the engine position. The
-        // stitcher's value is authoritative for pixels and unrelated to the
-        // engine's logical rows, so the colour check must not depend on it.
-        let mut req = req;
-        req.previous_rect.y = 999;
-        // The frame is page rows 0..60, which sits at logical -20.
-        let at_truth = engine.colour_cost_at(&req, -20).expect("rows exist");
-        assert!(at_truth < 1.0, "the true row must read as identical, got {at_truth}");
-        let at_wrong = engine.colour_cost_at(&req, 40).expect("rows exist");
+        assert_eq!(
+            req.previous_rect.y, 0,
+            "the prepended frame is at pixel row 0, while the engine's logical row is -60"
+        );
+        assert_eq!(engine.pos, Some(-60), "the engine tracks logical rows");
+
+        // The frame is a copy of the prepended content, so at its own logical
+        // row the canvas holds exactly those pixels...
+        let at_truth = engine.colour_cost_at(&req, -60).expect("rows exist");
+        assert!(
+            at_truth < 1.0,
+            "the frame's own row must read as identical, got {at_truth}"
+        );
+        // ...and one viewport lower it is a different page area.
+        let at_wrong = engine.colour_cost_at(&req, 0).expect("rows exist");
         assert!(
             at_wrong > at_truth + 10.0,
             "an unrelated row must differ, got {at_wrong}"

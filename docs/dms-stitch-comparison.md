@@ -146,7 +146,7 @@
 ### 本实现
 
 - 每次放置**新建完整画布**并 blit 旧内容（`src/stitch/canvas.rs:166-209`），代价 O(canvas)/帧；RGB24 比 DMS 的 RGBA 省 25%。
-- 支持参差画布：`row_coverage` 记录每行实际覆盖区间，未捕获区在导出时保持透明（`src/stitch/canvas.rs:43-79,172-199`），T/L 形与宽窄往返因此成立。
+- 支持参差画布：`row_coverage` 记录每行实际覆盖区间（`RowCoverage::{Empty, Full, Spans}`，`Spans` 可为**多段**），未捕获区在导出时保持透明（`src/stitch/canvas.rs`），T/L 形、宽窄往返与拱形（∩）因此成立。
 - **没有字节/行上限**（`src/stitch/canvas.rs:130-137` 只检查 i32 坐标）。
   - 实测 1920×12360 画布 = **71.2 MiB** RGB；同尺寸继续输出预览还要再分配 1920×4×12360 ≈ **94.9 MiB** RGBA，且旧 Vec 在下一帧前才释放，峰值接近 2×。
   - DMS 在 256 MiB 时主动止损；我们只受物理内存约束。

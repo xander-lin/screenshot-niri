@@ -23,7 +23,7 @@ mod types;
 use canvas::{
     append_frame_at_position, append_frame_at_position_overwriting_overlap_rows,
     canvas_overlap_rect, extract_stitched_region, translate_viewport_rect,
-    viewport_rect_within_stitched,
+    viewport_rect_covered_by_stitched,
 };
 #[cfg(test)]
 use fixed_bands::detect_fixed_bands;
@@ -71,8 +71,8 @@ pub use engine::RejectReason;
 pub use types::{
     AppendDirection, ComposeCrop, DuplicateAnalysisMotion, FastMotionAgreement,
     FastMotionCandidate, FastMotionTrace, FastMotionVerifyPass, FixedBands, FrameMatch,
-    FrameScreenOffset, MotionEstimate, PushResult, RgbFrame, SearchDirection, StitchDecisionPath,
-    StitchProfileBreakdown, StitchedFrame, ViewportRect,
+    FrameScreenOffset, MotionEstimate, PushResult, RgbFrame, RowCoverage, SearchDirection,
+    StitchDecisionPath, StitchProfileBreakdown, StitchedFrame, ViewportRect,
 };
 
 const MATCH_LINE_MAX_AVERAGE_DIFF: f64 = 3.0;
@@ -1192,7 +1192,10 @@ impl RawStitcher {
                 return Ok(false);
             }
         };
-        if viewport_rect_within_stitched(stitched, candidate_rect)? {
+        // Inside the bounding box is not the same as already captured: on a
+        // ragged canvas the frame can land in a never-captured region, and
+        // skipping the append would drop its pixels while reporting success.
+        if viewport_rect_covered_by_stitched(stitched, candidate_rect)? {
             self.viewport_rect = Some(candidate_rect);
             stitched.current_origin_x = candidate_rect.x;
             stitched.current_origin_y = candidate_rect.y;
@@ -4215,7 +4218,7 @@ mod tests {
         let previous = frame(4, 2, 10);
         let mut stitched = StitchedFrame::from_first_frame(&previous);
         // Simulate a ragged canvas: only the left half of each row is captured.
-        stitched.row_coverage = vec![(0, 2), (0, 2)];
+        stitched.row_coverage = vec![RowCoverage::Spans(vec![(0, 2)]); 2];
         let image = image_from_stitched_frame(&stitched).unwrap();
         // Covered pixel keeps full alpha; uncovered right half is transparent.
         assert_eq!(image.data[3], 255);
@@ -4259,7 +4262,7 @@ mod tests {
         let strip = &image.data[(4 * 4) * 4..];
         assert_eq!(&strip[0..3], &[200, 200, 200]);
         // Everything is covered after a pure bottom extension.
-        assert!(stitched.row_coverage.iter().all(|&(s, e)| s == 0 && e == 4));
+        assert!(stitched.row_coverage.iter().all(|r| r == &RowCoverage::Full));
     }
 
     #[test]
@@ -4289,7 +4292,7 @@ mod tests {
         assert_eq!(stitched.width, 8);
         assert_eq!(stitched.height, 4);
         // All rows fully covered: the widened frame spans the whole width.
-        assert!(stitched.row_coverage.iter().all(|&(s, e)| s == 0 && e == 8));
+        assert!(stitched.row_coverage.iter().all(|r| r == &RowCoverage::Full));
     }
 
     #[test]
@@ -4320,7 +4323,7 @@ mod tests {
         // Canvas keeps the original width; the shrunken rows stay covered.
         let stitched = stitcher.stitched().unwrap();
         assert_eq!(stitched.width, 6);
-        assert!(stitched.row_coverage.iter().all(|&(s, e)| s == 0 && e == 6));
+        assert!(stitched.row_coverage.iter().all(|r| r == &RowCoverage::Full));
     }
 
     #[test]
@@ -4384,8 +4387,8 @@ mod tests {
         // while the original content shifted to x 3..7, y 2..6.
         assert_eq!(stitched.current_origin_x, 0);
         assert_eq!(stitched.current_origin_y, 0);
-        assert_eq!(stitched.row_coverage[0], (0, 4));
-        assert_eq!(stitched.row_coverage[5], (3, 7));
+        assert_eq!(stitched.row_coverage[0], RowCoverage::Spans(vec![(0, 4)]));
+        assert_eq!(stitched.row_coverage[5], RowCoverage::Spans(vec![(3, 7)]));
         // Uncovered top-right corner of the L stays transparent on output;
         // the bottom row is covered only where the old canvas sits (x 3..7).
         let image = image_from_stitched_frame(stitched).unwrap();
@@ -4581,5 +4584,112 @@ mod tests {
             stitcher.accepted_direction.vertical_direction(),
             Some(AppendDirection::Bottom)
         );
+    }
+
+    /// An arch (∩): scroll up on the left, widen at the top, move the box to
+    /// the right and scroll down. The canvas must hold all three parts *and*
+    /// keep the space between the legs transparent — it was never selected, so
+    /// it was never captured.
+    ///
+    /// Two defects made this impossible before. A frame whose rect fell inside
+    /// the canvas *bounding box* was treated as already captured, so the right
+    /// leg was dropped while still reported as accepted; and per-row coverage
+    /// was a hull, so the gap between the legs was painted opaque.
+    ///
+    /// The geometry path itself is engine-agnostic, but `LegacyPipeline` is an
+    /// A/B artifact that was never taught to place frames across a selection
+    /// move, so this asserts the shipped engine only.
+    #[cfg(not(feature = "stitch-legacy"))]
+    #[test]
+    fn an_arch_keeps_the_gap_between_its_legs_transparent() {
+        const PAGE_WIDTH: u32 = 320;
+        const HEIGHT: u32 = 100;
+        // One page row per page row: the content is the same no matter which
+        // column or which selection captured it.
+        let page: Vec<Vec<u8>> = (0..2000u32).map(|row| row_texture(PAGE_WIDTH, row)).collect();
+        let crop = |x: u32, top: u32, width: u32| -> RgbFrame {
+            let stride = width * 3;
+            let mut data = Vec::with_capacity((stride * HEIGHT) as usize);
+            for y in 0..HEIGHT {
+                let row = &page[(top + y) as usize];
+                data.extend_from_slice(&row[(x * 3) as usize..((x + width) * 3) as usize]);
+            }
+            RgbFrame { width, height: HEIGHT, stride, data }
+        };
+        let mut stitcher = RawStitcher::new();
+        // Left leg: scroll up with the box on the left.
+        let left = FrameScreenOffset { x: 0, y: 0 };
+        let first = crop(0, 400, 100);
+        assert!(matches!(
+            stitcher.push_frame_with_offset(&first, &first, Some(LongDirection::Up), left),
+            Ok(PushResult::Initialized)
+        ));
+        for top in [350u32, 300, 250, 200] {
+            let frame = crop(0, top, 100);
+            assert!(
+                matches!(
+                    stitcher.push_frame_with_offset(&frame, &frame, Some(LongDirection::Up), left),
+                    Ok(PushResult::Accepted { .. })
+                ),
+                "the left leg must keep extending at page row {top}"
+            );
+        }
+        // Widen at the top: same position, three times the width.
+        let widened = crop(0, 200, 300);
+        assert!(matches!(
+            stitcher.push_frame_with_offset(&widened, &widened, Some(LongDirection::Up), left),
+            Ok(PushResult::Accepted { .. })
+        ));
+        // Narrow again, this time on the right, then scroll down.
+        let right = FrameScreenOffset { x: 200, y: 0 };
+        let moved = crop(200, 200, 100);
+        assert!(matches!(
+            stitcher.push_frame_with_offset(&moved, &moved, Some(LongDirection::Up), right),
+            Ok(PushResult::Accepted { .. })
+        ));
+        for top in [250u32, 300, 350, 400] {
+            let frame = crop(200, top, 100);
+            assert!(
+                matches!(
+                    stitcher.push_frame_with_offset(&frame, &frame, Some(LongDirection::Down), right),
+                    Ok(PushResult::Accepted { .. })
+                ),
+                "the right leg must keep extending at page row {top}"
+            );
+        }
+
+        let stitched = stitcher.stitched().unwrap();
+        assert_eq!((stitched.width, stitched.height), (300, 300));
+        // Canvas row = page row - 200.
+        assert_eq!(stitched.row_coverage[0], RowCoverage::Full, "the top bar spans everything");
+        assert_eq!(stitched.row_coverage[50], RowCoverage::Full);
+        for row in [100usize, 150, 200, 250, 299] {
+            assert_eq!(
+                stitched.row_coverage[row],
+                RowCoverage::Spans(vec![(0, 100), (200, 300)]),
+                "row {row} must hold both legs and nothing between them"
+            );
+        }
+
+        let image = image_from_stitched_frame(stitched).unwrap();
+        let alpha = |x: usize, y: usize| image.data[(y * 300 + x) * 4 + 3];
+        let rgb = |x: usize, y: usize| {
+            let at = (y * 300 + x) * 4;
+            [image.data[at + 2], image.data[at + 1], image.data[at]]
+        };
+        // The gap between the legs was never selected: transparent.
+        for (x, y) in [(150, 200), (100, 299), (199, 120)] {
+            assert_eq!(alpha(x, y), 0, "({x},{y}) lies between the legs and must be transparent");
+        }
+        // Both legs carry the page content they captured.
+        for (x, y, page_row) in [(50, 200, 400usize), (250, 200, 400), (250, 299, 499)] {
+            assert_eq!(alpha(x, y), 255, "({x},{y}) is inside a leg and must be opaque");
+            let expected = &page[page_row][x * 3..x * 3 + 3];
+            assert_eq!(rgb(x, y), [expected[0], expected[1], expected[2]]);
+        }
+        // The top bar spans the full width.
+        assert_eq!(alpha(150, 50), 255);
+        let expected = &page[250][150 * 3..150 * 3 + 3];
+        assert_eq!(rgb(150, 50), [expected[0], expected[1], expected[2]]);
     }
 }

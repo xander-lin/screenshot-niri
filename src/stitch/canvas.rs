@@ -5,7 +5,9 @@ use wayland_client::protocol::wl_shm::Format;
 use crate::image::Image;
 
 use super::rgb::{validate_rgb_frame, RgbSource};
-use super::{ComposeCrop, FixedBands, FrameMatch, RgbFrame, StitchedFrame, ViewportRect};
+use super::{
+    ComposeCrop, FixedBands, FrameMatch, RgbFrame, RowCoverage, StitchedFrame, ViewportRect,
+};
 
 impl StitchedFrame {
     #[allow(dead_code)]
@@ -35,9 +37,67 @@ impl StitchedFrame {
             compose_height: frame.height,
             active_crop,
             fixed_bands,
-            row_coverage: vec![(0, frame.width); frame.height as usize],
+            row_coverage: vec![RowCoverage::Full; frame.height as usize],
         }
     }
+}
+
+/// Inserts `[start, end)` into a sorted, disjoint interval list, merging any
+/// overlapping *or adjacent* intervals.
+///
+/// Merging adjacency is what lets "is this interval covered" be answered by a
+/// single containment test: a contiguous captured run is always one entry.
+pub(super) fn merge_interval(intervals: &mut Vec<(u32, u32)>, start: u32, end: u32) {
+    if end <= start {
+        return;
+    }
+    let mut start = start;
+    let mut end = end;
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(intervals.len() + 1);
+    let mut inserted = false;
+    for &(s, e) in intervals.iter() {
+        if e < start {
+            merged.push((s, e));
+        } else if s > end {
+            if !inserted {
+                merged.push((start, end));
+                inserted = true;
+            }
+            merged.push((s, e));
+        } else {
+            start = start.min(s);
+            end = end.max(e);
+        }
+    }
+    if !inserted {
+        merged.push((start, end));
+    }
+    *intervals = merged;
+}
+
+/// Parts of `[start, end)` that `covered` (sorted, disjoint) does not cover.
+fn uncovered_spans(start: u32, end: u32, covered: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut spans = Vec::new();
+    let mut cursor = start;
+    for &(s, e) in covered {
+        if e <= cursor {
+            continue;
+        }
+        if s >= end {
+            break;
+        }
+        if s > cursor {
+            spans.push((cursor, s.min(end)));
+        }
+        cursor = cursor.max(e);
+        if cursor >= end {
+            break;
+        }
+    }
+    if cursor < end {
+        spans.push((cursor, end));
+    }
+    spans
 }
 
 pub fn image_from_stitched_frame(frame: &StitchedFrame) -> Result<Image, Box<dyn Error>> {
@@ -50,16 +110,14 @@ pub fn image_from_stitched_frame(frame: &StitchedFrame) -> Result<Image, Box<dyn
     for y in 0..frame.height as usize {
         let src_row = y * frame.stride as usize;
         let dst_row = y * stride as usize;
-        let covered = frame
-            .row_coverage
-            .get(y)
-            .copied()
-            .unwrap_or((0, frame.width));
+        let covered = frame.row_coverage.get(y);
         for x in 0..frame.width as usize {
             let dst = dst_row + x * 4;
-            if covered.1 <= covered.0 || x < covered.0 as usize || x >= covered.1 as usize {
+            // No per-row map at all: the canvas is rectangular.
+            let filled = covered.map_or(true, |row| row.contains(x as u32));
+            if !filled {
                 // Never captured: keep RGB zeroed and fully transparent so the
-                // ragged corners of T/L-shaped stitches stay see-through.
+                // ragged corners of T/L/arch-shaped stitches stay see-through.
                 continue;
             }
             let src = src_row + x * 3;
@@ -169,33 +227,65 @@ fn append_frame_at_position_with_overlap_mode(
     let stitched_dst_y = (-min_y) as u32;
     let frame_dst_x = (frame_x - min_x) as u32;
     let frame_dst_y = (frame_y - min_y) as u32;
-    let mut row_coverage = vec![(0u32, 0u32); output_height as usize];
-    for (y, &(start, end)) in stitched.row_coverage.iter().enumerate() {
-        if end <= start {
-            continue;
+    // Fast path for the overwhelmingly common frame: a pure vertical scroll,
+    // where the canvas keeps its width and x offset and the frame is full
+    // width. Coverage then only moves vertically, so it is copied instead of
+    // rebuilt row by row (the general path below costs ~0.1 ms per accepted
+    // frame on an 8 500-row canvas).
+    let vertical_only = !stitched.row_coverage.is_empty()
+        && stitched_dst_x == 0
+        && output_width == stitched.width
+        && frame_dst_x == 0
+        && frame.width == output_width;
+    let mut row_coverage: Vec<RowCoverage> = if vertical_only {
+        let mut coverage = vec![RowCoverage::Empty; output_height as usize];
+        let dst = stitched_dst_y as usize;
+        let rows = (stitched.height as usize).min(output_height as usize - dst);
+        coverage[dst..dst + rows].clone_from_slice(&stitched.row_coverage[..rows]);
+        let frame_lo = frame_dst_y as usize;
+        let frame_hi = (frame_dst_y as usize + frame.height as usize).min(output_height as usize);
+        for row in coverage.iter_mut().take(frame_hi).skip(frame_lo) {
+            *row = RowCoverage::Full;
         }
-        let out_y = stitched_dst_y as usize + y;
-        if out_y < output_height as usize {
-            let start = stitched_dst_x.saturating_add(start).min(output_width);
-            let end = stitched_dst_x.saturating_add(end).min(output_width);
-            row_coverage[out_y] = (start, end);
-        }
-    }
-    for y in 0..frame.height as usize {
-        let out_y = frame_dst_y as usize + y;
-        if out_y >= output_height as usize {
+        coverage
+    } else {
+        vec![RowCoverage::Empty; output_height as usize]
+    };
+    let mut spans: Vec<(u32, u32)> = Vec::with_capacity(4);
+    for row in 0..output_height as usize {
+        if vertical_only {
             break;
         }
-        let frame_end = frame_dst_x.saturating_add(frame.width).min(output_width);
-        let (start, end) = row_coverage[out_y];
-        // Union hull of the existing extent and the frame extent. Adjacent or
-        // overlapping fills (the normal case) stay exact; a fully disjoint
-        // fill over-covers the gap, which only affects never-captured corners.
-        row_coverage[out_y] = if start < end {
-            (start.min(frame_dst_x), end.max(frame_end))
-        } else {
-            (frame_dst_x, frame_end)
-        };
+        spans.clear();
+        // The old row index, not the new one: the canvas may have moved down
+        // (prepend) or right (selection moved left) as well as grown.
+        let old_row = row.checked_sub(stitched_dst_y as usize);
+        match old_row.and_then(|old| stitched.row_coverage.get(old)) {
+            Some(existing) => existing.push_into(
+                &mut spans,
+                stitched_dst_x,
+                stitched.width,
+                output_width,
+            ),
+            None if stitched.row_coverage.is_empty() => {
+                // Empty map: the old canvas was rectangular, so every row it
+                // held was fully covered.
+                if old_row.is_some_and(|old| old < stitched.height as usize) {
+                    merge_interval(
+                        &mut spans,
+                        stitched_dst_x.min(output_width),
+                        stitched_dst_x.saturating_add(stitched.width).min(output_width),
+                    );
+                }
+            }
+            None => {}
+        }
+        // The frame's own extent on this row.
+        if row >= frame_dst_y as usize && row < frame_dst_y as usize + frame.height as usize {
+            let frame_end = frame_dst_x.saturating_add(frame.width).min(output_width);
+            merge_interval(&mut spans, frame_dst_x, frame_end);
+        }
+        row_coverage[row] = RowCoverage::from_spans(&spans, output_width);
     }
     blit_rgb(
         &stitched.data,
@@ -221,23 +311,41 @@ fn append_frame_at_position_with_overlap_mode(
         OverlapWriteMode::Preserve | OverlapWriteMode::Rows { .. } => {
             // Preserve captured pixels, not the entire canvas bounding box.
             // Widening after a narrow scroll must fill previously transparent
-            // strips even though they lie inside that bounding box.
+            // strips even though they lie inside that bounding box, and the
+            // frame is written only where the canvas has no pixels yet — which
+            // on a ragged canvas is a *set* of strips per row, not one.
+            let mut covered: Vec<(u32, u32)> = Vec::with_capacity(4);
             for y in 0..frame.height {
                 let dst_y = frame_dst_y + y;
-                let covered = dst_y.checked_sub(stitched_dst_y)
-                    .and_then(|row| stitched.row_coverage.get(row as usize))
-                    .copied().filter(|&(start, end)| start < end)
-                    .map(|(start, end)| (start + stitched_dst_x, end + stitched_dst_x));
+                covered.clear();
+                let old_row = dst_y.checked_sub(stitched_dst_y);
+                match old_row.and_then(|row| stitched.row_coverage.get(row as usize)) {
+                    Some(existing) => existing.push_into(
+                        &mut covered,
+                        stitched_dst_x,
+                        stitched.width,
+                        output_width,
+                    ),
+                    None if stitched.row_coverage.is_empty() => {
+                        if let Some(row) = old_row {
+                            if (row as u32) < stitched.height {
+                                merge_interval(
+                                    &mut covered,
+                                    stitched_dst_x.min(output_width),
+                                    stitched_dst_x
+                                        .saturating_add(stitched.width)
+                                        .min(output_width),
+                                );
+                            }
+                        }
+                    }
+                    None => {}
+                }
                 let frame_end = frame_dst_x + frame.width;
-                let spans = match covered {
-                    Some((start, end)) => [
-                        (frame_dst_x, start.min(frame_end)),
-                        (end.max(frame_dst_x), frame_end),
-                    ],
-                    None => [(frame_dst_x, frame_end), (0, 0)],
-                };
-                for (start, end) in spans {
-                    if start >= end { continue; }
+                for (start, end) in uncovered_spans(frame_dst_x, frame_end, &covered) {
+                    if start >= end {
+                        continue;
+                    }
                     let src = (y * frame.stride + (start - frame_dst_x) * 3) as usize;
                     let dst = (dst_y * output_stride + start * 3) as usize;
                     let len = ((end - start) * 3) as usize;
@@ -346,6 +454,41 @@ pub(super) fn viewport_rect_within_stitched(
         && rect.y >= 0
         && right <= i32::try_from(stitched.width)?
         && bottom <= i32::try_from(stitched.height)?)
+}
+
+/// Whether every pixel of `rect` has already been captured, not merely whether
+/// the rect fits inside the canvas bounding box.
+///
+/// The two are the same only for a rectangular canvas. A ragged one — after a
+/// selection resize or move — has never-captured regions *inside* its bounding
+/// box: the leg of an L, the space between the legs of an arch. Treating those
+/// as captured makes the caller skip the append, so the frame that would fill
+/// them is dropped while still being reported as accepted, and every later
+/// frame then fails the colour check because the canvas there is still empty.
+pub(super) fn viewport_rect_covered_by_stitched(
+    stitched: &StitchedFrame,
+    rect: ViewportRect,
+) -> Result<bool, Box<dyn Error>> {
+    if !viewport_rect_within_stitched(stitched, rect)? {
+        return Ok(false);
+    }
+    if stitched.row_coverage.is_empty() {
+        // An empty coverage map means every row is fully covered.
+        return Ok(true);
+    }
+    let x = u32::try_from(rect.x)?;
+    let right = x + rect.width;
+    let first_row = u32::try_from(rect.y)?;
+    for row in first_row..first_row + rect.height {
+        match stitched.row_coverage.get(row as usize) {
+            Some(coverage) if coverage.covers(x, right) => {}
+            Some(_) => return Ok(false),
+            // No per-row map: rectangular canvas, every row covered.
+            None if stitched.row_coverage.is_empty() => {}
+            None => return Ok(false),
+        }
+    }
+    Ok(true)
 }
 
 pub(super) fn extract_stitched_region(

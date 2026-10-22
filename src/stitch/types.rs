@@ -22,6 +22,106 @@ pub struct FixedBands {
     pub bottom: u32,
 }
 
+/// Captured horizontal extent of one canvas row.
+///
+/// Three states rather than a list because they are not equally common and the
+/// common ones must not allocate: a rectangular capture is `Full` on every row,
+/// and a ragged one is `Full` almost everywhere with `Spans` only where the
+/// selection moved. Building a `Vec` per row cost ~13% of an accepted frame on
+/// the real corpus (8 500 rows × one allocation each).
+///
+/// `Spans` exists because a ragged capture can have *disjoint* filled extents in
+/// one row — the two legs of an arch, whose space between them was never
+/// selected and must stay transparent. A hull of the two would paint that space
+/// opaque.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowCoverage {
+    /// Nothing was captured in this row.
+    Empty,
+    /// The whole row is captured.
+    Full,
+    /// Sorted, disjoint, non-adjacent captured extents `(start_x, end_x)`.
+    Spans(Vec<(u32, u32)>),
+}
+
+impl RowCoverage {
+    /// Collapses a scratch interval list into the cheapest representation.
+    pub(super) fn from_spans(spans: &[(u32, u32)], width: u32) -> Self {
+        match spans {
+            [] => RowCoverage::Empty,
+            [(0, end)] if *end >= width => RowCoverage::Full,
+            _ => RowCoverage::Spans(spans.to_vec()),
+        }
+    }
+
+    /// Appends this row's extents shifted by `dx` into `out`, merged with what
+    /// `out` already holds and clipped to `clip`.
+    ///
+    /// `Full` is resolved against `source_width` — the canvas width *when the
+    /// row was written*, not the current one. A canvas only grows, so using the
+    /// new width would claim the widening strip was captured too: the strip the
+    /// user just selected and has not captured yet.
+    pub(super) fn push_into(
+        &self,
+        out: &mut Vec<(u32, u32)>,
+        dx: u32,
+        source_width: u32,
+        clip: u32,
+    ) {
+        match self {
+            RowCoverage::Empty => {}
+            RowCoverage::Full => crate::stitch::canvas::merge_interval(
+                out,
+                dx.min(clip),
+                dx.saturating_add(source_width).min(clip),
+            ),
+            RowCoverage::Spans(spans) => {
+                for &(start, end) in spans {
+                    crate::stitch::canvas::merge_interval(
+                        out,
+                        start.saturating_add(dx).min(clip),
+                        end.saturating_add(dx).min(clip),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whether `x` was captured in this row.
+    pub fn contains(&self, x: u32) -> bool {
+        match self {
+            RowCoverage::Empty => false,
+            RowCoverage::Full => true,
+            RowCoverage::Spans(spans) => spans.iter().any(|&(start, end)| x >= start && x < end),
+        }
+    }
+
+    /// Whether the whole span `[start, end)` was captured in this row.
+    pub(super) fn covers(&self, start: u32, end: u32) -> bool {
+        match self {
+            RowCoverage::Empty => false,
+            RowCoverage::Full => true,
+            // Adjacent intervals are merged, so one entry must cover the span:
+            // pieces that merely add up leave a hole between them.
+            RowCoverage::Spans(spans) => spans
+                .iter()
+                .any(|&(lo, hi)| lo <= start && hi >= end),
+        }
+    }
+
+    /// Number of captured pixels in this row, capped at `width`.
+    pub fn captured_width(&self, width: u32) -> u32 {
+        match self {
+            RowCoverage::Empty => 0,
+            RowCoverage::Full => width,
+            RowCoverage::Spans(spans) => spans
+                .iter()
+                .map(|&(start, end)| end.saturating_sub(start))
+                .sum(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StitchedFrame {
     pub width: u32,
@@ -36,11 +136,11 @@ pub struct StitchedFrame {
     pub compose_height: u32,
     pub active_crop: ComposeCrop,
     pub fixed_bands: FixedBands,
-    /// Filled horizontal extent per row as `(start_x, end_x)` in canvas pixels.
-    /// Rows grow to the canvas bounding box when frames with different
-    /// geometries are stitched; unfilled extents stay transparent on output.
-    /// An empty vector means every row is considered fully covered.
-    pub row_coverage: Vec<(u32, u32)>,
+    /// Captured horizontal extent of each canvas row.
+    ///
+    /// An empty *outer* vector means every row is fully covered (the
+    /// rectangular case, and the default for a canvas that never went ragged).
+    pub row_coverage: Vec<RowCoverage>,
 }
 
 /// On-screen top-left offset (in capture buffer pixels) of the region a frame
