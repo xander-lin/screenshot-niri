@@ -99,59 +99,34 @@ const EDGE_BASIN_DIVISOR: i32 = 8;
 ///
 /// The window has to cover the *next* step, and the next step is at least as
 /// large as the last one when the page accelerates. Measured on real-1,
-/// widening 0.6 -> 1.0 -> 1.05 moved 20 frames out of the wide stage into this
+/// widening 0.6 -> 1.0 -> 1.05 moved 20 frames out of the guard stage into this
 /// cheaper one with identical placements (204 accepts, 0 misplaced, 0
 /// displaced bands, drift -257).
 ///
 /// The reason to widen is that the window should contain the next step, not
-/// speed: the extra positions cost about what the avoided wide scans save.
-/// Measured with the graded wide stage, 0.60 -> 1.05 is 204.2M -> 195.3M
-/// boundary cells (-4.4%) and the mean time does not move outside run-to-run
-/// noise. 1.10 is where it breaks: 205 accepts but 2 frames with displaced
-/// bands and drift -677, because a window that wide starts catching jump
-/// frames that the wide stage places better.
+/// speed: the extra positions cost about what the avoided guard rings save,
+/// and the mean time does not move outside run-to-run noise. 1.10 is where it
+/// breaks: 205 accepts but 2 frames with displaced bands and drift -677,
+/// because a window that wide starts catching jump frames that the guard
+/// places better.
 const EDGE_IMPULSE_MIN_HALF_WIDTH: i32 = 24;
 const EDGE_IMPULSE_SCALE_NUMERATOR: i32 = 21;
 const EDGE_IMPULSE_SCALE_DENOMINATOR: i32 = 20;
-/// Half-width of the wide search around the prediction.
+/// Ring ladder: first ring half-width, and the factor each further ring grows
+/// by.
 ///
-/// A displacement, not an overlap bound: the frame may land far from where it
-/// was predicted because the content kept scrolling while the engine refused.
-const EDGE_WIDE_HALF_WIDTH: i32 = 1400;
-/// Near ring of the wide stage, scored before the rest of the reach.
+/// The guard and anchor searches walk outward from their centre one ring at a
+/// time, in both directions at once. The nearest explanation is therefore tried
+/// before a distant one, and the common case never scores the whole canvas: on
+/// real-1 the guard runs 53 times and only 3 rings are ever opened beyond the
+/// first (real-long, where the viewport is tall enough for the extent to be
+/// wider than one ring).
 ///
-/// It must cover the plausible displacement, not just a fixed distance: the
-/// last step says how far the page moves per frame, so a jump of that scale
-/// belongs in the near ring and only a recovery belongs outside it.
-const EDGE_WIDE_NEAR_FLOOR: i32 = 300;
-const EDGE_WIDE_NEAR_SCALE_NUMERATOR: i32 = 2;
-const EDGE_WIDE_NEAR_SCALE_DENOMINATOR: i32 = 1;
-/// Maximum single-frame displacement, as a fraction of the viewport height.
-///
-/// The generic overlap floor (10% of the viewport) is far too permissive for
-/// this matcher: a 700-row viewport could accept a 630-row jump on 70 rows of
-/// evidence, and on periodic content those 70 rows are trivially "matched" at
-/// the wrong place. Measured on the synthetic corpus, allowing 630-row jumps
-/// produced 51 silent misplacements on `table` and 97 on `cards2`, all of them
-/// at long offsets after a refusal had stalled the canvas.
-///
-/// A real scroll advances by a fraction of a viewport between frames. 60%
-/// keeps at least 40% of the frame as overlap, which is what makes the
-/// separation gate meaningful in the first place.
-const EDGE_MAX_DISPLACEMENT_NUMERATOR: i32 = 6;
-const EDGE_MAX_DISPLACEMENT_DENOMINATOR: i32 = 10;
-
-/// Anchor stage: the search radius starts here and grows by
-/// [`EDGE_ANCHOR_GROWTH`], so a scroll-back is found at the nearest ring first
-/// rather than scanning the whole frozen extent in one pass.
-const EDGE_ANCHOR_BASE_HALF_WIDTH: i32 = 320;
-const EDGE_ANCHOR_GROWTH: i32 = 4;
-/// How many refusals keep widening the displacement guard, in viewports.
-///
-/// Three viewports covers the gap a scroll animation can open before the next
-/// clean frame arrives, and stays far below the anchor window so a stale
-/// canvas cannot be mistaken for a match far away.
-const EDGE_REFUSAL_WIDEN_STEPS: i32 = 3;
+/// A ring is a symmetric band `inner < |top - centre| <= radius`; the first one
+/// includes the centre. Rings exist so no position is scored twice, and so a
+/// far answer is only reachable after every nearer one has been rejected.
+const EDGE_RING_BASE_HALF_WIDTH: i32 = 320;
+const EDGE_RING_GROWTH: i32 = 4;
 
 /// A frame reduced to "where does luminance change, per row".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,10 +140,6 @@ pub(super) struct EdgeLadder {
 }
 
 impl EdgeLadder {
-    /// Builds the ladder for a frame.
-    ///
-    /// The margin exists so a moving scrollbar never enters the comparison; it
-    /// is a fixed fraction, not a detection step.
     /// The gain a session should use, from the first frame committed.
     ///
     /// Low-contrast content (peak below the first level's threshold) needs its
@@ -227,6 +198,10 @@ impl EdgeLadder {
         peak
     }
 
+    /// Builds the ladder for a frame.
+    ///
+    /// The margin exists so a moving scrollbar never enters the comparison; it
+    /// is a fixed fraction, not a detection step.
     pub(super) fn from_source(frame: &dyn RgbSource, gain: f32) -> Option<Self> {
         let width = frame.width();
         let height = frame.height();
@@ -522,9 +497,8 @@ pub enum RejectReason {
     Uninitialised,
     /// The frame does not look like the canvas anywhere.
     NoCandidate,
-    /// The frame is supported structurally but not verifiably: either several
-    /// offsets fit equally well and none survived the colour check, or no stage
-    /// could place it at all.
+    /// Several offsets fit equally well and none survived the colour check, so
+    /// the content cannot say which one is right.
     Ambiguous,
     /// Too little comparable evidence to judge.
     InsufficientEvidence,
@@ -632,7 +606,6 @@ pub(super) struct WindowedEdgeMatcher {
     /// is legitimately further away. Without widening, one blurred frame
     /// (a scroll animation between two wheel steps) freezes the capture
     /// permanently.
-    refusals_since_accept: u32,
     /// The ladder built by the most recent `place`, reused by `commit`.
     ///
     /// Building it costs about half of the per-frame time, and `place` is
@@ -679,9 +652,8 @@ impl WindowedEdgeMatcher {
         }
         let min_overlap = minimum_overlap(ladder.rows(), ladder.rows()).max(1);
         for top in lo..=hi {
-            // `inner == 0` means "no hole": the ring includes the centre. The
-            // doc below promised that while the code skipped it, so the first
-            // anchor ring could never answer "the content did not move".
+            // `inner == 0` means "no hole": the ring includes the centre, so
+            // the first ring can answer "the content did not move".
             if inner > 0 && (top - centre).abs() <= inner {
                 continue;
             }
@@ -741,28 +713,6 @@ impl WindowedEdgeMatcher {
         }
 
         costs.sort_by(|a, b| a.0.total_cmp(&b.0));
-        // Drop candidates the displacement guard forbids *before* picking a
-        // winner.
-        //
-        // Checking only `costs[0]` let one forbidden candidate veto the whole
-        // window. Periodic content makes that concrete: every period-length
-        // offset scores exactly 0, the sort happens to put a far one first,
-        // and the frame was refused even though a nearer equivalent offset sat
-        // inside the guard. The guard exists to stop a *single* bad match from
-        // jumping the canvas, not to discard content that has a legal answer.
-        let limit = self.max_displacement();
-        let guard_centre = self.pos.unwrap_or(costs[0].1);
-        let before = costs.len();
-        costs.retain(|(_, top, _)| (top - guard_centre).abs() <= limit);
-        if costs.len() < before && crate::trace::edge_gate_trace_enabled() {
-            crate::trace_log!(
-                "stitch: dropped {} candidate(s) beyond displacement {limit}",
-                before - costs.len()
-            );
-        }
-        if costs.len() < 4 {
-            return DecideOutcome::Reject(RejectReason::InsufficientEvidence);
-        }
         let (best_cost, best_top, _) = costs[0];
         // The runner-up is the cheapest candidate outside the winner's basin.
         //
@@ -1029,29 +979,62 @@ impl WindowedEdgeMatcher {
         (self.frame_rows as i32 / EDGE_BASIN_DIVISOR).max(EDGE_ADJACENT_ROWS)
     }
 
-    fn max_displacement(&self) -> i32 {
-        let rows = self.frame_rows as i32;
-        let base = (rows * EDGE_MAX_DISPLACEMENT_NUMERATOR / EDGE_MAX_DISPLACEMENT_DENOMINATOR)
-            .max(EDGE_IMPULSE_MIN_HALF_WIDTH);
-        // While refusing, the content keeps moving away from the frozen canvas.
-        // Each refusal buys one more viewport of reach, up to the anchor
-        // window, so recovery is possible without ever letting a *first*
-        // match jump the page.
-        let extra = self
-            .refusals_since_accept
-            .min(EDGE_REFUSAL_WIDEN_STEPS as u32) as i32
-            * rows;
-        base.saturating_add(extra)
+    /// Scores rings outward from `centre` until one of them accepts or the
+    /// frame's overlap with the canvas runs out.
+    ///
+    /// Near to far, and symmetric: the first ring covers both directions, so a
+    /// scroll-back is found as quickly as a scroll-forward and neither
+    /// direction is searched exhaustively before the other.
+    fn search_outward(
+        &self,
+        ladder: &EdgeLadder,
+        centre: i32,
+        already_covered: i32,
+        request: &PlacementRequest<'_>,
+    ) -> Option<(i32, f64)> {
+        let (lo, hi) = self.reachable_top_range(ladder)?;
+        let max_radius = (centre - lo).abs().max((hi - centre).abs());
+        if max_radius <= 0 {
+            return None;
+        }
+        // The first ring starts where the impulse window stopped, so no
+        // position is scored twice and the stages partition the space.
+        let mut inner = already_covered.max(0).min(max_radius);
+        let mut radius = EDGE_RING_BASE_HALF_WIDTH.max(inner + 1).min(max_radius);
+        loop {
+            if let DecideOutcome::Accept { top, cost } =
+                self.decide_ring(ladder, centre, inner, radius, request)
+            {
+                return Some((top, cost));
+            }
+            if radius >= max_radius {
+                return None;
+            }
+            inner = radius;
+            radius = radius.saturating_mul(EDGE_RING_GROWTH).min(max_radius);
+        }
     }
 
-    fn wide_near_half_width(&self) -> i32 {
-        let scaled = self
-            .last_delta
-            .map(|delta| {
-                (delta.abs() * EDGE_WIDE_NEAR_SCALE_NUMERATOR) / EDGE_WIDE_NEAR_SCALE_DENOMINATOR
-            })
-            .unwrap_or(0);
-        scaled.max(EDGE_WIDE_NEAR_FLOOR)
+    /// Every canvas row where the frame still shares at least
+    /// `minimum_overlap` rows with content the canvas actually holds.
+    ///
+    /// This is the guard, and it comes from the canvas rather than from a
+    /// configured displacement: outside this range there is not enough
+    /// evidence to compare, so no gate could accept a placement there. Both
+    /// directions are included — a frame may sit above or below the rows we
+    /// have.
+    fn reachable_top_range(&self, ladder: &EdgeLadder) -> Option<(i32, i32)> {
+        let canvas = self.canvas.as_ref()?;
+        if canvas.is_empty() {
+            return None;
+        }
+        let rows = ladder.rows() as i32;
+        let min_overlap = minimum_overlap(ladder.rows(), ladder.rows()).max(1) as i32;
+        // The frame occupies [top, top + rows); the canvas covers
+        // [filled_lo, filled_hi]. Their overlap must be at least min_overlap.
+        let lo = canvas.filled_lo - rows + min_overlap;
+        let hi = canvas.filled_hi + 1 - min_overlap;
+        (lo <= hi).then_some((lo, hi))
     }
 
     fn impulse_half_width(&self) -> i32 {
@@ -1072,7 +1055,6 @@ impl WindowedEdgeMatcher {
         cost: f64,
     ) -> EngineDecision {
         self.pending_ladder = Some(ladder);
-        self.refusals_since_accept = 0;
         let pos = self.pos.unwrap_or(top);
         let delta_y = top - pos;
         let overlap = self.frame_rows.saturating_sub(delta_y.unsigned_abs());
@@ -1133,95 +1115,57 @@ impl PlacementEngine for WindowedEdgeMatcher {
         };
         let predicted_top = pos + prediction;
 
-        // Stage 1: impulse window. Cheap, and almost always enough.
-        if self.last_delta.is_some() {
-            let half = self.impulse_half_width();
-            if let DecideOutcome::Accept { top, cost } =
-                self.decide(&ladder, predicted_top - half, predicted_top + half, request)
-            {
-                return self.accept(request, ladder.clone(), top, cost);
+        // The impulse window's radius: zero on the first frame, where there is
+        // no step to extrapolate.
+        let impulse_reach = if self.last_delta.is_some() {
+            self.impulse_half_width()
+        } else {
+            0
+        };
+
+        // Stage 1 — impulse: the neighbourhood of where the last step points.
+        // Almost every frame is decided here, and it costs one narrow window.
+        if impulse_reach > 0 {
+            if let DecideOutcome::Accept { top, cost } = self.decide(
+                &ladder,
+                predicted_top - impulse_reach,
+                predicted_top + impulse_reach,
+                request,
+            ) {
+                return self.accept(request, ladder, top, cost);
             }
         }
 
-        // Stage 2: the wide reach, in two rings around the same prediction.
-        //
-        // The near ring covers the displacement the last step makes plausible
-        // (`max(300, 2 x delta)`), and it decided every frame that reached this
-        // stage on all seven corpora.
-        //
-        // The near ring is scaled by the last step rather than fixed, and that
-        // is what separates this from the ring split measured earlier: cutting
-        // the reach into fixed-width bands cost 58 acceptances and introduced 13
-        // misplaced writes on real-1, because a fixed band decides a frame on a
-        // candidate set that excludes competitors the page actually has. A band
-        // that grows with the displacement still contains them.
-        //
-        // The far ring is not extra *reach*: everything it can place, the
-        // anchor ladder below can also reach (its cap is the largest
-        // displacement that still leaves `minimum_overlap` rows of evidence),
-        // and on a 254-row viewport the near ring alone already covers that
-        // whole range. What the far ring adds is *order*: it evaluates
-        // everything beyond the plausible band as one window, so the cheapest
-        // match out there wins before the anchor's nearest-first ladder gets a
-        // chance to accept a mediocre match closer to home. It runs only when
-        // the near ring rejects (once in 54 wide-stage frames on real-1), so it
-        // costs nothing in the common case. Measured: zero acceptances on all
-        // seven corpora, and deleting it changes no corpus and no test — it is
-        // a safety net for the direction reversal that no corpus exercises.
-        //
-        // The radius is a *displacement*, not an overlap bound: `top` and the
-        // prediction are both canvas coordinates, so the frame may legitimately
-        // land many viewport-heights from where it was predicted (the content
-        // kept scrolling while the engine refused). Bounding this by the frame
-        // height measured 76 acceptances on real-1 instead of 204.
-        let near = self.wide_near_half_width();
-        if let DecideOutcome::Accept { top, cost } = self.decide(
-            &ladder,
-            predicted_top - near,
-            predicted_top + near,
-            request,
-        ) {
-            return self.accept(request, ladder.clone(), top, cost);
-        }
-        if let DecideOutcome::Accept { top, cost } = self.decide_ring(
-            &ladder,
-            predicted_top,
-            near,
-            EDGE_WIDE_HALF_WIDTH,
-            request,
-        ) {
-            return self.accept(request, ladder.clone(), top, cost);
+        // Stage 2 — guard: every position where the frame still shares enough
+        // rows with the canvas to be compared at all, nearest to the prediction
+        // first. The rings walk outward in both directions, so the nearest
+        // explanation wins instead of one direction being exhausted first.
+        if let Some((top, cost)) =
+            self.search_outward(&ladder, predicted_top, impulse_reach, request)
+        {
+            return self.accept(request, ladder, top, cost);
         }
 
-        // Stage 3: anchor recovery, nearest ring first. The anchor is frozen
-        // across refusals, so a user who scrolls back finds the content again;
-        // searching outward from it means the nearest explanation wins instead
-        // of whichever ring happens to be scanned first.
-        if let Some(anchor) = self.anchor {
-            let limit = (ladder.rows() as i32)
-                .saturating_sub(minimum_overlap(ladder.rows(), ladder.rows()) as i32)
-                .max(1);
-            let mut inner = 0;
-            let mut radius = EDGE_ANCHOR_BASE_HALF_WIDTH.min(limit);
-            loop {
-                if let DecideOutcome::Accept { top, cost } =
-                    self.decide_ring(&ladder, anchor, inner, radius, request)
-                {
-                    return self.accept(request, ladder.clone(), top, cost);
-                }
-                if radius >= limit {
-                    break;
-                }
-                inner = radius;
-                radius = radius.saturating_mul(EDGE_ANCHOR_GROWTH).min(limit);
+        // Stage 3 — anchor: the same reach ordered from the last confirmed
+        // position. The guard above already covered every reachable row, so
+        // this is not extra *coverage* — it is a different order, and order
+        // decides which of several acceptable offsets wins. Measured: one
+        // real-long frame (top 2180, anchor 2120, prediction 2164) is placed
+        // here and nowhere else; deleting this stage loses it.
+        //
+        // Skipped when the anchor and the prediction coincide, because then it
+        // is the search that just failed.
+        let anchor = self.anchor.unwrap_or(pos);
+        if anchor != predicted_top {
+            if let Some((top, cost)) = self.search_outward(&ladder, anchor, 0, request) {
+                return self.accept(request, ladder, top, cost);
             }
         }
 
-        // Stage 4: refuse. Nothing moves, but the displacement guard has to
-        // widen: the canvas stays frozen while the content keeps scrolling, so
-        // each refusal leaves the next frame legitimately further away.
-        self.refusals_since_accept = self.refusals_since_accept.saturating_add(1);
-        EngineDecision::Reject { reason: RejectReason::Ambiguous }
+        // Stage 4 — the frame overlaps the canvas, but nothing in it matches
+        // anywhere the evidence allows. Nothing moves; the caller waits for the
+        // next frame.
+        EngineDecision::Reject { reason: RejectReason::NoCandidate }
     }
 
     fn commit(&mut self, rect: ViewportRect, requested_top: i32, frame: &dyn RgbSource) {
@@ -1991,64 +1935,50 @@ mod tests {
         );
     }
 
-    /// A single blurred frame (a scroll animation caught mid-flight) must not
-    /// freeze the capture permanently. While refusing, the content keeps moving
-    /// away from the frozen canvas, so the displacement guard has to widen —
-    /// otherwise every later frame is refused for being too far away and the
-    /// canvas never grows again.
+    /// A frame that matches nothing is refused without moving anything, and
+    /// the next frame that does match is placed: the search is rebuilt from the
+    /// canvas every time, so one bad frame cannot stall the capture.
     #[test]
-    fn refusals_widen_the_displacement_guard_so_capture_recovers() {
+    fn a_refused_frame_does_not_stop_the_next_one() {
         let mut engine = WindowedEdgeMatcher::new();
         let height = 60;
         let first = frame_from(0, height);
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
-        let base = engine.max_displacement();
-        assert_eq!(engine.refusals_since_accept, 0);
+        let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first)];
 
-        // A frame that matches nowhere: the engine refuses and counts it.
+        // No overlap with the canvas at all: nothing to compare against.
         let nowhere = frame_from(900, height);
-        let mut req = request(&nowhere, ViewportRect { x: 0, y: 0, width: W, height });
-        req.stitched = Box::leak(Box::new(canvas_of(height)));
+        let req =
+            request_on_canvas(&nowhere, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
         assert!(matches!(engine.place(&req), EngineDecision::Reject { .. }));
-        assert_eq!(engine.refusals_since_accept, 1);
-        assert!(
-            engine.max_displacement() > base,
-            "the guard must widen after a refusal, base={base} now={}",
-            engine.max_displacement()
-        );
+        assert_eq!(engine.pos, Some(0), "a refusal must not move the position");
 
-        // Accepting again restores the strict guard.
+        // The next frame overlaps again and is placed.
         let back = frame_from(10, height);
-        let mut req = request(&back, ViewportRect { x: 0, y: 0, width: W, height });
-        req.stitched = Box::leak(Box::new(canvas_of(height)));
-        assert!(matches!(engine.place(&req), EngineDecision::Place { .. }));
-        assert_eq!(engine.refusals_since_accept, 0);
-        assert_eq!(engine.max_displacement(), base);
+        let req =
+            request_on_canvas(&back, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
+        let EngineDecision::Place { rect, .. } = engine.place(&req) else {
+            panic!("the next overlapping frame must be placed");
+        };
+        assert_eq!(rect.y, 10);
     }
 
-    /// A move beyond the near ring's plausible band is still placed: with a
-    /// 600-row viewport the guard is 360 rows while the near ring is 300, so a
-    /// frame that moved 340 rows sits outside the near ring.
-    ///
-    /// The anchor ladder covers it, not the far ring — measured by deleting
-    /// the far ring, which leaves this test passing. The far ring's reach and
-    /// the anchor's are the same band here; what separates them is order, not
-    /// coverage.
+    /// A move outside the impulse window is still placed by the guard, which
+    /// searches everything the canvas can still compare, nearest first.
     #[test]
-    fn a_move_beyond_the_near_band_is_still_placed() {
+    fn a_move_beyond_the_impulse_window_is_placed_by_the_guard() {
         let height = 600;
         let mut engine = WindowedEdgeMatcher::new();
         let first = frame_from(0, height);
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
-        assert_eq!(engine.wide_near_half_width(), EDGE_WIDE_NEAR_FLOOR);
 
-        // 340 rows: outside the near ring (300), inside the guard (360).
+        // 340 rows: beyond the first ring (320), inside the canvas overlap.
         let moved = frame_from(340, height);
         let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first)];
         let req = request_on_canvas(&moved, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
         match engine.place(&req) {
             EngineDecision::Place { rect, .. } => assert_eq!(rect.y, 340),
-            other => panic!("the far ring must place a 340-row move: {other:?}"),
+            other => panic!("the guard must place a 340-row move: {other:?}"),
         }
     }
 
@@ -2070,25 +2000,6 @@ mod tests {
             DecideOutcome::Accept { top, .. } => assert_eq!(top, 0, "the centre must win"),
             DecideOutcome::Reject(_) => panic!("the centre must be a candidate at all"),
         }
-    }
-
-    /// The wide stage's near ring must grow with the last step, not be a fixed
-    /// distance: a page that jumps 400 rows per frame is plausible there, and
-    /// cutting the reach into fixed-width bands was measured to lose 58
-    /// acceptances and introduce 13 misplaced writes on real-1, because a fixed
-    /// band decides a frame on a candidate set that excludes competitors the
-    /// page actually has.
-    #[test]
-    fn the_wide_near_ring_scales_with_the_last_step() {
-        let mut engine = WindowedEdgeMatcher::new();
-        // No step yet: the floor keeps a recovery-sized band.
-        assert_eq!(engine.wide_near_half_width(), EDGE_WIDE_NEAR_FLOOR);
-        // A normal step is still below the floor.
-        engine.last_delta = Some(60);
-        assert_eq!(engine.wide_near_half_width(), EDGE_WIDE_NEAR_FLOOR);
-        // A jump of 400 rows is plausible at 2x the step, not at the floor.
-        engine.last_delta = Some(400);
-        assert_eq!(engine.wide_near_half_width(), 800);
     }
 
     #[test]
