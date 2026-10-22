@@ -1025,18 +1025,21 @@ impl WindowedEdgeMatcher {
         (self.frame_rows as i32 / EDGE_BASIN_DIVISOR).max(EDGE_ADJACENT_ROWS)
     }
 
-    /// How far the frame may sit from the previous frame and still share
-    /// `minimum_overlap` rows with it.
+    /// How far the frame may sit from the previous frame and still *overlap* it.
     ///
-    /// This is the guard window: the only positions where the new frame can be
-    /// read as a continuation of the one before it. It is a property of the
-    /// two frames, not of the canvas — a 254-row viewport with 26 rows of
-    /// required overlap gives 228 rows either side, however tall the canvas has
-    /// grown.
+    /// This is the guard window, and it is the frame's own height: at
+    /// `|d| = rows` the two frames just touch, at `|d| = rows - 1` they share a
+    /// single row. Both directions are included, so a capture that scrolls back
+    /// up gets the same window as one that scrolls down.
+    ///
+    /// It is deliberately *not* `rows - minimum_overlap`. Overlap and evidence
+    /// are different questions: whether the frame continues the previous one is
+    /// geometry, while whether the overlap carries enough boundaries to trust is
+    /// a quality gate applied later, to the candidate's actual score. Folding
+    /// the second into the first made the window a constant of the gate rather
+    /// than of the frames, and it hid positions that do overlap.
     fn adjacency_radius(&self, ladder: &EdgeLadder) -> i32 {
-        let rows = ladder.rows() as i32;
-        let min_overlap = minimum_overlap(ladder.rows(), ladder.rows()).max(1) as i32;
-        (rows - min_overlap).max(0)
+        ladder.rows() as i32
     }
 
     /// Every canvas row where the frame still shares `minimum_overlap` rows
@@ -2106,17 +2109,22 @@ mod tests {
     fn the_anchor_stage_waits_for_the_red_border() {
         let height = 60;
         let mut engine = WindowedEdgeMatcher::new();
+        // A canvas three viewports tall: rows 0..180.
         let first = frame_from(0, height);
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
         let second = frame_from(60, height);
-        engine.commit(ViewportRect { x: 0, y: 60, width: W, height }, 60, &second);
-        assert_eq!(engine.pos, Some(60));
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 60, &second);
+        let third = frame_from(120, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 120, &third);
+        assert_eq!(engine.pos, Some(120));
 
-        // Row 10: inside the canvas, outside the guard band.
+        // Row 10: the canvas covers it, but the guard band (120 ± 60, i.e.
+        // 60..180) does not — the frame is not a continuation of the previous
+        // one, it is content from further up the page.
         let back = frame_from(10, height);
-        let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first), (60, &second)];
+        let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first), (60, &second), (120, &third)];
         let mut req =
-            request_on_canvas(&back, ViewportRect { x: 0, y: 60, width: W, height }, &committed);
+            request_on_canvas(&back, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
 
         req.refusals = 0;
         assert!(
@@ -2128,6 +2136,40 @@ mod tests {
         match engine.place(&req) {
             EngineDecision::Place { rect, .. } => assert_eq!(rect.y, 10),
             other => panic!("recovery must place the frame: {other:?}"),
+        }
+    }
+
+    /// Both directions are ordinary. A capture that scrolls back up must be
+    /// predicted, guarded and placed exactly like one that scrolls down: the
+    /// impulse window extrapolates a negative step, the guard band is symmetric
+    /// around the previous frame, and the frame lands *above* it.
+    ///
+    /// real-1 is a scroll-up corpus (total displacement -8020 px, 112 negative
+    /// steps), so this path is exercised by the corpora as well; this test pins
+    /// the geometry so a future change cannot make the window one-sided.
+    #[test]
+    fn scrolling_back_up_is_placed_like_scrolling_down() {
+        let height = 60;
+        let mut engine = WindowedEdgeMatcher::new();
+        // Start deep in the page and walk upward in half-viewport steps, so
+        // consecutive frames really do overlap (a full-viewport step leaves
+        // them touching, with zero rows in common).
+        let start = frame_from(600, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 600, &start);
+        let mut committed: Vec<(i32, RgbFrame)> = vec![(600, start)];
+        for top in [570i32, 540, 510] {
+            let frame = frame_from(top as u32, height);
+            let refs: Vec<(i32, &RgbFrame)> = committed.iter().map(|(y, f)| (*y, f)).collect();
+            let req =
+                request_on_canvas(&frame, ViewportRect { x: 0, y: 0, width: W, height }, &refs);
+            match engine.place(&req) {
+                EngineDecision::Place { rect, .. } => {
+                    assert_eq!(rect.y, top, "backward step to {top} must be placed there")
+                }
+                other => panic!("backward step to {top} refused: {other:?}"),
+            }
+            engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, top, &frame);
+            committed.push((top, frame));
         }
     }
 
