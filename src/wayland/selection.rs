@@ -172,6 +172,12 @@ struct OutputRuntime {
     info: OutputInfo,
     output: WlOutput,
     xdg_output: Option<ZxdgOutputV1>,
+    /// Pixel size of the output's current mode (`wl_output.mode`), which is the
+    /// grid the compositor scans out. `wl_output.scale` cannot say this: it is
+    /// an integer hint, while a 1.5-scaled 1920x1080 output reports scale 2 for
+    /// a 1280x720 logical size. Long capture starts without a frozen frame, so
+    /// this is the only density source it has before the first capture arrives.
+    mode_pixels: Option<(i32, i32)>,
 }
 
 struct OverlaySurface {
@@ -275,10 +281,11 @@ struct UiState {
     capture_pending: Option<LogicalRect>,
     /// Sticky until completion: edits may return to the original rectangle.
     capture_invalid: bool,
-    /// Global point where the selection drag started. A spanning selection
-    /// is clamped to the output containing this point — the box belongs to
-    /// the screen it was clicked on, not to whichever screen covers more of
-    /// its area.
+    /// Global point where the selection drag started. `L` promotion uses it to
+    /// clamp a spanning normal-mode selection to the output containing this
+    /// point — the box belongs to the screen it was clicked on, not to
+    /// whichever screen covers more of its area. A *long-mode* drag that spans
+    /// outputs is discarded on release instead (see `discard_selection`).
     selection_anchor: Option<(i32, i32)>,
     /// Visible selection-border thickness in logical pixels (configurable).
     border_width: i32,
@@ -424,9 +431,9 @@ enum EditDrag {
 /// Border color for the current selection.
 ///
 /// White-red means "attention" and has two causes: a long-mode selection spans
-/// outputs (release clamps it to one output, because a long capture is a single
-/// screen by construction), or the stitcher is refusing the current content.
-/// Neither is a silent failure.
+/// outputs (release discards it, because a long capture is a single screen by
+/// construction), or the stitcher is refusing the current content. Neither is a
+/// silent failure.
 fn selection_border_color(spans_warning: bool, stitch_warning: bool) -> [u8; 4] {
     if stitch_warning || spans_warning {
         OVERLAY_BORDER_WHITE_RED_BGRA
@@ -450,8 +457,8 @@ fn border_color_for_state(state: &UiState, rect: Option<LogicalRect>) -> [u8; 4]
 ///
 /// Only long mode warns about a spanning selection: a long capture is a single
 /// screen by construction, so a spanning rect there is a real problem the user
-/// must fix (release clamps it to the drag's anchor output and enters edit
-/// mode). Normal mode composites a spanning selection from per-output pieces,
+/// must fix (release discards the box and returns to an empty selection).
+/// Normal mode composites a spanning selection from per-output pieces,
 /// which is a supported capture — warning about it would flag a working
 /// selection as an error, during the drag and in edit mode alike.
 fn border_color_for(
@@ -1230,6 +1237,38 @@ fn set_overlay_pointer_input_interactive(state: &mut UiState) {
     }
 }
 
+/// Whether a finished long-mode selection must be discarded.
+///
+/// Long capture is single-screen by construction, so a box that spans outputs
+/// is not a selection — the red border says so. Clamping it to one output would
+/// silently capture something the user did not select, so the box is dropped
+/// instead and the user drags again.
+fn long_selection_must_be_discarded(long_mode: bool, rect: Option<LogicalRect>, infos: &[OutputInfo]) -> bool {
+    long_mode && rect.is_some_and(|rect| crate::geometry::rect_spans_outputs(rect, infos))
+}
+
+/// Applies [`long_selection_must_be_discarded`] to the current state.
+fn discard_spanning_long_selection(state: &mut UiState) -> bool {
+    let infos = state.output_infos();
+    if !long_selection_must_be_discarded(state.long_mode, state.drag.selected_rect(), &infos) {
+        return false;
+    }
+    discard_selection(state);
+    true
+}
+
+/// Drops the selection as if the drag had never happened.
+///
+/// Long capture is single-screen, so a box spanning outputs cannot become a
+/// capture: clamping it to one output captures something the user did not
+/// select, and the red border already told them so. Returning to the empty
+/// selection state is the honest outcome — the user drags again.
+fn discard_selection(state: &mut UiState) {
+    state.drag = DragState::Idle;
+    state.selection_anchor = None;
+    invalidate_overlay_bases(state);
+}
+
 /// Drops cached overlay bases so the next render rebuilds them with the
 /// current selection rectangle (used after selection-box edits).
 fn invalidate_overlay_bases(state: &mut UiState) {
@@ -1407,6 +1446,13 @@ fn toggle_edit_mode(state: &mut UiState) -> Option<OverlayInputMode> {
                 .pointer_global_position()
                 .unwrap_or((state.pointer_x, state.pointer_y));
             state.drag.finish(x, y);
+        }
+        // Same rule as a release: a long-mode box that spans outputs is not a
+        // selection, so E discards it rather than opening an edit mode on a box
+        // that can never be captured.
+        if discard_spanning_long_selection(state) {
+            render_overlays(state);
+            return None;
         }
         state.editing = true;
         state.edit_drag = None;
@@ -1908,16 +1954,48 @@ fn rect_union(a: LogicalRect, b: LogicalRect) -> LogicalRect {
 }
 
 
+/// The output's pixel size from its mode, when the mode describes the same
+/// shape as the logical size.
+///
+/// A rotated output reports the *unrotated* mode (1920x1080 for a 1080x1920
+/// logical size), so the mode is not the buffer's shape there — using it would
+/// squash the overlay through the viewport. The logical size wins in that case,
+/// which costs sharpness but keeps the geometry right.
+fn mode_pixels_for(mode: Option<(i32, i32)>, logical: (i32, i32)) -> Option<(i32, i32)> {
+    let (mode_width, mode_height) = mode?;
+    let (logical_width, logical_height) = logical;
+    if mode_width <= 0 || mode_height <= 0 || logical_width <= 0 || logical_height <= 0 {
+        return None;
+    }
+    let lhs = i64::from(mode_width) * i64::from(logical_height);
+    let rhs = i64::from(mode_height) * i64::from(logical_width);
+    // 1% tolerance: xdg_output rounds the logical size, so the cross products
+    // of a genuinely unrotated output are equal only up to that rounding.
+    if (lhs - rhs).abs() * 100 > lhs.max(rhs) {
+        return None;
+    }
+    Some((mode_width, mode_height))
+}
+
 /// Overlay buffer size in pixels.
 ///
-/// Two hard lower bounds: the frozen image that is about to be displayed (we
-/// must not resample our own screenshot before the compositor shows it) and the
-/// output's physical density from `wp_fractional_scale_v1` (otherwise the
-/// compositor upscales the overlay). Without `wp_viewporter` a buffer larger
-/// than the surface cannot be mapped back, so the logical size wins.
+/// Hard lower bounds, in the order they are known:
+///
+/// - the frozen image that is about to be displayed (we must not resample our
+///   own screenshot before the compositor shows it);
+/// - when there is no frozen image yet — a `--long` session starts live — the
+///   output's current mode, which is the grid the compositor scans out and the
+///   density the live capture will arrive at;
+/// - the output's density from `wp_fractional_scale_v1`, when the compositor
+///   advertises it (180 = 1.5), otherwise the compositor upscales the overlay.
+///
+/// The capture wins over the mode: it is what we display, so its grid is the
+/// one to match. Without `wp_viewporter` a buffer larger than the surface
+/// cannot be mapped back, so the logical size wins.
 fn overlay_buffer_size(
     logical: (i32, i32),
     capture: Option<(i32, i32)>,
+    output_pixels: Option<(i32, i32)>,
     preferred_scale: i32,
     viewport_available: bool,
 ) -> (i32, i32) {
@@ -1928,7 +2006,7 @@ fn overlay_buffer_size(
     }
     let numerator = i64::from(preferred_scale.max(1));
     let hinted = |extent: i32| (i64::from(extent) * numerator + 119) / 120;
-    let (capture_width, capture_height) = capture.unwrap_or((0, 0));
+    let (capture_width, capture_height) = capture.or(output_pixels).unwrap_or((0, 0));
     (
         hinted(logical_width)
             .max(i64::from(capture_width))
@@ -1946,14 +2024,18 @@ fn overlay_buffer_size(
 /// `wp_fractional_scale_v1.preferred_scale`, and the frozen capture size from
 /// the screenshot that was taken before the selection started.
 fn refresh_overlay_surface(state: &mut UiState, output_name: u32, qh: &QueueHandle<UiState>) {
-    let Some(output_info) = state
+    let Some(output) = state
         .outputs
         .iter()
         .find(|output| output.info.global_name == output_name)
-        .map(|output| output.info)
     else {
         return;
     };
+    let output_info = output.info;
+    let output_pixels = mode_pixels_for(
+        output.mode_pixels,
+        (output.info.logical.width, output.info.logical.height),
+    );
     let frozen = (if state.screenshot_cursor_hidden {
         &state.frozen_outputs_without_cursor
     } else {
@@ -1980,6 +2062,7 @@ fn refresh_overlay_surface(state: &mut UiState, output_name: u32, qh: &QueueHand
     let (buffer_width, buffer_height) = overlay_buffer_size(
         (logical_width, logical_height),
         frozen.map(|frozen| (frozen.width, frozen.height)),
+        output_pixels,
         preferred_scale,
         viewporter.is_some(),
     );
@@ -2135,6 +2218,7 @@ impl Dispatch<WlRegistry, ()> for UiState {
                     info: OutputInfo { global_name: name, logical: LogicalRect { x: 0, y: 0, width: 1, height: 1 }, scale: 1 },
                     output,
                     xdg_output: None,
+                    mode_pixels: None,
                 });
             }
             _ => {}
@@ -2236,32 +2320,13 @@ impl Dispatch<WlPointer, ()> for UiState {
                             invalidate_overlay_bases(state);
                         } else if !state.editing {
                             state.drag.finish(x, y);
-                            // Long mode cannot capture a selection spanning
-                            // outputs: clamp it to the output where the drag
-                            // started (the screen the user clicked on) and
-                            // drop into edit mode for the user to keep
-                            // adjusting the placement.
-                            if state.long_mode && state.drag.is_finished() {
-                                if let Some(rect) = state.drag.selected_rect() {
-                                    if selection_spans_outputs(state, rect) {
-                                        let clamped = state
-                                            .selection_anchor
-                                            .map(|(ax, ay)| crate::geometry::clamp_rect_to_output_at_point(
-                                                rect,
-                                                &state.output_infos(),
-                                                ax,
-                                                ay,
-                                            ))
-                                            .unwrap_or_else(|| crate::geometry::clamp_rect_to_largest_output(
-                                                rect,
-                                                &state.output_infos(),
-                                            ));
-                                        state.drag = DragState::Finished(clamped);
-                                        state.editing = true;
-                                        invalidate_overlay_bases(state);
-                                    }
-                                }
-                            }
+                            // Long capture is single-screen, so a box spanning
+                            // outputs is not a selection (that is what the red
+                            // border says). Clamping it to one output would
+                            // silently capture something the user did not
+                            // select, so the drag is discarded instead and the
+                            // user drags again.
+                            discard_spanning_long_selection(state);
                         }
                     }
                     _ => {}
@@ -2353,9 +2418,16 @@ impl Dispatch<WlOutput, u32> for UiState {
         };
         match event {
             wl_output::Event::Scale { factor } => output.info.scale = factor.max(1),
-            wl_output::Event::Mode { width, height, .. } if output.info.logical.width <= 1 && output.info.logical.height <= 1 => {
-                output.info.logical.width = width;
-                output.info.logical.height = height;
+            wl_output::Event::Mode { flags, width, height, .. } => {
+                if matches!(flags, WEnum::Value(flags) if flags.contains(wl_output::Mode::Current)) {
+                    output.mode_pixels = Some((width.max(1), height.max(1)));
+                }
+                // Without xdg_output the mode is the only size there is; it is
+                // the pixel size, which is what this fallback always assumed.
+                if output.info.logical.width <= 1 && output.info.logical.height <= 1 {
+                    output.info.logical.width = width;
+                    output.info.logical.height = height;
+                }
             }
             _ => {}
         }
@@ -2491,19 +2563,40 @@ mod tests {
     }
 
     #[test]
-    fn overlay_buffer_size_never_shrinks_below_capture_or_density() {
+    fn overlay_buffer_size_never_shrinks_below_content_or_density() {
         // 1920x1080 output at 1.5 reports a 1280x720 logical size; the frozen
         // capture is 1920x1080 and the hint is 180 (120ths).
-        assert_eq!(overlay_buffer_size((1280, 720), Some((1920, 1080)), 180, true), (1920, 1080));
+        assert_eq!(overlay_buffer_size((1280, 720), Some((1920, 1080)), Some((1920, 1080)), 180, true), (1920, 1080));
         // Same density with no capture yet (the live path): still 1.5x.
-        assert_eq!(overlay_buffer_size((1280, 720), None, 180, true), (1920, 1080));
-        assert_eq!(overlay_buffer_size((1280, 720), None, 150, true), (1600, 900));
-        assert_eq!(overlay_buffer_size((1280, 720), None, 120, true), (1280, 720));
+        assert_eq!(overlay_buffer_size((1280, 720), None, None, 180, true), (1920, 1080));
+        assert_eq!(overlay_buffer_size((1280, 720), None, None, 150, true), (1600, 900));
+        assert_eq!(overlay_buffer_size((1280, 720), None, None, 120, true), (1280, 720));
+        // Long capture starts live: no frozen frame, and niri does not advertise
+        // wp_fractional_scale_v1, so there is no hint either. The output's mode
+        // is the grid the live capture arrives at, so the overlay is already at
+        // the right density instead of being upscaled by the compositor.
+        assert_eq!(overlay_buffer_size((1280, 720), None, Some((1920, 1080)), 120, true), (1920, 1080));
+        // A capture is what we display, so its grid wins over the mode.
+        assert_eq!(overlay_buffer_size((1280, 720), Some((1280, 720)), Some((1920, 1080)), 120, true), (1280, 720));
         // A capture denser than the hint wins: the image we display must never
         // be resampled on its way to the screen.
-        assert_eq!(overlay_buffer_size((1280, 720), Some((2560, 1440)), 180, true), (2560, 1440));
+        assert_eq!(overlay_buffer_size((1280, 720), Some((2560, 1440)), None, 180, true), (2560, 1440));
         // Without wp_viewporter a larger buffer cannot be mapped back.
-        assert_eq!(overlay_buffer_size((1280, 720), Some((1920, 1080)), 180, false), (1280, 720));
+        assert_eq!(overlay_buffer_size((1280, 720), Some((1920, 1080)), None, 180, false), (1280, 720));
+    }
+
+    /// The mode is the density source only when it describes the same shape as
+    /// the logical size; a rotated output reports the unrotated mode.
+    #[test]
+    fn the_output_mode_is_a_density_source_only_when_the_shape_matches() {
+        // 1920x1080 mode, 1280x720 logical: 1.5.
+        assert_eq!(mode_pixels_for(Some((1920, 1080)), (1280, 720)), Some((1920, 1080)));
+        // Same shape with xdg_output rounding: 1.5 of 1281x721 is not integral.
+        assert_eq!(mode_pixels_for(Some((1920, 1080)), (1281, 721)), Some((1920, 1080)));
+        // Rotated: the mode is landscape, the logical size is portrait.
+        assert_eq!(mode_pixels_for(Some((1920, 1080)), (720, 1280)), None);
+        // No mode event (wl_output below version 4).
+        assert_eq!(mode_pixels_for(None, (1280, 720)), None);
     }
 
     #[test]
@@ -3060,6 +3153,41 @@ mod tests {
             apply_edge_drag(rect, SelectionEdge::Bottom, 115, 140, bounds),
             LogicalRect { x: 100, y: 100, width: 40, height: 40 }
         );
+    }
+
+    /// A long-mode box spanning outputs is not a selection: it is dropped, not
+    /// clamped to one output (which would capture a box the user never chose).
+    #[test]
+    fn a_long_selection_that_spans_outputs_is_discarded_not_clamped() {
+        let infos = [
+            OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 0, width: 100, height: 80 }, scale: 1 },
+            OutputInfo { global_name: 2, logical: LogicalRect { x: 100, y: 0, width: 100, height: 80 }, scale: 1 },
+        ];
+        let spanning = LogicalRect { x: 90, y: 10, width: 30, height: 20 };
+        let inside = LogicalRect { x: 10, y: 10, width: 30, height: 20 };
+
+        assert!(long_selection_must_be_discarded(true, Some(spanning), &infos));
+        assert!(!long_selection_must_be_discarded(true, Some(inside), &infos));
+        // Normal mode composites a spanning selection from per-output pieces,
+        // so the same box is a valid capture there.
+        assert!(!long_selection_must_be_discarded(false, Some(spanning), &infos));
+        assert!(!long_selection_must_be_discarded(true, None, &infos));
+    }
+
+    #[test]
+    fn discarding_a_selection_returns_to_the_empty_selection_state() {
+        let mut state = ui_state();
+        state.long_mode = true;
+        state.drag = DragState::Finished(SELECTED);
+        state.selection_anchor = Some((10, 20));
+
+        discard_selection(&mut state);
+
+        assert_eq!(state.drag, DragState::Idle);
+        assert_eq!(state.selection_anchor, None);
+        // The selection state is what the next press starts from, so the
+        // overlay must be told to repaint without a box.
+        assert!(state.long_mode);
     }
 
     #[test]

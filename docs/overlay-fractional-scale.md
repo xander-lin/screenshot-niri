@@ -42,15 +42,21 @@ spanning selection that touched the scaled output failed too.
 ### Overlay buffer size
 
 ```
-buffer = max(frozen capture pixels, ceil(logical x preferred_scale / 120))
+buffer = max(content pixels, ceil(logical x preferred_scale / 120))
 ```
 
-- `preferred_scale` comes from `wp_fractional_scale_v1` (180 = 1.5); without the
-  protocol it stays 120 and the capture alone sizes the buffer.
-- Two hard lower bounds: never below the frozen image that is about to be
-  displayed (otherwise we resample our own screenshot before the compositor
-  shows it) and never below the output's pixel density (otherwise the
-  compositor upscales the overlay).
+- `content` is the frozen capture when there is one, and the output's current
+  `wl_output.mode` otherwise: a `--long` session starts live, so before the
+  first capture the mode is the only known pixel grid (and it is the grid the
+  live capture will arrive at). The capture wins over the mode because it is
+  what we display.
+- `preferred_scale` comes from `wp_fractional_scale_v1` (180 = 1.5); niri does
+  not advertise that protocol, so there the mode is what makes a 1.5-scaled
+  long-capture overlay sharp.
+- Two hard lower bounds: never below the content that is about to be displayed
+  (otherwise we resample our own screenshot before the compositor shows it) and
+  never below the output's pixel density (otherwise the compositor upscales the
+  overlay).
 - Without `wp_viewporter` a buffer larger than the surface cannot be mapped
   back, so the logical size wins and the old blur returns.
 - `buffer_scale` stays 1; a `wp_viewport` destination equal to the logical size
@@ -107,7 +113,7 @@ Overlay buffers and both frozen caches grow by `scale^2` (2.25x at 1.5). On a
 
 ## Tests
 
-- `overlay_buffer_size_never_shrinks_below_capture_or_density`
+- `overlay_buffer_size_never_shrinks_below_content_or_density`
 - `frozen_overlay_maps_buffer_pixels_through_the_logical_grid` (4x4 logical,
   6x6 buffer): reverting the mapping to 1:1 fails it.
 - `preview_fills_a_denser_buffer_without_gaps` (2x2 logical, 4x4 buffer): the

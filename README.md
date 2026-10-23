@@ -104,7 +104,7 @@ border_width = 3
 ### Long/Scroll Screenshot (`--long`)
 
 1. Run `screenshot --long` — enter region selection.
-2. **Drag** to select the capture area on a single output. If the box spans two outputs its border turns **red** as a warning; releasing then clamps the box to the output where the drag started and enters edit mode so you can keep adjusting. Back on a single output the border turns white again.
+2. **Drag** to select the capture area on a single output. If the box spans two outputs its border turns **red** as a warning; releasing there **discards the box** — as if nothing had been selected — so you can drag again on one output. Back on a single output the border turns white again.
 3. The overlay dims except for the selected region. Capture is inset one logical pixel where the box is large enough. The closed border remains visible while selecting, resizing, and moving. Capture pauses during dragging; any unfinished frame exposed to a moved/resized border is discarded before stitching.
 4. **Scroll** the content within the selected region.
    The selection border is always drawn above the stitched preview, with the same appearance before and after selection.
