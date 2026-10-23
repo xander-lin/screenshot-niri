@@ -556,7 +556,7 @@ fn ui_render_border_rect(state: &UiState) -> Option<LogicalRect> {
 }
 
 /// Moves the whole box so the grab point stays under the pointer, clamped to
-/// the output bounds. Size never changes.
+/// `bounds` (the whole desktop for edit drags). Size never changes.
 pub fn apply_box_move(
     rect: LogicalRect,
     offset_x: i32,
@@ -1896,6 +1896,12 @@ fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, prev
     let logical_w = output_logical.width.max(1);
     let logical_h = output_logical.height.max(1);
     let vp = preview.viewport_rect;
+    if vp.intersection(output_logical).is_none() {
+        // The preview belongs to the selection's output; rendering it on a
+        // disjoint one would anchor the mapping far outside the buffer and
+        // paint canvas content that is not on this screen.
+        return;
+    }
     let cw = preview.capture_width.max(1) as i32;
     let ch = preview.capture_height.max(1) as i32;
     let origin_x = preview.current_origin_x;
@@ -1926,13 +1932,16 @@ fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, prev
     let vp_buffer_h = (buffer_y(vp.bottom()) - vp_buffer_y).max(1);
     // Canvas pixels per buffer pixel: the capture's density over the buffer's.
     // One when they agree, which is the normal case and needs no resampling.
+    // `div_euclid` (floor) keeps the covering rule the same on both sides of
+    // the anchor; truncation toward zero shifts the already-captured content
+    // left of / above the selection by up to one pixel.
     let canvas_x = |bx: i32| -> i64 {
         i64::from(origin_x)
-            + (i64::from(bx) - vp_buffer_x) * i64::from(cw) / vp_buffer_w
+            + ((i64::from(bx) - vp_buffer_x) * i64::from(cw)).div_euclid(vp_buffer_w)
     };
     let canvas_y = |by: i32| -> i64 {
         i64::from(origin_y)
-            + (i64::from(by) - vp_buffer_y) * i64::from(ch) / vp_buffer_h
+            + ((i64::from(by) - vp_buffer_y) * i64::from(ch)).div_euclid(vp_buffer_h)
     };
 
     // Buffer-major: every buffer pixel of the dimmed area picks the stitched
@@ -2741,6 +2750,34 @@ mod tests {
         // Nothing is drawn outside the selection's buffer extent.
         assert_eq!(pixel_at(&data, 6, 0, 0), [7, 7, 7, 7]);
         assert_eq!(pixel_at(&data, 6, 4, 4), [7, 7, 7, 7]);
+    }
+
+    /// The preview belongs to the selection's output. Rendering it on a
+    /// disjoint output must not paint canvas content there: the mapping's
+    /// anchor falls far outside the buffer and the offsets land on unrelated
+    /// pixels (a long canvas makes that reachable).
+    #[test]
+    fn a_preview_is_not_drawn_on_a_disjoint_output() {
+        let mut image = solid_image(400, 8, &[(0, 8, [1, 2, 3, 255])]);
+        for y in 0..8usize {
+            for x in 200..204usize {
+                let offset = y * image.stride as usize + x * 4;
+                image.data[offset..offset + 4].copy_from_slice(&[9, 9, 9, 255]);
+            }
+        }
+        let preview = LongPreviewSnapshot {
+            image,
+            current_origin_x: 0,
+            current_origin_y: 0,
+            viewport_rect: LogicalRect { x: 200, y: 0, width: 4, height: 4 },
+            capture_width: 4,
+            capture_height: 4,
+        };
+        // The selection is on an output at x=0..200; this overlay is elsewhere.
+        let other_output = LogicalRect { x: 400, y: 0, width: 8, height: 8 };
+        let mut data = vec![7u8; 8 * 8 * 4];
+        draw_preview_on_overlay(&mut data, 8, 8, &preview, other_output, None);
+        assert!(data.iter().all(|byte| *byte == 7), "nothing may be drawn on a disjoint output");
     }
 
     #[test]
