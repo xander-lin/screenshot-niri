@@ -22,6 +22,7 @@
 #[cfg(test)]
 use std::collections::VecDeque;
 
+use super::placement::SearchAxis;
 use super::rgb::RgbSource;
 use super::{
     minimum_overlap, AppendDirection, FrameMatch, SearchDirection, StitchedFrame, ViewportRect,
@@ -154,7 +155,11 @@ impl EdgeLadder {
     /// uses the neutral 1.0. See `from_source` for why this is decided once
     /// per session rather than per frame.
     pub(super) fn session_gain(frame: &dyn RgbSource) -> f32 {
-        let peak = Self::peak_delta(frame);
+        Self::session_gain_on(frame, SearchAxis::Vertical)
+    }
+
+    pub(super) fn session_gain_on(frame: &dyn RgbSource, axis: SearchAxis) -> f32 {
+        let peak = Self::peak_delta_on(frame, axis);
         if peak > 0.0 && peak < EDGE_LEVEL_ONE {
             (EDGE_LEVEL_ONE / peak).min(64.0)
         } else {
@@ -162,16 +167,31 @@ impl EdgeLadder {
         }
     }
 
-    /// The strongest vertical bin-mean delta in a frame, in luminance levels.
-    fn peak_delta(frame: &dyn RgbSource) -> f32 {
-        let width = frame.width();
-        let height = frame.height();
-        if width == 0 || height == 0 {
+    /// Reads a frame in axis terms: `(along, across)` positions, where `along`
+    /// is the scroll axis and `across` is the dimension the bins span.
+    fn pixel_on(frame: &dyn RgbSource, axis: SearchAxis, along: u32, across: u32) -> [u8; 3] {
+        match axis {
+            SearchAxis::Vertical => frame.pixel_rgb(across, along),
+            SearchAxis::Horizontal => frame.pixel_rgb(along, across),
+        }
+    }
+
+    fn extent_on(frame: &dyn RgbSource, axis: SearchAxis) -> (u32, u32) {
+        match axis {
+            SearchAxis::Vertical => (frame.height(), frame.width()),
+            SearchAxis::Horizontal => (frame.width(), frame.height()),
+        }
+    }
+
+    /// The strongest bin-mean delta along the scroll axis, in luminance levels.
+    fn peak_delta_on(frame: &dyn RgbSource, axis: SearchAxis) -> f32 {
+        let (along, across) = Self::extent_on(frame, axis);
+        if along == 0 || across == 0 {
             return 0.0;
         }
-        let margin = width * EDGE_MARGIN_NUMERATOR / EDGE_MARGIN_DENOMINATOR;
-        let body_start = margin.min(width);
-        let body_end = width.saturating_sub(margin).max(body_start);
+        let margin = across * EDGE_MARGIN_NUMERATOR / EDGE_MARGIN_DENOMINATOR;
+        let body_start = margin.min(across);
+        let body_end = across.saturating_sub(margin).max(body_start);
         let body_width = body_end - body_start;
         if body_width == 0 {
             return 0.0;
@@ -180,15 +200,15 @@ impl EdgeLadder {
         let bin_width = body_width / bins;
         let mut previous: Option<Vec<f32>> = None;
         let mut peak = 0f32;
-        for y in 0..height {
+        for position in 0..along {
             let mut row = vec![0f32; bins as usize];
             for b in 0..bins {
-                let x0 = body_start + b * bin_width;
-                let x1 = if b + 1 == bins { body_end } else { x0 + bin_width };
+                let a0 = body_start + b * bin_width;
+                let a1 = if b + 1 == bins { body_end } else { a0 + bin_width };
                 let mut sum = 0u32;
                 let mut count = 0u32;
-                for x in x0..x1 {
-                    let [r, g, bl] = frame.pixel_rgb(x, y);
+                for a in a0..a1 {
+                    let [r, g, bl] = Self::pixel_on(frame, axis, position, a);
                     sum += 77 * u32::from(r) + 150 * u32::from(g) + 29 * u32::from(bl);
                     count += 1;
                 }
@@ -210,15 +230,29 @@ impl EdgeLadder {
     /// The margin exists so a moving scrollbar never enters the comparison; it
     /// is a fixed fraction, not a detection step.
     pub(super) fn from_source(frame: &dyn RgbSource, gain: f32) -> Option<Self> {
-        let width = frame.width();
-        let height = frame.height();
-        if width == 0 || height == 0 {
+        Self::from_source_on(frame, gain, SearchAxis::Vertical)
+    }
+
+    /// Builds the ladder along `axis`.
+    ///
+    /// The descriptor is the derivative *along the scroll axis*, binned across
+    /// the other dimension: rows of `|dL/dy|` for a vertical scroll, columns of
+    /// `|dL/dx|` for a horizontal one. Everything downstream — the canvas, the
+    /// windows, the gates — addresses "positions along the axis" and needs no
+    /// knowledge of which way that is.
+    pub(super) fn from_source_on(
+        frame: &dyn RgbSource,
+        gain: f32,
+        axis: SearchAxis,
+    ) -> Option<Self> {
+        let (along, across) = Self::extent_on(frame, axis);
+        if along == 0 || across == 0 {
             return None;
         }
 
-        let margin = width * EDGE_MARGIN_NUMERATOR / EDGE_MARGIN_DENOMINATOR;
-        let body_start = margin.min(width);
-        let body_end = width.saturating_sub(margin).max(body_start);
+        let margin = across * EDGE_MARGIN_NUMERATOR / EDGE_MARGIN_DENOMINATOR;
+        let body_start = margin.min(across);
+        let body_end = across.saturating_sub(margin).max(body_start);
         let body_width = body_end - body_start;
         if body_width == 0 {
             return None;
@@ -227,21 +261,21 @@ impl EdgeLadder {
         let bin_width = body_width / bins;
         let bins_usize = bins as usize;
 
-        // Per-row, per-bin luminance means.
-        let mut means = vec![0f32; height as usize * bins_usize];
-        for y in 0..height {
+        // Per-position, per-bin luminance means.
+        let mut means = vec![0f32; along as usize * bins_usize];
+        for position in 0..along {
             for b in 0..bins {
-                let x0 = body_start + b * bin_width;
-                let x1 = if b + 1 == bins { body_end } else { x0 + bin_width };
+                let a0 = body_start + b * bin_width;
+                let a1 = if b + 1 == bins { body_end } else { a0 + bin_width };
                 let mut sum = 0u32;
                 let mut count = 0u32;
-                for x in x0..x1 {
-                    let [r, g, bl] = frame.pixel_rgb(x, y);
+                for a in a0..a1 {
+                    let [r, g, bl] = Self::pixel_on(frame, axis, position, a);
                     sum += 77 * u32::from(r) + 150 * u32::from(g) + 29 * u32::from(bl);
                     count += 1;
                 }
                 let mean = if count == 0 { 0.0 } else { (sum >> 8) as f32 / count as f32 };
-                means[y as usize * bins_usize + b as usize] = mean;
+                means[position as usize * bins_usize + b as usize] = mean;
             }
         }
 
@@ -256,14 +290,18 @@ impl EdgeLadder {
         // ladder on the scale the canvas was built with; a boundary stronger
         // than the scale simply saturates at level 2, which compares fine.
 
-        // Vertical difference: the boundary between row y-1 and row y.
-        let mut levels = vec![0u8; height as usize * bins_usize];
-        let mut row_mass = vec![0u16; height as usize];
-        for y in 0..height as usize {
+        // Difference between consecutive positions along the axis.
+        let mut levels = vec![0u8; along as usize * bins_usize];
+        let mut row_mass = vec![0u16; along as usize];
+        for position in 0..along as usize {
             for b in 0..bins_usize {
-                let index = y * bins_usize + b;
+                let index = position * bins_usize + b;
                 let current = means[index];
-                let previous = if y == 0 { current } else { means[index - bins_usize] };
+                let previous = if position == 0 {
+                    current
+                } else {
+                    means[index - bins_usize]
+                };
                 let delta = (current - previous).abs() * gain;
                 let level = if delta >= EDGE_LEVEL_TWO {
                     2
@@ -274,14 +312,14 @@ impl EdgeLadder {
                 };
                 levels[index] = level;
                 if level > 0 {
-                    row_mass[y] += 1;
+                    row_mass[position] += 1;
                 }
             }
         }
 
         // Keep the rows that actually carry boundaries, strongest first, then
         // restore ascending order so scoring walks memory forwards.
-        let mut order: Vec<u32> = (0..height).filter(|y| row_mass[*y as usize] > 0).collect();
+        let mut order: Vec<u32> = (0..along).filter(|p| row_mass[*p as usize] > 0).collect();
         order.sort_by(|a, b| {
             row_mass[*b as usize]
                 .cmp(&row_mass[*a as usize])
@@ -290,7 +328,12 @@ impl EdgeLadder {
         order.truncate(EDGE_MAX_SCORING_ROWS);
         order.sort_unstable();
 
-        Some(Self { rows: height, bins, levels, scoring_rows: order })
+        Some(Self {
+            rows: along,
+            bins,
+            levels,
+            scoring_rows: order,
+        })
     }
 
     pub(super) fn rows(&self) -> u32 {
@@ -360,9 +403,10 @@ impl EdgeCanvas {
         self.filled_lo > self.filled_hi
     }
 
-    /// Shifts every stored row down by `shift`, used when the pixel canvas
-    /// prepends rows because a frame extended it upward.
-    fn shift_down(&mut self, shift: i32) {
+    /// Shifts every stored row forward by `shift`, used when the pixel canvas
+    /// prepends rows (or columns, on the horizontal axis) because a frame
+    /// extended it upward (or leftward).
+    fn shift_forward(&mut self, shift: i32) {
         if shift <= 0 || self.is_empty() {
             return;
         }
@@ -629,6 +673,54 @@ pub(super) trait PlacementEngine {
     }
 }
 
+/// A rectangular view of the pixel canvas as an [`RgbSource`].
+///
+/// Exists so the horizontal matcher can build a descriptor from the pixels the
+/// capture already holds, instead of maintaining a second descriptor canvas
+/// through the whole session. The rectangle is chosen by the caller and is
+/// inside the canvas by construction.
+pub(super) struct CanvasRegion<'a> {
+    canvas: &'a StitchedFrame,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl<'a> CanvasRegion<'a> {
+    fn new(canvas: &'a StitchedFrame, x: u32, y: u32, width: u32, height: u32) -> Self {
+        Self {
+            canvas,
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+}
+
+impl RgbSource for CanvasRegion<'_> {
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    fn pixel_rgb(&self, x: u32, y: u32) -> [u8; 3] {
+        let canvas_x = self.x + x;
+        let canvas_y = self.y + y;
+        let offset =
+            canvas_y as usize * self.canvas.stride as usize + canvas_x as usize * 3;
+        [
+            self.canvas.data[offset],
+            self.canvas.data[offset + 1],
+            self.canvas.data[offset + 2],
+        ]
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Production engine: boundaries + impulse windows + explicit refusal
 // ---------------------------------------------------------------------------
@@ -636,6 +728,12 @@ pub(super) trait PlacementEngine {
 /// The engine described in `docs/edge-stitch-design.md` §5.
 #[derive(Debug, Default)]
 pub(super) struct WindowedEdgeMatcher {
+    /// Which way this matcher's canvas is indexed. Every position it stores,
+    /// every window it searches and every delta it reports is measured along
+    /// this axis; the descriptor is built along it too. Two instances (one per
+    /// axis) is how "the same logic on both axes" is spelled without a
+    /// transpose layer in between.
+    axis: SearchAxis,
     canvas: Option<EdgeCanvas>,
     /// Canvas row of the last accepted frame; the search centre for prediction.
     pos: Option<i32>,
@@ -674,8 +772,11 @@ pub(super) struct WindowedEdgeMatcher {
 }
 
 impl WindowedEdgeMatcher {
-    pub(super) fn new() -> Self {
-        Self::default()
+    pub(super) fn new(axis: SearchAxis) -> Self {
+        Self {
+            axis,
+            ..Self::default()
+        }
     }
 
     /// Scores an annulus around `centre`: positions with `inner < |top - centre|
@@ -737,6 +838,7 @@ impl WindowedEdgeMatcher {
         ladder: &EdgeLadder,
         lo: i32,
         hi: i32,
+        centre: i32,
         request: &PlacementRequest<'_>,
     ) -> DecideOutcome {
         let Some(canvas) = self.canvas.as_ref() else {
@@ -753,10 +855,10 @@ impl WindowedEdgeMatcher {
                 costs.push((score.cost, top, score.used));
             }
         }
-        // The window's own centre is the best available "where should this be"
-        // estimate for this pass: the impulse and wide stages centre on the
-        // prediction, the anchor stage on the anchor.
-        let centre = lo.saturating_add(hi) / 2;
+        // `centre` is the best available "where should this be" estimate for
+        // this pass: the impulse window centres on the prediction, the
+        // horizontal window on the previous frame (ties then prefer the
+        // smallest step, which keeps the canvas continuous).
         self.decide_from_costs(costs, centre, request)
     }
 
@@ -992,30 +1094,56 @@ impl WindowedEdgeMatcher {
         // (a geometry change re-seeds the engine's logical space, a prepend
         // re-bases the pixel buffer, and neither disturbs the difference).
         let engine_pos = self.pos?;
-        let canvas_anchor = request.previous_rect.y + (top - engine_pos);
+        // Everything below is expressed along the engine's own axis. The
+        // anchor is the previous frame's pixel coordinate on that axis plus the
+        // difference the engine decided on — both halves come from the same
+        // `commit`, so the pair is consistent by construction. Using their
+        // difference keeps the formula independent of how either coordinate
+        // space is anchored (a geometry change re-seeds the engine's logical
+        // space, a prepend re-bases the pixel buffer, and neither disturbs the
+        // difference).
+        let (previous_along, previous_across) = match self.axis {
+            SearchAxis::Vertical => (request.previous_rect.y, request.previous_rect.x),
+            SearchAxis::Horizontal => (request.previous_rect.x, request.previous_rect.y),
+        };
+        let (along, across) = match self.axis {
+            SearchAxis::Vertical => (frame.height(), frame.width()),
+            SearchAxis::Horizontal => (frame.width(), frame.height()),
+        };
+        let canvas_anchor = previous_along + (top - engine_pos);
         let mut total = 0u64;
         let mut samples = 0u64;
-        let fw = frame.width();
-        let fh = frame.height();
-        let step_x = (fw / 8).max(1);
-        let step_y = (fh / 12).max(1);
-        for y in (0..fh).step_by(step_y as usize) {
+        let step_along = (along / 12).max(1);
+        let step_across = (across / 8).max(1);
+        for a in (0..along).step_by(step_along as usize) {
             // `stitched` rows are addressed directly by canvas coordinate:
             // when the canvas grows upward the stitcher rebases the data *and*
-            // the viewport rects together, so `previous_rect.y + (top -
-            // engine_pos)` already lands on the right row without an origin
-            // adjustment. (Subtracting an origin here measurably broke real-1,
-            // whose canvas prepends throughout.)
-            let canvas_y = canvas_anchor + y as i32;
-            if canvas_y < 0 || canvas_y >= stitched.height as i32 {
+            // the viewport rects together, so the anchor already lands on the
+            // right row without an origin adjustment. (Subtracting an origin
+            // here measurably broke real-1, whose canvas prepends throughout.)
+            let canvas_along = canvas_anchor + a as i32;
+            if canvas_along < 0
+                || canvas_along
+                    >= match self.axis {
+                        SearchAxis::Vertical => stitched.height as i32,
+                        SearchAxis::Horizontal => stitched.width as i32,
+                    }
+            {
                 continue;
             }
-            for x in (0..fw).step_by(step_x as usize) {
-                // The frame's left edge sits at `previous_rect.x` in the
-                // canvas; a selection that does not start at x=0 has to be
-                // shifted before its pixels can be compared.
-                let canvas_x = request.previous_rect.x + x as i32;
-                if canvas_x < 0 || canvas_x >= stitched.width as i32 {
+            for c in (0..across).step_by(step_across as usize) {
+                // The frame's edge on the other axis sits at the previous
+                // frame's position: a vertical scroll does not move sideways.
+                let canvas_across = previous_across + c as i32;
+                let (frame_x, frame_y, canvas_x, canvas_y) = match self.axis {
+                    SearchAxis::Vertical => (c, a, canvas_across, canvas_along),
+                    SearchAxis::Horizontal => (a, c, canvas_along, canvas_across),
+                };
+                if canvas_x < 0
+                    || canvas_x >= stitched.width as i32
+                    || canvas_y < 0
+                    || canvas_y >= stitched.height as i32
+                {
                     continue;
                 }
                 // Compare only pixels the canvas actually captured. A ragged
@@ -1031,7 +1159,7 @@ impl WindowedEdgeMatcher {
                         continue;
                     }
                 }
-                let f = frame.pixel_rgb(x, y);
+                let f = frame.pixel_rgb(frame_x, frame_y);
                 let so = canvas_y as usize * stitched.stride as usize
                     + canvas_x as usize * 3;
                 if so + 2 >= stitched.data.len() {
@@ -1154,24 +1282,47 @@ impl WindowedEdgeMatcher {
     ) -> EngineDecision {
         self.pending_ladder = Some(ladder);
         let pos = self.pos.unwrap_or(top);
-        let delta_y = top - pos;
-        let overlap = self.frame_rows.saturating_sub(delta_y.unsigned_abs());
+        let delta = top - pos;
+        let overlap = self.frame_rows.saturating_sub(delta.unsigned_abs());
         self.pending_top = Some(top);
-        EngineDecision::Place {
-            rect: ViewportRect {
-                x: request.previous_rect.x,
-                y: top,
-                width: request.previous_rect.width,
-                height: request.previous_rect.height,
-            },
-            match_info: FrameMatch {
-                direction: if delta_y < 0 {
+        let (rect, direction, delta_x, delta_y) = match self.axis {
+            SearchAxis::Vertical => (
+                ViewportRect {
+                    x: request.previous_rect.x,
+                    y: top,
+                    width: request.previous_rect.width,
+                    height: request.previous_rect.height,
+                },
+                if delta < 0 {
                     AppendDirection::Top
                 } else {
                     AppendDirection::Bottom
                 },
+                0,
+                delta,
+            ),
+            SearchAxis::Horizontal => (
+                ViewportRect {
+                    x: top,
+                    y: request.previous_rect.y,
+                    width: request.previous_rect.width,
+                    height: request.previous_rect.height,
+                },
+                if delta < 0 {
+                    AppendDirection::Left
+                } else {
+                    AppendDirection::Right
+                },
+                delta,
+                0,
+            ),
+        };
+        EngineDecision::Place {
+            rect,
+            match_info: FrameMatch {
+                direction,
                 overlap,
-                delta_x: 0,
+                delta_x,
                 delta_y,
                 score: cost,
             },
@@ -1233,6 +1384,7 @@ impl PlacementEngine for WindowedEdgeMatcher {
                 &ladder,
                 predicted_top - impulse_reach,
                 predicted_top + impulse_reach,
+                predicted_top,
                 request,
             ) {
                 return self.accept(request, ladder, top, cost);
@@ -1351,7 +1503,7 @@ impl PlacementEngine for WindowedEdgeMatcher {
         // re-bases the buffer.
         let shift = rect.y - requested_top;
         if shift > 0 {
-            canvas.shift_down(shift);
+            canvas.shift_forward(shift);
         }
 
         let previous = self.pos;
@@ -1370,7 +1522,9 @@ impl PlacementEngine for WindowedEdgeMatcher {
     }
 
     fn reset(&mut self) {
+        let axis = self.axis;
         *self = Self::default();
+        self.axis = axis;
     }
 
     fn last_descriptor(&self) -> Option<(u32, u32, Vec<u8>)> {
@@ -1378,6 +1532,157 @@ impl PlacementEngine for WindowedEdgeMatcher {
             .as_ref()
             .or(self.last_committed_ladder.as_ref())
             .map(|ladder| ladder.as_grayscale())
+    }
+}
+
+/// Places a frame on the horizontal axis, building the descriptor on demand.
+///
+/// The vertical matcher's canvas accumulates for the whole session because
+/// every frame contributes to it. The horizontal axis gets no such state: a
+/// horizontal step is rare, and a persistent second canvas would have to be
+/// re-seeded on every vertical step anyway. Instead the descriptor is built for
+/// the one region the comparison can use — the previous frame's rectangle,
+/// which is captured by construction because that frame wrote it — and the
+/// same decision code runs on it.
+///
+/// Two restrictions follow from what is known at that moment:
+///
+///  - **One direction.** The caller only gets here with a direction the user
+///    actually indicated, so only positions on that side of the previous frame
+///    are considered. There is no second direction to compare against.
+///  - **Only the comparable part.** The strip is the previous frame's own
+///    rectangle, and a candidate is scored only where it overlaps it. On a
+///    ragged canvas the rest of the frame sits on pixels nothing has captured;
+///    those are not evidence and are never compared.
+///
+/// The gates are the vertical ones (`decide_from_costs`), minus the anchor
+/// window: recovery belongs to the axis the capture is on.
+pub(super) fn place_horizontally(
+    stitched: &StitchedFrame,
+    previous_rect: ViewportRect,
+    frame: &dyn RgbSource,
+    direction: SearchDirection,
+) -> EngineDecision {
+    let width = frame.width();
+    let height = frame.height();
+    if width == 0 || height == 0 || stitched.width == 0 || stitched.height == 0 {
+        return EngineDecision::Reject {
+            reason: RejectReason::Invalid,
+        };
+    }
+    let forward = match direction {
+        SearchDirection::Right => true,
+        SearchDirection::Left => false,
+        _ => {
+            return EngineDecision::Reject {
+                reason: RejectReason::Invalid,
+            };
+        }
+    };
+    let previous_x = previous_rect.x;
+    let previous_y = previous_rect.y;
+
+    // The previous frame's rectangle: the only pixels this comparison may use.
+    let strip_x = previous_x.max(0);
+    let strip_y = previous_y.max(0);
+    let strip_right = previous_x
+        .saturating_add(width as i32)
+        .min(stitched.width as i32);
+    let strip_bottom = previous_y
+        .saturating_add(height as i32)
+        .min(stitched.height as i32);
+    if strip_right <= strip_x || strip_bottom <= strip_y {
+        return EngineDecision::Reject {
+            reason: RejectReason::NoCandidate,
+        };
+    }
+
+    let gain = EdgeLadder::session_gain_on(frame, SearchAxis::Horizontal);
+    let Some(frame_ladder) = EdgeLadder::from_source_on(frame, gain, SearchAxis::Horizontal)
+    else {
+        return EngineDecision::Reject {
+            reason: RejectReason::Invalid,
+        };
+    };
+    if frame_ladder.scoring_rows().is_empty() {
+        // Uniform content along the axis: there is nothing to compare.
+        return EngineDecision::Reject {
+            reason: RejectReason::NoBoundaries,
+        };
+    }
+    let strip = CanvasRegion::new(
+        stitched,
+        strip_x as u32,
+        strip_y as u32,
+        (strip_right - strip_x) as u32,
+        (strip_bottom - strip_y) as u32,
+    );
+    let Some(strip_ladder) = EdgeLadder::from_source_on(&strip, gain, SearchAxis::Horizontal)
+    else {
+        return EngineDecision::Reject {
+            reason: RejectReason::Invalid,
+        };
+    };
+    if strip_ladder.bins() != frame_ladder.bins() {
+        return EngineDecision::Reject {
+            reason: RejectReason::Invalid,
+        };
+    }
+    let mut canvas = EdgeCanvas::new(strip_ladder.bins(), strip_x);
+    canvas.write(strip_x, &strip_ladder);
+
+    // Candidates stay within one frame width of the previous position: further
+    // than that the two frames share nothing, so there is no overlap to score.
+    let (window_lo, window_hi) = if forward {
+        (previous_x, previous_x.saturating_add(width as i32))
+    } else {
+        (previous_x.saturating_sub(width as i32), previous_x)
+    };
+
+    let mut matcher = WindowedEdgeMatcher::new(SearchAxis::Horizontal);
+    matcher.canvas = Some(canvas);
+    matcher.pos = Some(previous_x);
+    matcher.anchor = Some(previous_x);
+    matcher.frame_rows = width;
+    let request = PlacementRequest {
+        stitched,
+        previous_rect,
+        frame,
+        search_direction: Some(direction),
+        refusals: 0,
+    };
+    let mut cache = ScoreCache::default();
+    match matcher.decide(
+        &mut cache,
+        &frame_ladder,
+        window_lo,
+        window_hi,
+        previous_x,
+        &request,
+    ) {
+        DecideOutcome::Accept { top, cost } => {
+            let delta = top - previous_x;
+            EngineDecision::Place {
+                rect: ViewportRect {
+                    x: top,
+                    y: previous_y,
+                    width: previous_rect.width,
+                    height: previous_rect.height,
+                },
+                match_info: FrameMatch {
+                    direction: if delta < 0 {
+                        AppendDirection::Left
+                    } else {
+                        AppendDirection::Right
+                    },
+                    overlap: width.saturating_sub(delta.unsigned_abs()),
+                    delta_x: delta,
+                    delta_y: 0,
+                    score: cost,
+                },
+            }
+        }
+        DecideOutcome::Reject(reason) => EngineDecision::Reject { reason },
     }
 }
 
@@ -1558,7 +1863,7 @@ mod tests {
     fn low_contrast_stripes_are_placed_like_high_contrast_content() {
         let page = stripe_page_rows(1024, 2);
         let height = 160;
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         let first = stripe_frame(&page, 0, height);
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
 
@@ -1587,7 +1892,7 @@ mod tests {
     fn low_contrast_only_content_is_placed_without_a_block_in_view() {
         let height = 160;
         let page = stripe_page_rows(2048, 2);
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         let first = stripe_frame(&page, 0, height);
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
         let second = stripe_frame(&page, 60, height);
@@ -1627,7 +1932,7 @@ mod tests {
             page[row] = 0;
         }
 
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         // First frame: pure low contrast, peak 2, gain 4.
         let first = stripe_frame(&page, 0, height);
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
@@ -1670,7 +1975,7 @@ mod tests {
             RgbFrame { width: W, height, stride, data }
         };
 
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         let first = periodic(0, height);
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
 
@@ -1858,7 +2163,7 @@ mod tests {
 
     #[test]
     fn uniform_frame_reports_no_boundaries_instead_of_guessing() {
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         seed(&mut engine, 0, 40);
         let flat = flat_frame(40);
         let rect = ViewportRect { x: 0, y: 0, width: W, height: 40 };
@@ -1873,7 +2178,7 @@ mod tests {
 
     #[test]
     fn finds_a_small_forward_shift() {
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         seed(&mut engine, 0, 60);
         let frame = frame_from(17, 60);
         let rect = ViewportRect { x: 0, y: 0, width: W, height: 60 };
@@ -1890,7 +2195,7 @@ mod tests {
 
     #[test]
     fn refuses_when_the_frame_is_nowhere_in_the_canvas() {
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         seed(&mut engine, 0, 60);
         // 900 rows away: no overlap with a 60-row canvas.
         let frame = frame_from(900, 60);
@@ -1939,7 +2244,7 @@ mod tests {
             data.extend_from_slice(&row_texture(i % 12));
         }
         let page = RgbFrame { width: W, height: 120, stride, data };
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         engine.commit(
             ViewportRect { x: 0, y: 0, width: W, height: 60 },
             0,
@@ -1968,7 +2273,7 @@ mod tests {
 
     #[test]
     fn rejection_does_not_move_the_anchor() {
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         seed(&mut engine, 0, 60);
         let anchor_before = engine.anchor;
         let pos_before = engine.pos;
@@ -1997,7 +2302,7 @@ mod tests {
     /// growing.
     #[test]
     fn prepending_rows_keeps_the_engine_in_logical_coordinates() {
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         let height = 60;
 
         // Canvas starts covering page rows 100..=159 at logical row 0.
@@ -2040,7 +2345,7 @@ mod tests {
     /// the canvas and the engine kept comparing against stale content.
     #[test]
     fn a_prepended_frame_is_written_into_the_canvas() {
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         let height = 60;
         let first = frame_from_signed(100, height);
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
@@ -2076,7 +2381,7 @@ mod tests {
     /// canvas every time, so one bad frame cannot stall the capture.
     #[test]
     fn a_refused_frame_does_not_stop_the_next_one() {
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         let height = 60;
         let first = frame_from(0, height);
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
@@ -2108,7 +2413,7 @@ mod tests {
     #[test]
     fn the_guard_window_is_the_frame_height_in_both_directions() {
         let height = 60;
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         let first = frame_from(0, height);
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
         let ladder = EdgeLadder::from_source(&first, engine.session_gain).unwrap();
@@ -2131,7 +2436,7 @@ mod tests {
     #[test]
     fn the_anchor_reach_is_bounded_by_the_canvas_evidence() {
         let height = 60;
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         let first = frame_from(0, height);
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
         let ladder = EdgeLadder::from_source(&first, engine.session_gain).unwrap();
@@ -2160,7 +2465,7 @@ mod tests {
     #[test]
     fn a_continuation_wins_over_recovery_even_with_a_red_border() {
         let height = 60;
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         let first = frame_from(0, height);
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
         let second = frame_from(60, height);
@@ -2190,7 +2495,7 @@ mod tests {
     #[test]
     fn the_colour_check_reads_the_rows_the_frame_would_occupy() {
         let height = 60;
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         // Canvas initialised at logical 0, then grown upward: the second commit
         // prepends rows, so pixel row 0 stops being logical row 0. That is the
         // case a mapping derived from anything but the commit pair gets wrong.
@@ -2235,7 +2540,7 @@ mod tests {
         let first = frame_from(0, height);
         let mut cache = ScoreCache::default();
         let canvas = {
-            let mut e = WindowedEdgeMatcher::new();
+            let mut e = WindowedEdgeMatcher::new(SearchAxis::Vertical);
             e.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
             e.canvas.clone().expect("canvas")
         };
@@ -2259,7 +2564,7 @@ mod tests {
     #[test]
     fn the_guard_band_is_not_cut_by_the_impulse_window() {
         let height = 60;
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         let first = frame_from(0, height);
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
         // A step of 44, so the prediction sits at 44 while the previous frame is
@@ -2291,7 +2596,7 @@ mod tests {
     #[test]
     fn the_anchor_stage_waits_for_the_red_border() {
         let height = 60;
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         // A canvas three viewports tall: rows 0..180.
         let first = frame_from(0, height);
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
@@ -2333,7 +2638,7 @@ mod tests {
     #[test]
     fn scrolling_back_up_is_placed_like_scrolling_down() {
         let height = 60;
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         // Start deep in the page and walk upward in half-viewport steps, so
         // consecutive frames really do overlap (a full-viewport step leaves
         // them touching, with zero rows in common).
@@ -2361,7 +2666,7 @@ mod tests {
     #[test]
     fn a_move_beyond_the_impulse_window_is_placed_by_the_guard() {
         let height = 600;
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         let first = frame_from(0, height);
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
 
@@ -2382,7 +2687,7 @@ mod tests {
     #[test]
     fn the_first_anchor_ring_includes_its_centre() {
         let height = 60;
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         let first = frame_from(0, height);
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
         let same = frame_from(0, height);
@@ -2394,6 +2699,102 @@ mod tests {
             DecideOutcome::Accept { top, .. } => assert_eq!(top, 0, "the centre must win"),
             DecideOutcome::Reject(_) => panic!("the centre must be a candidate at all"),
         }
+    }
+
+    fn hashed_page(x: u32, y: u32) -> u8 {
+        let mut hash = (x / 6).wrapping_mul(0x9E37_79B1) ^ (y / 6).wrapping_mul(0x85EB_CA77);
+        hash ^= hash >> 15;
+        hash = hash.wrapping_mul(0x2545_F491);
+        hash ^= hash >> 13;
+        (hash & 0xFF) as u8
+    }
+
+    fn page_crop(page_x: u32, page_y: u32, width: u32, height: u32) -> RgbFrame {
+        let stride = width * 3;
+        let mut data = Vec::with_capacity((stride * height) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let value = hashed_page(page_x + x, page_y + y);
+                data.extend_from_slice(&[value, value, value]);
+            }
+        }
+        RgbFrame {
+            width,
+            height,
+            stride,
+            data,
+        }
+    }
+
+    #[test]
+    fn horizontal_placement_reads_the_step_along_the_axis() {
+        let canvas = StitchedFrame::from_first_frame(&page_crop(0, 0, 240, 60));
+        let rect = ViewportRect {
+            x: 0,
+            y: 0,
+            width: 240,
+            height: 60,
+        };
+        let moved = page_crop(30, 0, 240, 60);
+        match place_horizontally(&canvas, rect, &moved, SearchDirection::Right) {
+            EngineDecision::Place { rect, match_info } => {
+                assert_eq!(rect.x, 30);
+                assert_eq!(match_info.delta_x, 30);
+                assert_eq!(match_info.delta_y, 0);
+                assert_eq!(match_info.direction, AppendDirection::Right);
+            }
+            other => panic!("a 30 px step must be placed, got {other:?}"),
+        }
+    }
+
+    /// Only the direction the user indicated is searched. The same frame,
+    /// asked the other way, has no answer and says so.
+    #[test]
+    fn horizontal_placement_searches_only_the_indicated_direction() {
+        let canvas = StitchedFrame::from_first_frame(&page_crop(0, 0, 240, 60));
+        let rect = ViewportRect {
+            x: 0,
+            y: 0,
+            width: 240,
+            height: 60,
+        };
+        let moved = page_crop(30, 0, 240, 60);
+        assert!(matches!(
+            place_horizontally(&canvas, rect, &moved, SearchDirection::Left),
+            EngineDecision::Reject { .. }
+        ));
+    }
+
+    /// Content that is uniform along the axis carries no evidence, and the
+    /// horizontal matcher refuses it for the same reason the vertical one
+    /// does — not because a pixel difference happened to be small.
+    #[test]
+    fn horizontal_placement_refuses_content_without_horizontal_boundaries() {
+        let canvas = StitchedFrame::from_first_frame(&page_crop(0, 0, 240, 60));
+        let rect = ViewportRect {
+            x: 0,
+            y: 0,
+            width: 240,
+            height: 60,
+        };
+        // Rows are constant across x: the page has no vertical edges at all.
+        let stripe = |value: u8| {
+            let stride = 240 * 3;
+            RgbFrame {
+                width: 240,
+                height: 60,
+                stride,
+                data: (0..60)
+                    .flat_map(|_| std::iter::repeat_n(value, (stride) as usize))
+                    .collect(),
+            }
+        };
+        assert!(matches!(
+            place_horizontally(&canvas, rect, &stripe(120), SearchDirection::Right),
+            EngineDecision::Reject {
+                reason: RejectReason::NoBoundaries
+            }
+        ));
     }
 
     #[test]

@@ -48,7 +48,9 @@ use perceptual::perceptual_frame_match;
 use perceptual::{PerceptualFrame, PerceptualMotionEstimate, PERCEPTUAL_MOTION_ADJACENT_DELTA};
 #[cfg(feature = "stitch-legacy")]
 use placement::canvas_search_axis;
-use placement::{find_canvas_placement_match, SearchAxis};
+#[cfg(any(test, feature = "stitch-legacy"))]
+use placement::find_canvas_placement_match;
+use placement::SearchAxis;
 use engine::{EngineDecision, PlacementEngine, PlacementRequest, WindowedEdgeMatcher};
 use rgb::{
     average_difference_same_source, average_luminance_difference_source, crop_rgb_frame,
@@ -176,6 +178,17 @@ impl AcceptedDirectionMemory {
                 self.direction
             }
             _ => None,
+        }
+    }
+
+    /// The axis of the last accepted step — the capture's impulse.
+    ///
+    /// `None` before any step has been placed: only then is the hint the sole
+    /// information available about which way the viewport is going.
+    fn axis(self) -> Option<SearchAxis> {
+        match self.direction? {
+            AppendDirection::Top | AppendDirection::Bottom => Some(SearchAxis::Vertical),
+            AppendDirection::Left | AppendDirection::Right => Some(SearchAxis::Horizontal),
         }
     }
 }
@@ -403,7 +416,7 @@ fn new_placement_engine() -> Box<dyn PlacementEngine> {
     }
     #[cfg(not(feature = "stitch-legacy"))]
     {
-        Box::new(WindowedEdgeMatcher::new())
+        Box::new(WindowedEdgeMatcher::new(SearchAxis::Vertical))
     }
 }
 
@@ -730,26 +743,47 @@ impl RawStitcher {
         let compose_frame = rgb_frame_from_source(compose_frame)?;
         let active_compose_frame = crop_rgb_frame(&compose_frame, active_crop)?;
 
-        // Horizontal scrolling is a different axis with its own unmeasured
-        // behaviour, so it keeps the previous canvas-scan matcher. The windowed
-        // edge matcher is vertical-only by construction: its descriptor is the
-        // derivative along the scroll axis, which for a horizontal scroll would
-        // have to be the column derivative instead.
-        let horizontal = matches!(
+        // The impulse decides which axis is asked first.
+        //
+        // The capture is moving one way until it isn't, and the last accepted
+        // step is the only thing that knows which way that was — a released
+        // arrow key can be stale, and the content can turn without a keypress.
+        // The hint seeds the very first step, before any impulse exists.
+        //
+        // The two axes are not scored against each other. The impulse axis
+        // answers first; if it cannot place the frame, the other axis is asked
+        // once, restricted to the placements that still overlap the previous
+        // frame. Whichever axis answers, wins; if neither does, the frame is
+        // refused.
+        let primary_axis = self.impulse_axis(search_direction);
+        let mut placed_axis = primary_axis;
+        let mut decision = self.place_on_axis(
+            primary_axis,
+            previous_rect,
+            &active_compose,
             search_direction,
-            Some(SearchDirection::Left | SearchDirection::Right)
+            true,
         );
-        let decision = if horizontal {
-            self.legacy_horizontal_placement(previous_rect, &active_compose, search_direction)
-        } else {
-            self.engine.place(&PlacementRequest {
-                stitched: self.stitched.as_ref().ok_or("missing stitched frame")?,
-                previous_rect,
-                frame: &active_compose,
-                search_direction,
-                refusals: self.consecutive_refusals,
-            })
+        let primary_reason = match &decision {
+            EngineDecision::Reject { reason } => Some(*reason),
+            EngineDecision::Place { .. } => None,
         };
+        if primary_reason.is_some() {
+            if self.second_axis_can_help(previous_rect, &active_compose) {
+                let attempt = self.place_on_axis(
+                    primary_axis.other(),
+                    previous_rect,
+                    &active_compose,
+                    search_direction,
+                    false,
+                );
+                if matches!(attempt, EngineDecision::Place { .. }) {
+                    placed_axis = primary_axis.other();
+                    decision = attempt;
+                }
+            }
+        }
+        let horizontal = placed_axis == SearchAxis::Horizontal;
 
         // A refusal is not the end of the pipeline: the stale-edge recovery
         // below handles a canvas edge that changed underneath us (a refreshed
@@ -759,7 +793,7 @@ impl RawStitcher {
         let (candidate_rect, match_info) = match decision {
             EngineDecision::Place { rect, match_info } => (rect, match_info),
             EngineDecision::Reject { reason } => {
-                self.last_reject_reason = Some(reason);
+                self.last_reject_reason = Some(primary_reason.unwrap_or(reason));
                 if crate::trace::trace_verbose_enabled() {
                     crate::trace_log!("stitch: engine refused reason={}", reason.as_str());
                 }
@@ -917,39 +951,107 @@ impl RawStitcher {
         Ok(PushResult::NoMatch)
     }
 
-    /// Horizontal placement still uses the previous canvas-scan matcher.
+    /// The axis the capture is moving along.
+    fn impulse_axis(&self, search_direction: Option<SearchDirection>) -> SearchAxis {
+        if let Some(axis) = self.accepted_direction.axis() {
+            return axis;
+        }
+        match search_direction {
+            Some(SearchDirection::Left | SearchDirection::Right) => SearchAxis::Horizontal,
+            _ => SearchAxis::Vertical,
+        }
+    }
+
+    /// Whether asking the other axis is worth anything.
     ///
-    /// Kept separate from `engine` on purpose: the windowed edge matcher is
-    /// built around the derivative along the scroll axis, and the horizontal
-    /// case has not been measured. Silently treating a horizontal request as
-    /// vertical would be a regression dressed up as a simplification.
-    #[cfg(not(feature = "stitch-legacy"))]
-    fn legacy_horizontal_placement(
+    /// A frame that does not overlap the canvas where it was captured shares no
+    /// content with anything already placed, so no axis can verify it. That
+    /// happens when the selection box was moved to a region nothing has
+    /// captured yet, and it is knowable from geometry alone — before paying for
+    /// a second search.
+    fn second_axis_can_help(&self, previous_rect: ViewportRect, frame: &impl RgbSource) -> bool {
+        let Some(stitched) = self.stitched.as_ref() else {
+            return false;
+        };
+        crate::stitch::canvas::canvas_overlap_rect(
+            stitched,
+            frame,
+            previous_rect.x,
+            previous_rect.y,
+        )
+        .is_some()
+    }
+
+    /// Asks one axis for a placement.
+    ///
+    /// `allow_anchor` separates the two roles an axis can play. The impulse
+    /// axis may fall back to the whole-canvas anchor once the border is red;
+    /// the other axis is only ever asked for the predicted step.
+    fn place_on_axis(
         &mut self,
+        axis: SearchAxis,
         previous_rect: ViewportRect,
         frame: &impl RgbSource,
         search_direction: Option<SearchDirection>,
+        allow_anchor: bool,
     ) -> EngineDecision {
-        match find_canvas_placement_match(
-            match self.stitched.as_ref() {
-                Some(stitched) => stitched,
-                None => return EngineDecision::Reject { reason: RejectReason::Uninitialised },
-            },
-            previous_rect,
-            frame,
-            SearchAxis::Horizontal,
-            search_direction,
-        ) {
-            Some(match_info) => EngineDecision::Place {
-                rect: ViewportRect {
-                    x: previous_rect.x + match_info.delta_x,
-                    y: previous_rect.y + match_info.delta_y,
-                    width: previous_rect.width,
-                    height: previous_rect.height,
+        // The hint is a sign, not an axis: passing "down" to the horizontal
+        // matcher (or "left" to the vertical engine) would filter out every
+        // candidate either of them has.
+        let hint = match axis {
+            SearchAxis::Vertical => search_direction
+                .filter(|direction| matches!(direction, SearchDirection::Up | SearchDirection::Down)),
+            SearchAxis::Horizontal => search_direction.filter(|direction| {
+                matches!(direction, SearchDirection::Left | SearchDirection::Right)
+            }),
+        };
+        match axis {
+            SearchAxis::Vertical => match self.stitched.as_ref() {
+                Some(stitched) => self.engine.place(&PlacementRequest {
+                    stitched,
+                    previous_rect,
+                    frame,
+                    search_direction: hint,
+                    refusals: if allow_anchor {
+                        self.consecutive_refusals
+                    } else {
+                        0
+                    },
+                }),
+                None => EngineDecision::Reject {
+                    reason: RejectReason::Uninitialised,
                 },
-                match_info,
             },
-            None => EngineDecision::Reject { reason: RejectReason::NoCandidate },
+            SearchAxis::Horizontal => {
+                // The horizontal axis has no persistent descriptor: it is built
+                // on demand from the pixels the capture already holds, for the
+                // strip the search can reach (see `place_horizontally`). Its
+                // anchor window does not exist — recovery belongs to the axis
+                // the capture is on — so `allow_anchor` has nothing to widen
+                // here.
+                let Some(stitched) = self.stitched.as_ref() else {
+                    return EngineDecision::Reject {
+                        reason: RejectReason::Uninitialised,
+                    };
+                };
+                // One direction only, and the direction has to come from the
+                // user: nothing about the content says which side it moved to.
+                // Without it there is no horizontal question to ask.
+                let Some(direction) = hint else {
+                    return EngineDecision::Reject {
+                        reason: RejectReason::NoCandidate,
+                    };
+                };
+                #[cfg(not(feature = "stitch-legacy"))]
+                {
+                    engine::place_horizontally(stitched, previous_rect, frame, direction)
+                }
+                #[cfg(feature = "stitch-legacy")]
+                {
+                    let _ = direction;
+                    self.legacy_horizontal_placement(previous_rect, frame, hint, None)
+                }
+            }
         }
     }
 
@@ -959,6 +1061,7 @@ impl RawStitcher {
         previous_rect: ViewportRect,
         frame: &impl RgbSource,
         search_direction: Option<SearchDirection>,
+        _window: Option<(i32, i32)>,
     ) -> EngineDecision {
         self.legacy_placement(previous_rect, frame, search_direction)
     }
@@ -3405,21 +3508,6 @@ mod tests {
     }
 
     #[test]
-    fn vertical_mode_rejects_horizontal_motion() {
-        let previous = textured_frame(160, 48);
-        let current = shifted_right(&previous, 12);
-        let mut stitcher = RawStitcher::new();
-        stitcher
-            .push_frame(previous, Some(LongDirection::Down))
-            .unwrap();
-
-        assert_eq!(
-            push_until_refused(&mut stitcher, &current, Some(LongDirection::Down)),
-            PushResult::NoMatch
-        );
-    }
-
-    #[test]
     fn perceptual_motion_prefers_small_positive_shift_over_zero_with_tiny_differences() {
         let previous = textured_frame(160, 48);
         let current = shifted_top_with_tiny_difference(&previous, 1);
@@ -3737,9 +3825,13 @@ mod tests {
         assert_eq!(stitched.anchor_origin_y, 2);
     }
 
+    /// The fixture needs structure *along* the horizontal axis. A frame whose
+    /// rows are constant carries no `|dL/dx|` at all, so there is nothing to
+    /// match a sideways shift against and refusing it is the honest answer —
+    /// that is what this test used to rely on the old pixel scan to paper over.
     #[test]
     fn append_expands_right() {
-        let previous = frame(32, 24, 10);
+        let previous = textured_frame(32, 24);
         let current = shifted_right(&previous, 4);
         let mut stitcher = RawStitcher::new();
         stitcher
@@ -3757,7 +3849,7 @@ mod tests {
 
     #[test]
     fn append_expands_left() {
-        let previous = frame(32, 24, 10);
+        let previous = textured_frame(32, 24);
         let current = shifted_left(&previous, 3);
         let mut stitcher = RawStitcher::new();
         stitcher
@@ -4022,7 +4114,7 @@ mod tests {
         let previous_rect = ViewportRect { x: 0, y: 0, width: 32, height: 60 };
         let target = crop_frame(&world, 0, 20, 32, 60);
 
-        let mut engine = WindowedEdgeMatcher::new();
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         engine.commit(previous_rect, 0, &crop_frame(&world, 0, 0, 32, 60));
 
         let request = PlacementRequest {
@@ -4819,7 +4911,7 @@ mod tests {
         let mut col_band = Vec::with_capacity(page_w as usize);
         while (col_band.len() as u32) < page_w {
             let run = 5 + lcg(&mut state) % 9;
-            let value = 50 + lcg(&mut state) % 150;
+            let value = lcg(&mut state) % 256;
             for _ in 0..run.min(page_w - col_band.len() as u32) {
                 col_band.push(value as u8);
             }

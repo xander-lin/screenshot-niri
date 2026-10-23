@@ -16,10 +16,20 @@ const CANVAS_PLACEMENT_LOCAL_MIN_MARGIN: f64 = 1.0;
 const CANVAS_PLACEMENT_LOCAL_RADII: [i32; 4] = [32, 64, 128, CANVAS_PLACEMENT_LOCAL_RADIUS];
 const CANVAS_PLACEMENT_GLOBAL_COARSE_STEP: u32 = 24;
 const CANVAS_PLACEMENT_GLOBAL_REFINE_RADIUS: i32 = CANVAS_PLACEMENT_GLOBAL_COARSE_STEP as i32;
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum SearchAxis {
+    #[default]
     Vertical,
     Horizontal,
+}
+
+impl SearchAxis {
+    pub(super) fn other(self) -> Self {
+        match self {
+            Self::Vertical => Self::Horizontal,
+            Self::Horizontal => Self::Vertical,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

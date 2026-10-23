@@ -109,6 +109,8 @@ border_width = 3
 4. **Scroll** the content within the selected region.
    The selection border is always drawn above the stitched preview, with the same appearance before and after selection.
 5. Press **↑** / **↓** / **←** / **→** to hint the scroll direction for better stitching. The hint can change mid-session: a **serpentine** path — right, down, left, down — stitches into one image, as long as consecutive frames still overlap. Each turn is matched against what is already on the canvas, so a wide page can be walked column by column.
+
+   The hint's job is to name the direction, not to pin the axis: the stitcher follows the step it last verified and falls back to the other axis only when that step cannot be placed. A horizontal step needs a horizontal hint (←/→) — nothing in the frame says which side it moved to, so a sideways move under a vertical hint is refused rather than guessed.
 6. Press **E** during capture to enter selection-box **editing mode**: the box edges can be dragged to resize it and the box interior can be dragged to move it; wheel events are blocked (the displayed content cannot scroll while editing). Resizing is stitched at the exact edited position, which enables:
    - capturing content that is narrower on top and wider on the bottom (T-shaped captures),
    - scrolling vertically first and horizontally afterwards (L-shaped captures, hint with **←** / **→**),
