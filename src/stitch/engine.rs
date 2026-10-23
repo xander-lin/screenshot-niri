@@ -1547,9 +1547,11 @@ impl PlacementEngine for WindowedEdgeMatcher {
 ///
 /// Two restrictions follow from what is known at that moment:
 ///
-///  - **One direction.** The caller only gets here with a direction the user
-///    actually indicated, so only positions on that side of the previous frame
-///    are considered. There is no second direction to compare against.
+///  - **One direction, or both.** On the impulse axis both directions are
+///    ordinary (a scroll-back is a step like any other), so `direction` is
+///    `None` and the window is symmetric. As a *fallback* the caller only gets
+///    here with a direction the user actually indicated, and only positions on
+///    that side are considered.
 ///  - **Only the comparable part.** The strip is the previous frame's own
 ///    rectangle, and a candidate is scored only where it overlaps it. On a
 ///    ragged canvas the rest of the frame sits on pixels nothing has captured;
@@ -1561,7 +1563,7 @@ pub(super) fn place_horizontally(
     stitched: &StitchedFrame,
     previous_rect: ViewportRect,
     frame: &dyn RgbSource,
-    direction: SearchDirection,
+    direction: Option<SearchDirection>,
 ) -> EngineDecision {
     let width = frame.width();
     let height = frame.height();
@@ -1571,9 +1573,10 @@ pub(super) fn place_horizontally(
         };
     }
     let forward = match direction {
-        SearchDirection::Right => true,
-        SearchDirection::Left => false,
-        _ => {
+        None => None,
+        Some(SearchDirection::Right) => Some(true),
+        Some(SearchDirection::Left) => Some(false),
+        Some(_) => {
             return EngineDecision::Reject {
                 reason: RejectReason::Invalid,
             };
@@ -1633,10 +1636,13 @@ pub(super) fn place_horizontally(
 
     // Candidates stay within one frame width of the previous position: further
     // than that the two frames share nothing, so there is no overlap to score.
-    let (window_lo, window_hi) = if forward {
-        (previous_x, previous_x.saturating_add(width as i32))
-    } else {
-        (previous_x.saturating_sub(width as i32), previous_x)
+    let (window_lo, window_hi) = match forward {
+        Some(true) => (previous_x, previous_x.saturating_add(width as i32)),
+        Some(false) => (previous_x.saturating_sub(width as i32), previous_x),
+        None => (
+            previous_x.saturating_sub(width as i32),
+            previous_x.saturating_add(width as i32),
+        ),
     };
 
     let mut matcher = WindowedEdgeMatcher::new(SearchAxis::Horizontal);
@@ -1648,7 +1654,7 @@ pub(super) fn place_horizontally(
         stitched,
         previous_rect,
         frame,
-        search_direction: Some(direction),
+        search_direction: direction,
         refusals: 0,
     };
     let mut cache = ScoreCache::default();
@@ -2736,7 +2742,7 @@ mod tests {
             height: 60,
         };
         let moved = page_crop(30, 0, 240, 60);
-        match place_horizontally(&canvas, rect, &moved, SearchDirection::Right) {
+        match place_horizontally(&canvas, rect, &moved, Some(SearchDirection::Right)) {
             EngineDecision::Place { rect, match_info } => {
                 assert_eq!(rect.x, 30);
                 assert_eq!(match_info.delta_x, 30);
@@ -2760,7 +2766,7 @@ mod tests {
         };
         let moved = page_crop(30, 0, 240, 60);
         assert!(matches!(
-            place_horizontally(&canvas, rect, &moved, SearchDirection::Left),
+            place_horizontally(&canvas, rect, &moved, Some(SearchDirection::Left)),
             EngineDecision::Reject { .. }
         ));
     }
@@ -2790,7 +2796,7 @@ mod tests {
             }
         };
         assert!(matches!(
-            place_horizontally(&canvas, rect, &stripe(120), SearchDirection::Right),
+            place_horizontally(&canvas, rect, &stripe(120), Some(SearchDirection::Right)),
             EngineDecision::Reject {
                 reason: RejectReason::NoBoundaries
             }

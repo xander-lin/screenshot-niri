@@ -630,7 +630,19 @@ impl RawStitcher {
         self.previous_compose_frame = Some(frame);
         self.previous_perceptual_frame = Some(PerceptualFrame::from_source(analysis_frame));
         self.previous_perceptual_delta = None;
-        self.accepted_direction = AcceptedDirectionMemory::default();
+        // A geometry change is a *known* step, not a matched one: the box moved
+        // by exactly `delta`, so the content moved with it. Recording it keeps
+        // the axis pointing where the capture is really going — after a
+        // horizontal nudge the next frame must be looked for horizontally even
+        // though the arrow key still says "down".
+        //
+        // A resize (delta 0) says nothing about direction and clears the
+        // memory instead, so the next frame falls back to the hint.
+        if delta_x != 0 || delta_y != 0 {
+            self.accepted_direction.record(match_info.direction);
+        } else {
+            self.accepted_direction = AcceptedDirectionMemory::default();
+        }
         self.last_screen_offset = Some(new_offset);
         // The canvas geometry changed underneath the engine; re-seed it from
         // the new viewport instead of letting it search a stale ladder.
@@ -768,7 +780,22 @@ impl RawStitcher {
             EngineDecision::Reject { reason } => Some(*reason),
             EngineDecision::Place { .. } => None,
         };
-        if primary_reason.is_some() {
+        // "Nothing moved" is not an answer on the impulse axis while the pixels
+        // changed: the duplicate check has already established that this frame
+        // differs from the previous one, so an axis that can only say "the same
+        // place" has not explained anything. That is what a stale impulse looks
+        // like at a turn — the axis the capture just left keeps answering zero,
+        // because movement along the other axis barely disturbs its descriptor.
+        // So a zero-delta answer asks the other axis too; it is kept only when
+        // that axis has nothing better, which is the honest reading of content
+        // that changed in place.
+        let primary_is_zero = match &decision {
+            EngineDecision::Place { match_info, .. } => {
+                match_info.delta_x == 0 && match_info.delta_y == 0
+            }
+            EngineDecision::Reject { .. } => false,
+        };
+        if primary_reason.is_some() || primary_is_zero {
             if self.second_axis_can_help(previous_rect, &active_compose) {
                 let attempt = self.place_on_axis(
                     primary_axis.other(),
@@ -777,7 +804,13 @@ impl RawStitcher {
                     search_direction,
                     false,
                 );
-                if matches!(attempt, EngineDecision::Place { .. }) {
+                let improved = match &attempt {
+                    EngineDecision::Place { match_info, .. } => {
+                        !primary_is_zero || match_info.delta_x != 0 || match_info.delta_y != 0
+                    }
+                    EngineDecision::Reject { .. } => false,
+                };
+                if improved {
                     placed_axis = primary_axis.other();
                     decision = attempt;
                 }
@@ -984,16 +1017,19 @@ impl RawStitcher {
 
     /// Asks one axis for a placement.
     ///
-    /// `allow_anchor` separates the two roles an axis can play. The impulse
-    /// axis may fall back to the whole-canvas anchor once the border is red;
-    /// the other axis is only ever asked for the predicted step.
+    /// `primary` separates the two roles an axis can play. The impulse axis is
+    /// the capture's own direction: both directions are ordinary (a scroll-back
+    /// is a step like any other) and it may fall back to the whole-canvas anchor
+    /// once the border is red. The other axis is only ever asked for the
+    /// predicted step, in the one direction the user indicated, and has no
+    /// anchor.
     fn place_on_axis(
         &mut self,
         axis: SearchAxis,
         previous_rect: ViewportRect,
         frame: &impl RgbSource,
         search_direction: Option<SearchDirection>,
-        allow_anchor: bool,
+        primary: bool,
     ) -> EngineDecision {
         // The hint is a sign, not an axis: passing "down" to the horizontal
         // matcher (or "left" to the vertical engine) would filter out every
@@ -1012,7 +1048,7 @@ impl RawStitcher {
                     previous_rect,
                     frame,
                     search_direction: hint,
-                    refusals: if allow_anchor {
+                    refusals: if primary {
                         self.consecutive_refusals
                     } else {
                         0
@@ -1025,30 +1061,30 @@ impl RawStitcher {
             SearchAxis::Horizontal => {
                 // The horizontal axis has no persistent descriptor: it is built
                 // on demand from the pixels the capture already holds, for the
-                // strip the search can reach (see `place_horizontally`). Its
+                // strip the comparison can use (see `place_horizontally`). Its
                 // anchor window does not exist — recovery belongs to the axis
-                // the capture is on — so `allow_anchor` has nothing to widen
-                // here.
+                // the capture is on — so `primary` has nothing to widen here.
                 let Some(stitched) = self.stitched.as_ref() else {
                     return EngineDecision::Reject {
                         reason: RejectReason::Uninitialised,
                     };
                 };
-                // One direction only, and the direction has to come from the
-                // user: nothing about the content says which side it moved to.
-                // Without it there is no horizontal question to ask.
-                let Some(direction) = hint else {
+                // On the impulse axis both directions are ordinary. As a
+                // fallback the direction has to come from the user: nothing
+                // about the content says which side it moved to, so without it
+                // there is no horizontal question to ask.
+                let direction = if primary { None } else { hint };
+                if !primary && direction.is_none() {
                     return EngineDecision::Reject {
                         reason: RejectReason::NoCandidate,
                     };
-                };
+                }
                 #[cfg(not(feature = "stitch-legacy"))]
                 {
                     engine::place_horizontally(stitched, previous_rect, frame, direction)
                 }
                 #[cfg(feature = "stitch-legacy")]
                 {
-                    let _ = direction;
                     self.legacy_horizontal_placement(previous_rect, frame, hint, None)
                 }
             }
@@ -1063,7 +1099,35 @@ impl RawStitcher {
         search_direction: Option<SearchDirection>,
         _window: Option<(i32, i32)>,
     ) -> EngineDecision {
-        self.legacy_placement(previous_rect, frame, search_direction)
+        // The axis is the caller's, not the hint's: after a horizontal edit the
+        // hint can still say "down" while the capture is moving sideways.
+        match find_canvas_placement_match(
+            match self.stitched.as_ref() {
+                Some(stitched) => stitched,
+                None => {
+                    return EngineDecision::Reject {
+                        reason: RejectReason::Uninitialised,
+                    };
+                }
+            },
+            previous_rect,
+            frame,
+            SearchAxis::Horizontal,
+            search_direction,
+        ) {
+            Some(match_info) => EngineDecision::Place {
+                rect: ViewportRect {
+                    x: previous_rect.x + match_info.delta_x,
+                    y: previous_rect.y + match_info.delta_y,
+                    width: previous_rect.width,
+                    height: previous_rect.height,
+                },
+                match_info,
+            },
+            None => EngineDecision::Reject {
+                reason: RejectReason::NoCandidate,
+            },
+        }
     }
 
     #[cfg(feature = "stitch-legacy")]
@@ -4370,6 +4434,106 @@ mod tests {
         assert_eq!(&strip[0..3], &[200, 200, 200]);
         // Everything is covered after a pure bottom extension.
         assert!(stitched.row_coverage.iter().all(|r| r == &RowCoverage::Full));
+    }
+
+    /// An edit box that is nudged right, then back by a pixel, then right
+    /// again, must leave the capture pointing the way it is really going.
+    ///
+    /// Every geometry change is a *known* step — the box moved by exactly
+    /// `new_offset - last_offset`, so the frame is placed there without
+    /// matching — and the pixels of the frame are placed to the right of the
+    /// original ones throughout. The question this pins is what the stitcher
+    /// believes afterwards: the next real scroll is horizontal, while the
+    /// arrow key still says "down".
+    #[test]
+    fn an_edit_box_oscillating_by_one_pixel_keeps_the_horizontal_direction() {
+        let page = |x: u32, y: u32| -> u8 {
+            let mut hash =
+                (x / 5).wrapping_mul(0x9E37_79B1) ^ (y / 5).wrapping_mul(0x85EB_CA77);
+            hash ^= hash >> 15;
+            hash = hash.wrapping_mul(0x2545_F491);
+            hash ^= hash >> 13;
+            (((x / 30 + y / 20) % 4) as u8) * 40 + (hash & 63) as u8
+        };
+        let frame_at = |frame_x: u32, frame_y: u32| -> RgbFrame {
+            let (width, height) = (120u32, 80u32);
+            let stride = width * 3;
+            let mut data = Vec::with_capacity((stride * height) as usize);
+            for y in 0..height {
+                for x in 0..width {
+                    let value = page(frame_x + x, frame_y + y);
+                    data.extend_from_slice(&[value, value, value]);
+                }
+            }
+            RgbFrame {
+                width,
+                height,
+                stride,
+                data,
+            }
+        };
+        let offset = |x: i32, y: i32| FrameScreenOffset { x, y };
+        let mut stitcher = RawStitcher::new();
+        let mut push = |frame: RgbFrame, screen: FrameScreenOffset| {
+            stitcher
+                .push_frame_with_offset(&frame, &frame, Some(LongDirection::Down), screen)
+                .unwrap()
+        };
+
+        assert!(matches!(push(frame_at(0, 0), offset(0, 0)), PushResult::Initialized));
+
+        // The box moves right by 8 px: the frame's content sits 8 px right of
+        // the content already captured.
+        match push(frame_at(8, 0), offset(8, 0)) {
+            PushResult::Accepted { match_info } => {
+                assert_eq!((match_info.delta_x, match_info.delta_y), (8, 0));
+            }
+            other => panic!("the box moving right must place the frame, got {other:?}"),
+        }
+        // Corrected back by one pixel.
+        match push(frame_at(7, 0), offset(7, 0)) {
+            PushResult::Accepted { match_info } => {
+                assert_eq!((match_info.delta_x, match_info.delta_y), (-1, 0));
+            }
+            other => panic!("the correction must place the frame, got {other:?}"),
+        }
+        // And one pixel right again.
+        match push(frame_at(8, 0), offset(8, 0)) {
+            PushResult::Accepted { match_info } => {
+                assert_eq!((match_info.delta_x, match_info.delta_y), (1, 0));
+            }
+            other => panic!("the second correction must place the frame, got {other:?}"),
+        }
+
+        // The capture now scrolls right while the hint still says "down".
+        // Nothing about the arrow key is right any more; the last verified
+        // step was horizontal and that is what has to be followed.
+        match push(frame_at(38, 0), offset(8, 0)) {
+            PushResult::Accepted { match_info } => {
+                assert_eq!(
+                    (match_info.delta_x, match_info.delta_y),
+                    (30, 0),
+                    "the scroll is horizontal and 30 px long"
+                );
+            }
+            other => panic!(
+                "after a horizontal edit the next scroll must be placed on the \
+                 horizontal axis, got {other:?}"
+            ),
+        }
+
+        let stitched = stitcher.stitched().unwrap();
+        assert_eq!((stitched.width, stitched.height), (158, 80));
+        for y in 0..80 {
+            for x in 0..158 {
+                let expected = page(x, y);
+                assert_eq!(
+                    stitched_pixel_rgb(stitched, x, y),
+                    [expected, expected, expected],
+                    "canvas pixel ({x},{y}) must be the page"
+                );
+            }
+        }
     }
 
     #[test]
