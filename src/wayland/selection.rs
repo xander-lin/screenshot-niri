@@ -49,13 +49,19 @@ const KEY_LEFT: u32 = 105;
 const KEY_RIGHT: u32 = 106;
 const KEY_DIGIT_FIRST: u32 = 2;
 const KEY_DIGIT_LAST: u32 = 10;
-/// Three full-resolution buffers per overlay: one held on-screen by the
-/// compositor, one committed and awaiting display, one free to keep the
-/// commit cycle alive. With only two, a compositor whose `wl_buffer.release`
-/// lags more than one frame (observed on multi-output niri where the frame
-/// pace spans two outputs) starves both buffers, and the stall becomes
-/// self-sustaining: no free buffer → no commit → no frame swap → no release.
-const OVERLAY_BUFFER_COUNT: usize = 3;
+/// Buffers per overlay: two — one on screen, one committed and awaiting display.
+///
+/// The overlay only ever paints a dim mask, a hole, a border and the stitched
+/// preview, and it commits only when one of those changes. A third buffer was
+/// reserved for the case where a compositor holds a buffer for a whole frame
+/// while the client produces the next one, which would starve a two-buffer
+/// rotation into a self-sustaining stall (no free buffer → no commit → no swap
+/// → no release). Measured on niri 26.04 with two outputs it does not happen:
+/// the preview at `--fps` keeps committing and releases arrive in time. If a
+/// compositor is ever found that does hold a frame, this is the constant to
+/// raise — the cost is a full-resolution RGBA set per overlay (8.1 MB at
+/// 1920x1080).
+const OVERLAY_BUFFER_COUNT: usize = 2;
 /// Logical-pixel snap range around each selection edge in edit mode.
 const EDGE_SNAP_RANGE: i32 = 8;
 /// Smallest selection kept while dragging an edge.
@@ -216,11 +222,19 @@ struct OverlaySurface {
     base_key: Option<(i32, i32, Option<LogicalRect>)>,
 }
 
+/// Marks an overlay as being on the frozen-image path, and how big its buffer is.
+///
+/// It used to hold two whole buffers of pixels — `base` (the frozen frame) and
+/// `dimmed` (that frame composited under the dim mask) — 8.1 MB each per output
+/// at 1920x1080. Neither is storage: `base` is the frozen capture itself
+/// (sampled through `frozen_pixel`, an identity when the buffer and the capture
+/// share a grid) and `dimmed` is `base` composited under one constant mask. On a
+/// two-output session that was 33 MB of duplication, and `H` rebuilt all of it on
+/// every press. Both are now computed per pixel from the frozen frame, which the
+/// session already holds once.
 struct OverlayRenderCache {
     width: i32,
     height: i32,
-    base: Vec<u8>,
-    dimmed: Vec<u8>,
 }
 
 struct FrozenOutput {
@@ -228,7 +242,104 @@ struct FrozenOutput {
     width: i32,
     height: i32,
     stride: i32,
+    /// The frame as captured **without** the compositor's cursor overlay, which
+    /// is what the selection overlay shows by default (`H` flips it).
     data: Vec<u8>,
+    /// What the with-cursor capture adds to it.
+    cursor_delta: CursorDelta,
+}
+
+/// Pixels where the with-cursor capture differs from the without-cursor one.
+///
+/// The two frames are captured back to back and differ only where the
+/// compositor drew the cursor: measured 1 440–2 706 pixels of 2 073 600 on a
+/// 1920x1080 output (0.07–0.13%), so 8.3 MB → 11–22 KB. Storing the second
+/// capture whole — which is what this replaces — cost 16.6 MB on a two-output
+/// session for a patch the size of a mouse pointer.
+///
+/// The patch is deliberately *not* assumed to be only the cursor: it records
+/// every pixel that differs, so a caret that blinked or a clock that ticked
+/// between the two captures is reproduced exactly rather than being dropped
+/// from the frame the user is about to cut. The bounding box is kept because it
+/// is the cursor's footprint — it is what the two captures differ by — and it
+/// bounds the work when a frame is needed for one region only.
+struct CursorDelta {
+    /// Differing pixels per capture row, sorted by x. Rows with none are
+    /// omitted, which is almost all of them.
+    rows: Vec<(u32, Vec<(u32, [u8; 4])>)>,
+    /// Bounding box of every recorded pixel: `(x, y, width, height)`.
+    ///
+    /// The cursor's footprint, and what makes the patch's size legible in a
+    /// trace or a failure message. Nothing reads it to decide anything.
+    #[cfg_attr(not(test), allow(dead_code))]
+    bounds: Option<(i32, i32, i32, i32)>,
+    /// Bytes this patch occupies, for the memory report.
+    #[cfg_attr(not(test), allow(dead_code))]
+    bytes: usize,
+}
+
+impl CursorDelta {
+    const EMPTY: CursorDelta = CursorDelta { rows: Vec::new(), bounds: None, bytes: 0 };
+
+    /// Records every pixel where `other` differs from `base`.
+    ///
+    /// `base` and `other` must share a geometry; a mismatch records nothing and
+    /// leaves the caller on the base frame, which is the safe direction (the
+    /// cursor is not in the picture, rather than the picture being wrong).
+    fn between(base: &FrozenOutput, other: &FrozenOutput) -> CursorDelta {
+        if (base.width, base.height, base.stride) != (other.width, other.height, other.stride) {
+            return CursorDelta::EMPTY;
+        }
+        let mut rows: Vec<(u32, Vec<(u32, [u8; 4])>)> = Vec::new();
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        let mut bytes = 0usize;
+        for y in 0..base.height as u32 {
+            let row_start = y as usize * base.stride as usize;
+            let mut pixels: Vec<(u32, [u8; 4])> = Vec::new();
+            for x in 0..base.width as u32 {
+                let offset = row_start + x as usize * 4;
+                let (Some(a), Some(b)) = (
+                    base.data.get(offset..offset + 4),
+                    other.data.get(offset..offset + 4),
+                ) else {
+                    continue;
+                };
+                if a == b {
+                    continue;
+                }
+                let pixel = [b[0], b[1], b[2], b[3]];
+                pixels.push((x, pixel));
+                bytes += std::mem::size_of::<(u32, [u8; 4])>();
+                min_x = min_x.min(x as i32);
+                min_y = min_y.min(y as i32);
+                max_x = max_x.max(x as i32);
+                max_y = max_y.max(y as i32);
+            }
+            if !pixels.is_empty() {
+                rows.push((y, pixels));
+            }
+        }
+        let bounds = (min_y != i32::MAX).then(|| (min_x, min_y, max_x - min_x + 1, max_y - min_y + 1));
+        CursorDelta { rows, bounds, bytes }
+    }
+
+    /// The pixels this patch replaces on capture row `y`.
+    fn row(&self, y: u32) -> Option<&[(u32, [u8; 4])]> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        self.rows
+            .binary_search_by_key(&y, |(row, _)| *row)
+            .ok()
+            .map(|index| self.rows[index].1.as_slice())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
 }
 
 impl Drop for OverlaySurface {
@@ -254,8 +365,10 @@ struct UiState {
     pointer: Option<WlPointer>,
     keyboard: Option<WlKeyboard>,
     outputs: Vec<OutputRuntime>,
+    /// One frozen frame per output: the without-cursor capture, plus the patch
+    /// that turns it into the with-cursor one. `screenshot_cursor_hidden` picks
+    /// which to draw; see `frozen_for_output`.
     frozen_outputs: Vec<FrozenOutput>,
-    frozen_outputs_without_cursor: Vec<FrozenOutput>,
     overlays: Vec<OverlaySurface>,
     pointer_output_name: Option<u32>,
     long_mode: bool,
@@ -337,8 +450,7 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
         pointer: None,
         keyboard: None,
         outputs: Vec::new(),
-        frozen_outputs: frozen_outputs_from_captures(frozen_outputs)?,
-        frozen_outputs_without_cursor: Vec::new(),
+        frozen_outputs: frozen_outputs_from_captures(frozen_outputs, &[])?,
         overlays: Vec::new(),
         pointer_output_name: None,
         long_mode: false,
@@ -710,13 +822,17 @@ impl SelectionSession {
         let conn = Connection::connect_to_env()?;
         let mut event_queue = conn.new_event_queue::<UiState>();
         let qh = event_queue.handle();
+        // The pair is folded into one list here: the with-cursor capture
+        // becomes the patch on the without-cursor frame, not a second frame.
         let frozen_outputs = match frozen_outputs {
-            Some(captures) => frozen_outputs_from_captures(captures)?,
-            None => Vec::new(),
-        };
-        let frozen_outputs_without_cursor = match frozen_outputs_without_cursor {
-            Some(captures) => frozen_outputs_from_captures(captures)?,
-            None => Vec::new(),
+            Some(captures) => frozen_outputs_from_captures(
+                captures,
+                frozen_outputs_without_cursor.unwrap_or(&[]),
+            )?,
+            None => match frozen_outputs_without_cursor {
+                Some(captures) => frozen_outputs_from_captures(captures, &[])?,
+                None => Vec::new(),
+            },
         };
         let mut state = UiState {
             compositor: None,
@@ -730,7 +846,6 @@ impl SelectionSession {
             keyboard: None,
             outputs: Vec::new(),
             frozen_outputs,
-            frozen_outputs_without_cursor,
             overlays: Vec::new(),
             pointer_output_name: None,
             long_mode,
@@ -775,9 +890,6 @@ impl SelectionSession {
         }
         if !state.frozen_outputs.is_empty() {
             validate_frozen_outputs(&state.outputs, &state.frozen_outputs)?;
-        }
-        if !state.frozen_outputs_without_cursor.is_empty() {
-            validate_frozen_outputs(&state.outputs, &state.frozen_outputs_without_cursor)?;
         }
         create_overlays(&mut state, &qh)?;
         conn.flush()?;
@@ -835,15 +947,28 @@ impl SelectionSession {
         self.state.capture_invalid = false;
         // Long capture is single-screen: from here on, rendering and the
         // pending-render debt are scoped to the selected output only.
-        self.state.render_scope = Some(viewport.regions[0].output_global_name);
+        let scope_output = viewport.regions[0].output_global_name;
+        self.state.render_scope = Some(scope_output);
         // After L promotion, future layer configure events must not rebuild
         // a frozen render cache over the live capture hole.
         self.state.frozen_outputs.clear();
-        self.state.frozen_outputs_without_cursor.clear();
         for overlay in &mut self.state.overlays {
             overlay.render_cache = None;
             overlay.base_pixels = None;
             overlay.base_key = None;
+        }
+        // The other outputs' canvases are never drawn on again: the pointer is
+        // grabbed by the selected output, capture is scoped to it, and the
+        // overlays there keep whatever the compositor last took from them.
+        // Holding their buffers alive holds a full-resolution RGBA set per
+        // screen — 8.1 MB each at 1920x1080 — for surfaces that will not be
+        // committed to again. Measured on a two-output session: 4 buffers and
+        // 32.4 MB of `RssShmem` during selection, 2 buffers and 16.2 MB once
+        // the capture is running.
+        for overlay in &mut self.state.overlays {
+            if overlay.output_name != scope_output {
+                overlay.buffers.clear();
+            }
         }
         // Retry until at least one overlay is rendered (buffer available).
         // Scoped to the selected output: long capture is single-screen.
@@ -896,6 +1021,26 @@ impl SelectionSession {
 
     pub fn screenshot_cursor_hidden(&self) -> bool {
         self.state.screenshot_cursor_hidden
+    }
+
+    /// The frozen frames the session is displaying, in the form the PNG
+    /// compositor wants.
+    ///
+    /// The session stored them as the without-cursor capture plus a cursor
+    /// patch, and the caller already handed over the two full-frame sets it
+    /// captured. Materialising the shown frame here — with the patch applied
+    /// when the user asked for the cursor — keeps one source of truth for what
+    /// was on screen, and costs one frame's pixels once, at the end.
+    pub fn frozen_captures_for_output(&self) -> Vec<CapturedOutput> {
+        let with_cursor = !self.state.screenshot_cursor_hidden;
+        self.state
+            .frozen_outputs
+            .iter()
+            .map(|frozen| CapturedOutput {
+                output_name: frozen.info.global_name,
+                image: frozen.to_image(with_cursor),
+            })
+            .collect()
     }
 
     /// Turns the long-capture border red while the stitcher is refusing
@@ -1296,7 +1441,6 @@ fn invalidate_overlay_bases(state: &mut UiState) {
 /// capture live content, and a frozen frame must not survive into the handover.
 fn drop_frozen_bases(state: &mut UiState) {
     state.frozen_outputs.clear();
-    state.frozen_outputs_without_cursor.clear();
     for overlay in &mut state.overlays {
         overlay.render_cache = None;
         overlay.base_pixels = None;
@@ -1515,22 +1659,12 @@ fn full_output_rect_by_index(output_infos: &[OutputInfo], index: usize) -> Optio
 fn toggle_frozen_frame(state: &mut UiState) {
     state.screenshot_cursor_hidden = !state.screenshot_cursor_hidden;
     for index in 0..state.overlays.len() {
-        let output_name = state.overlays[index].output_name;
-        let width = state.overlays[index].width;
-        let height = state.overlays[index].height;
-        let Some(output) = state.outputs.iter().find(|output| output.info.global_name == output_name) else {
-            continue;
-        };
-        let captures = if state.screenshot_cursor_hidden {
-            &state.frozen_outputs_without_cursor
-        } else {
-            &state.frozen_outputs
-        };
-        let Some(frozen) = captures.iter().find(|frozen| frozen.info.global_name == output_name) else {
-            continue;
-        };
+        // Only the overlay's buffers need invalidating: the frozen pixels are
+        // read from the stored capture on every draw, so switching frames is
+        // switching whether `frozen_pixel` applies the cursor patch. There is
+        // no second frame to rebuild, which is what used to make `H` cost a
+        // whole 8.3 MB rebuild per output.
         let overlay = &mut state.overlays[index];
-        overlay.render_cache = Some(build_overlay_render_cache(width, height, output.info, frozen, state.border_width));
         for buffer in &mut overlay.buffers {
             buffer.initialized = false;
             buffer.last_selected = None;
@@ -1608,10 +1742,18 @@ fn render_overlays(state: &mut UiState) -> usize {
     // live path; it used to hardcode white, which is why a drag across outputs
     // kept the plain border until long mode started.
     let border = border_color_for_state(state, state.drag.current_rect());
+    let frozen_capture = &state.frozen_outputs;
+    // The stored frame *is* the without-cursor capture, so
+    // `screenshot_cursor_hidden` (the default, and what `H` toggles) means "do
+    // not apply the patch".
+    let with_cursor = !state.screenshot_cursor_hidden;
     for overlay in &mut state.overlays {
         // Live overlays always use the same compositor, including edit/input
         // redraws; the frozen-image dirty-region path is normal-mode only.
         let Some(render_cache) = overlay.render_cache.as_ref() else {
+            continue;
+        };
+        let Some(frozen) = frozen_from(frozen_capture, overlay.output_name) else {
             continue;
         };
         let Some(buffer) = overlay.buffers.iter_mut().find(|buffer| buffer.available) else {
@@ -1637,9 +1779,9 @@ fn render_overlays(state: &mut UiState) -> usize {
             continue;
         };
         if buffer.initialized {
-            draw_overlay_region(data, render_cache, output.info, rect, damage, border_width, border);
+            draw_overlay_region(data, render_cache, output.info, frozen, with_cursor, rect, damage, border_width, border);
         } else {
-            draw_overlay(data, render_cache, output.info, rect, border_width, border);
+            draw_overlay(data, render_cache, output.info, frozen, with_cursor, rect, border_width, border);
             buffer.initialized = true;
         }
         buffer.last_selected = current_selected;
@@ -1652,40 +1794,73 @@ fn render_overlays(state: &mut UiState) -> usize {
     committed + render_live_overlays(state, None)
 }
 
-fn frozen_outputs_from_captures(captures: &[CapturedOutput]) -> Result<Vec<FrozenOutput>, Box<dyn Error>> {
+/// Builds the session's frozen frames from a with-cursor / without-cursor pair.
+///
+/// One capture of each output is kept whole — the **without-cursor** one, which
+/// is what the overlay shows until `H` — and the with-cursor capture is reduced
+/// to the pixels where the two differ. The pair is taken microseconds apart, so
+/// the difference is the cursor overlay plus whatever blinked in between; both
+/// are reproduced exactly.
+///
+/// A missing without-cursor capture falls back to keeping the with-cursor one
+/// whole, which is worse for memory and identical on screen. A pair that does
+/// not share a geometry does the same, per output: a wrong picture is a much
+/// worse failure than a duplicated one.
+fn frozen_outputs_from_captures(
+    captures: &[CapturedOutput],
+    without_cursor: &[CapturedOutput],
+) -> Result<Vec<FrozenOutput>, Box<dyn Error>> {
     let mut frozen_outputs = Vec::with_capacity(captures.len());
     for capture in captures {
-        let image = &capture.image;
-        if !matches!(image.format, Format::Xrgb8888 | Format::Argb8888) {
-            return Err(format!("unsupported frozen output format for output {}: {:?}", capture.output_name, image.format).into());
-        }
-        if image.width <= 0 || image.height <= 0 {
-            return Err(format!("frozen output {} dimensions must be positive", capture.output_name).into());
-        }
-        let minimum_stride = image.width.checked_mul(4).ok_or("frozen output stride overflow")?;
-        if image.stride < minimum_stride {
-            return Err(format!("frozen output {} stride is smaller than width * 4", capture.output_name).into());
-        }
-        let minimum_len = usize::try_from(image.stride)?.checked_mul(usize::try_from(image.height)?).ok_or("frozen output data length overflow")?;
-        if image.data.len() < minimum_len {
-            return Err(format!("frozen output {} data is shorter than stride * height", capture.output_name).into());
-        }
-        let width = i32::try_from(image.width)?;
-        let height = i32::try_from(image.height)?;
-        let stride = i32::try_from(image.stride)?;
+        let base = without_cursor
+            .iter()
+            .find(|other| other.output_name == capture.output_name);
+        let (base_image, cursor_image) = match base {
+            Some(base) => (&base.image, &capture.image),
+            None => (&capture.image, &capture.image),
+        };
+        let frozen_base = frozen_output_from_image(capture.output_name, base_image)?;
+        let cursor_frame = frozen_output_from_image(capture.output_name, cursor_image)?;
+        let cursor_delta = CursorDelta::between(&frozen_base, &cursor_frame);
         frozen_outputs.push(FrozenOutput {
-            info: OutputInfo {
-                global_name: capture.output_name,
-                logical: LogicalRect { x: 0, y: 0, width, height },
-                scale: 1,
-            },
-            width,
-            height,
-            stride,
-            data: image.data.clone(),
+            cursor_delta,
+            ..frozen_base
         });
     }
     Ok(frozen_outputs)
+}
+
+/// One capture, as the frozen frame the overlay draws from.
+fn frozen_output_from_image(output_name: u32, image: &Image) -> Result<FrozenOutput, Box<dyn Error>> {
+    if !matches!(image.format, Format::Xrgb8888 | Format::Argb8888) {
+        return Err(format!("unsupported frozen output format for output {output_name}: {:?}", image.format).into());
+    }
+    if image.width <= 0 || image.height <= 0 {
+        return Err(format!("frozen output {output_name} dimensions must be positive").into());
+    }
+    let minimum_stride = image.width.checked_mul(4).ok_or("frozen output stride overflow")?;
+    if image.stride < minimum_stride {
+        return Err(format!("frozen output {output_name} stride is smaller than width * 4").into());
+    }
+    let minimum_len = usize::try_from(image.stride)?.checked_mul(usize::try_from(image.height)?).ok_or("frozen output data length overflow")?;
+    if image.data.len() < minimum_len {
+        return Err(format!("frozen output {output_name} data is shorter than stride * height").into());
+    }
+    let width = i32::try_from(image.width)?;
+    let height = i32::try_from(image.height)?;
+    let stride = i32::try_from(image.stride)?;
+    Ok(FrozenOutput {
+        info: OutputInfo {
+            global_name: output_name,
+            logical: LogicalRect { x: 0, y: 0, width, height },
+            scale: 1,
+        },
+        width,
+        height,
+        stride,
+        data: image.data.clone(),
+        cursor_delta: CursorDelta::EMPTY,
+    })
 }
 
 #[allow(dead_code)]
@@ -1698,7 +1873,77 @@ fn validate_frozen_outputs(outputs: &[OutputRuntime], frozen_outputs: &[FrozenOu
     Ok(())
 }
 
-fn frozen_pixel(frozen: &FrozenOutput, overlay_width: i32, overlay_height: i32, local_x: i32, local_y: i32) -> [u8; 4] {
+impl FrozenOutput {
+    /// This frame as an `Image`, optionally with the cursor patch applied.
+    ///
+    /// Allocates one frame, which is what the final composite needs anyway.
+    fn to_image(&self, with_cursor: bool) -> Image {
+        let bytes = usize::try_from(self.stride.max(0))
+            .unwrap_or(0)
+            .saturating_mul(usize::try_from(self.height.max(0)).unwrap_or(0));
+        let mut data = vec![0u8; bytes];
+        let keep = bytes.min(self.data.len());
+        data[..keep].copy_from_slice(&self.data[..keep]);
+        if with_cursor && !self.cursor_delta.is_empty() {
+            for (y, pixels) in &self.cursor_delta.rows {
+                let row_start = *y as usize * self.stride as usize;
+                for (x, pixel) in pixels {
+                    let offset = row_start + *x as usize * 4;
+                    if offset + 4 <= data.len() {
+                        data[offset..offset + 4].copy_from_slice(pixel);
+                    }
+                }
+            }
+        }
+        Image {
+            width: self.width as u32,
+            height: self.height as u32,
+            stride: self.stride as u32,
+            format: Format::Argb8888,
+            data,
+        }
+    }
+}
+
+/// The frozen frame for one output, from the session's single stored list.
+fn frozen_from(captures: &[FrozenOutput], output_name: u32) -> Option<&FrozenOutput> {
+    captures
+        .iter()
+        .find(|frozen| frozen.info.global_name == output_name)
+}
+
+/// One pixel of the frozen frame, as the overlay should show it.
+///
+/// `with_cursor` selects between the two captures the session was started with:
+/// the stored frame is the without-cursor one, and the with-cursor capture is
+/// its `cursor_delta`. Applying the patch here rather than storing a second
+/// frame is what makes `H` free and the second capture almost free in memory.
+fn frozen_pixel(
+    frozen: &FrozenOutput,
+    overlay_width: i32,
+    overlay_height: i32,
+    local_x: i32,
+    local_y: i32,
+    with_cursor: bool,
+) -> [u8; 4] {
+    let pixel = frozen_base_pixel(frozen, overlay_width, overlay_height, local_x, local_y);
+    if !with_cursor || frozen.cursor_delta.is_empty() {
+        return pixel;
+    }
+    // The patch is indexed in capture pixels, so it has to be sampled the same
+    // way the base frame was — through the same buffer-to-capture map.
+    let source_x = ((local_x as i64 * frozen.width as i64) / overlay_width.max(1) as i64) as i32;
+    let source_y = ((local_y as i64 * frozen.height as i64) / overlay_height.max(1) as i64) as i32;
+    let Some(rows) = frozen.cursor_delta.row(source_y.max(0) as u32) else {
+        return pixel;
+    };
+    match rows.binary_search_by_key(&(source_x.max(0) as u32), |(x, _)| *x) {
+        Ok(index) => rows[index].1,
+        Err(_) => pixel,
+    }
+}
+
+fn frozen_base_pixel(frozen: &FrozenOutput, overlay_width: i32, overlay_height: i32, local_x: i32, local_y: i32) -> [u8; 4] {
     if frozen.width <= 0 || frozen.height <= 0 || frozen.stride <= 0 || overlay_width <= 0 || overlay_height <= 0 {
         return [0, 0, 0, 255];
     }
@@ -1722,23 +1967,8 @@ fn frozen_pixel(frozen: &FrozenOutput, overlay_width: i32, overlay_height: i32, 
     [pixel[0], pixel[1], pixel[2], 255]
 }
 
-fn build_overlay_render_cache(width: i32, height: i32, output: OutputInfo, frozen: &FrozenOutput, border_width: i32) -> OverlayRenderCache {
-    let buffer_width = width.max(0) as usize;
-    let buffer_height = height.max(0) as usize;
-    let len = buffer_width.saturating_mul(buffer_height).saturating_mul(4);
-    let mut base = vec![0; len];
-    let mut dimmed = vec![0; len];
-    for local_y in 0..buffer_height {
-        for local_x in 0..buffer_width {
-            let offset = (local_y * buffer_width + local_x) * 4;
-            let pixel = frozen_pixel(frozen, width, height, local_x as i32, local_y as i32);
-            let logical_x = (local_x as i64 * output.logical.width as i64 / width.max(1) as i64) as i32;
-            let logical_y = (local_y as i64 * output.logical.height as i64 / height.max(1) as i64) as i32;
-            base[offset..offset + 4].copy_from_slice(&pixel);
-            dimmed[offset..offset + 4].copy_from_slice(&composited_overlay_pixel(pixel, output.logical.x + logical_x, output.logical.y + logical_y, None, border_width));
-        }
-    }
-    OverlayRenderCache { width, height, base, dimmed }
+fn build_overlay_render_cache(width: i32, height: i32) -> OverlayRenderCache {
+    OverlayRenderCache { width, height }
 }
 
 fn composited_overlay_pixel(base: [u8; 4], global_x: i32, global_y: i32, selected: Option<LogicalRect>, border_width: i32) -> [u8; 4] {
@@ -1759,11 +1989,11 @@ fn composited_overlay_pixel(base: [u8; 4], global_x: i32, global_y: i32, selecte
     ]
 }
 
-fn draw_overlay(data: &mut [u8], cache: &OverlayRenderCache, output: OutputInfo, selected: Option<LogicalRect>, border_width: i32, border: [u8; 4]) {
-    draw_overlay_region(data, cache, output, selected, LogicalRect { x: 0, y: 0, width: cache.width, height: cache.height }, border_width, border);
+fn draw_overlay(data: &mut [u8], cache: &OverlayRenderCache, output: OutputInfo, frozen: &FrozenOutput, with_cursor: bool, selected: Option<LogicalRect>, border_width: i32, border: [u8; 4]) {
+    draw_overlay_region(data, cache, output, frozen, with_cursor, selected, LogicalRect { x: 0, y: 0, width: cache.width, height: cache.height }, border_width, border);
 }
 
-fn draw_overlay_region(data: &mut [u8], cache: &OverlayRenderCache, output: OutputInfo, selected: Option<LogicalRect>, dirty: LogicalRect, border_width: i32, border: [u8; 4]) {
+fn draw_overlay_region(data: &mut [u8], cache: &OverlayRenderCache, output: OutputInfo, frozen: &FrozenOutput, with_cursor: bool, selected: Option<LogicalRect>, dirty: LogicalRect, border_width: i32, border: [u8; 4]) {
     if cache.width <= 0 || cache.height <= 0 {
         return;
     }
@@ -1781,15 +2011,22 @@ fn draw_overlay_region(data: &mut [u8], cache: &OverlayRenderCache, output: Outp
             let global_x = to_global(local_x as i32, logical.x, logical.width, cache.width);
             let global_y = to_global(local_y as i32, logical.y, logical.height, cache.height);
             let offset = (local_y * width + local_x) * 4;
-            let source = match overlay_pixel(global_x, global_y, selected, border_width, border) {
-                OVERLAY_SELECTED_TRANSPARENT_BGRA => &cache.base,
-                OVERLAY_OUTSIDE_MASK_BGRA => &cache.dimmed,
+            // Both layers are derived, not stored: the frozen frame is the
+            // session's one copy of those pixels, and the dimmed version is that
+            // same pixel composited under a constant mask.
+            let pixel = frozen_pixel(frozen, cache.width, cache.height, local_x as i32, local_y as i32, with_cursor);
+            match overlay_pixel(global_x, global_y, selected, border_width, border) {
+                OVERLAY_SELECTED_TRANSPARENT_BGRA => {
+                    data[offset..offset + 4].copy_from_slice(&pixel);
+                }
+                OVERLAY_OUTSIDE_MASK_BGRA => {
+                    let dimmed = composited_overlay_pixel(pixel, global_x, global_y, None, border_width);
+                    data[offset..offset + 4].copy_from_slice(&dimmed);
+                }
                 border => {
                     data[offset..offset + 4].copy_from_slice(&border);
-                    continue;
                 }
-            };
-            data[offset..offset + 4].copy_from_slice(&source[offset..offset + 4]);
+            }
         }
     }
 }
@@ -2083,21 +2320,13 @@ fn refresh_overlay_surface(state: &mut UiState, output_name: u32, qh: &QueueHand
     else {
         return;
     };
-    let output_info = output.info;
     let output_pixels = mode_pixels_for(
         output.mode_pixels,
         (output.info.logical.width, output.info.logical.height),
     );
-    let frozen = (if state.screenshot_cursor_hidden {
-        &state.frozen_outputs_without_cursor
-    } else {
-        &state.frozen_outputs
-    })
-    .iter()
-    .find(|frozen| frozen.info.global_name == output_name);
+    let frozen = frozen_from(&state.frozen_outputs, output_name);
     let shm = state.shm.clone();
     let viewporter = state.viewporter.clone();
-    let border_width = state.border_width;
     let Some(index) = state.overlays.iter().position(|overlay| overlay.output_name == output_name) else {
         return;
     };
@@ -2120,7 +2349,7 @@ fn refresh_overlay_surface(state: &mut UiState, output_name: u32, qh: &QueueHand
     );
     let resized = (buffer_width, buffer_height)
         != (state.overlays[index].width, state.overlays[index].height)
-        || state.overlays[index].buffers.is_empty();
+        || state.overlays[index].buffers.len() != OVERLAY_BUFFER_COUNT;
     if resized {
         let Some(shm) = shm else {
             return;
@@ -2151,19 +2380,16 @@ fn refresh_overlay_surface(state: &mut UiState, output_name: u32, qh: &QueueHand
             }
         }
     }
-    if let Some(frozen) = frozen {
+    // The cache is geometry-only now, so it is built whenever there is a frozen
+    // frame to draw and the size changed — no pixels are copied to build it.
+    if frozen.is_some() {
         let cache_matches = state.overlays[index]
             .render_cache
             .as_ref()
             .is_some_and(|cache| cache.width == buffer_width && cache.height == buffer_height);
         if !cache_matches {
-            state.overlays[index].render_cache = Some(build_overlay_render_cache(
-                buffer_width,
-                buffer_height,
-                output_info,
-                frozen,
-                border_width,
-            ));
+            state.overlays[index].render_cache =
+                Some(build_overlay_render_cache(buffer_width, buffer_height));
         }
     }
     // A viewport destination is surface state: it only takes effect on the next
@@ -2682,10 +2908,10 @@ mod tests {
         // (1,1)-(3,3) must be the hole at buffer [2,4), not [1,3).
         let output_info = OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 0, width: 4, height: 4 }, scale: 2 };
         let frozen = frozen_test_output(output_info, 6, 6, [10, 20, 30, 255]);
-        let cache = build_overlay_render_cache(6, 6, output_info, &frozen, 1);
+        let cache = build_overlay_render_cache(6, 6);
         let mut data = vec![0u8; 6 * 6 * 4];
         let selected = LogicalRect { x: 1, y: 1, width: 2, height: 2 };
-        draw_overlay(&mut data, &cache, output_info, Some(selected), 1, OVERLAY_BORDER_WHITE_BGRA);
+        draw_overlay(&mut data, &cache, output_info, &frozen, false, Some(selected), 1, OVERLAY_BORDER_WHITE_BGRA);
 
         // Inside the hole the frozen pixel is shown undimmed; outside it is
         // dimmed, and the closed ring is white. Comparing against the raw
@@ -3063,10 +3289,10 @@ mod tests {
         let local = selected_buffer_rect(output, rect, 100, 100).unwrap();
         let frozen = frozen_test_output(output, 100, 100, [20, 30, 40, 255]);
         for thickness in 1..=16 {
-            let cache = build_overlay_render_cache(100, 100, output, &frozen, thickness);
+            let cache = build_overlay_render_cache(100, 100);
             let mut normal = vec![0; 100 * 100 * 4];
             let mut live = normal.clone();
-            draw_overlay(&mut normal, &cache, output, Some(rect), thickness, OVERLAY_BORDER_WHITE_BGRA);
+            draw_overlay(&mut normal, &cache, output, &frozen, false, Some(rect), thickness, OVERLAY_BORDER_WHITE_BGRA);
             draw_overlay_dim_with_selection(&mut live, 100, 100, output, Some(rect), thickness, OVERLAY_BORDER_WHITE_BGRA, true);
             for y in 0..100 {
                 for x in 0..100 {
@@ -3092,13 +3318,13 @@ mod tests {
         let old = LogicalRect { x: 20, y: 20, width: 20, height: 20 };
         let new = LogicalRect { x: 60, y: 60, width: 20, height: 20 };
         let frozen = frozen_test_output(output, 100, 100, [20, 30, 40, 255]);
-        let cache = build_overlay_render_cache(100, 100, output, &frozen, 16);
+        let cache = build_overlay_render_cache(100, 100);
         let mut data = vec![0; 100 * 100 * 4];
-        draw_overlay(&mut data, &cache, output, Some(old), 16, OVERLAY_BORDER_WHITE_BGRA);
+        draw_overlay(&mut data, &cache, output, &frozen, false, Some(old), 16, OVERLAY_BORDER_WHITE_BGRA);
         let dirty = dirty_selected_region(Some(border_bounds(old, 16)), Some(border_bounds(new, 16)), 100, 100).unwrap();
-        draw_overlay_region(&mut data, &cache, output, Some(new), dirty, 16, OVERLAY_BORDER_WHITE_BGRA);
+        draw_overlay_region(&mut data, &cache, output, &frozen, false, Some(new), dirty, 16, OVERLAY_BORDER_WHITE_BGRA);
         let mut expected = vec![0; data.len()];
-        draw_overlay(&mut expected, &cache, output, Some(new), 16, OVERLAY_BORDER_WHITE_BGRA);
+        draw_overlay(&mut expected, &cache, output, &frozen, false, Some(new), 16, OVERLAY_BORDER_WHITE_BGRA);
         assert_eq!(data, expected);
     }
 
@@ -3399,7 +3625,6 @@ mod tests {
             keyboard: None,
             outputs: Vec::new(),
             frozen_outputs: Vec::new(),
-            frozen_outputs_without_cursor: Vec::new(),
             overlays: Vec::new(),
             pointer_output_name: None,
             long_mode: false,
@@ -3654,9 +3879,9 @@ mod tests {
         let output_info = OutputInfo { global_name: 1, logical: output, scale: 1 };
         let frozen_pixel = [10, 20, 30, 255];
         let frozen = frozen_test_output(output_info, output.width, output.height, frozen_pixel);
-        let cache = build_overlay_render_cache(output.width, output.height, output_info, &frozen, 3);
+        let cache = build_overlay_render_cache(output.width, output.height);
 
-        draw_overlay(&mut data, &cache, output_info, Some(selected), 3, OVERLAY_BORDER_WHITE_BGRA);
+        draw_overlay(&mut data, &cache, output_info, &frozen, false, Some(selected), 3, OVERLAY_BORDER_WHITE_BGRA);
 
         assert_eq!(pixel_at(&data, output.width as usize, 0, 0), OVERLAY_BORDER_WHITE_BGRA);
         // The border is a closed outside ring, including the four corners.
@@ -3682,28 +3907,161 @@ mod tests {
         let output_info = OutputInfo { global_name: 1, logical: output, scale: 1 };
         let frozen_pixel = [10, 20, 30, 255];
         let frozen = frozen_test_output(output_info, output.width, output.height, frozen_pixel);
-        let cache = build_overlay_render_cache(output.width, output.height, output_info, &frozen, 3);
+        let cache = build_overlay_render_cache(output.width, output.height);
 
-        draw_overlay(&mut data, &cache, output_info, Some(previous), 3, OVERLAY_BORDER_WHITE_BGRA);
-        draw_overlay_region(&mut data, &cache, output_info, Some(current), dirty, 3, OVERLAY_BORDER_WHITE_BGRA);
+        draw_overlay(&mut data, &cache, output_info, &frozen, false, Some(previous), 3, OVERLAY_BORDER_WHITE_BGRA);
+        draw_overlay_region(&mut data, &cache, output_info, &frozen, false, Some(current), dirty, 3, OVERLAY_BORDER_WHITE_BGRA);
 
         assert_eq!(pixel_at(&data, output.width as usize, 1, 1), OVERLAY_BORDER_WHITE_BGRA);
         assert_eq!(pixel_at(&data, output.width as usize, 2, 2), OVERLAY_BORDER_WHITE_BGRA);
     }
 
     #[test]
-    fn build_overlay_render_cache_stores_base_and_dimmed_pixels() {
+    /// The cache holds geometry, not pixels.
+    ///
+    /// It used to keep two whole buffers — the frozen frame and its dimmed
+    /// version — which was 8.1 MB per output per layer at 1920x1080 and rebuilt
+    /// in full on every `H`. Both are derived from the one frozen capture, so
+    /// this pins that a draw produces exactly the same pixels without them.
+    fn the_render_cache_holds_no_pixels_but_draws_the_frozen_frame() {
         let output = LogicalRect { x: 0, y: 0, width: 2, height: 1 };
         let output_info = OutputInfo { global_name: 1, logical: output, scale: 1 };
         let mut frozen = frozen_test_output(output_info, output.width, output.height, [10, 20, 30, 255]);
         frozen.data[4..8].copy_from_slice(&[40, 50, 60, 255]);
 
-        let cache = build_overlay_render_cache(output.width, output.height, output_info, &frozen, 3);
+        let cache = build_overlay_render_cache(output.width, output.height);
+        // Nothing pixel-sized is retained.
+        assert_eq!(cache.width, output.width);
+        assert_eq!(cache.height, output.height);
+        assert_eq!(std::mem::size_of::<OverlayRenderCache>(), 8);
 
-        assert_eq!(pixel_at(&cache.base, output.width as usize, 0, 0), [10, 20, 30, 255]);
-        assert_eq!(pixel_at(&cache.base, output.width as usize, 1, 0), [40, 50, 60, 255]);
-        assert_eq!(pixel_at(&cache.dimmed, output.width as usize, 0, 0), [6, 11, 17, 255]);
-        assert_eq!(pixel_at(&cache.dimmed, output.width as usize, 1, 0), [23, 28, 34, 255]);
+        // A selection covering nothing leaves the frozen frame untouched.
+        let mut data = vec![0u8; (output.width * output.height * 4) as usize];
+        draw_overlay(&mut data, &cache, output_info, &frozen, false, None, 3, OVERLAY_BORDER_WHITE_BGRA);
+        // `None` means the whole output is dimmed; with no selection the border
+        // is drawn over it, so compare the inside against the dimmed value the
+        // cache used to precompute.
+        let dimmed_left = composited_overlay_pixel([10, 20, 30, 255], 0, 0, None, 3);
+        assert_eq!(pixel_at(&data, 2, 0, 0), dimmed_left);
+        let dimmed_right = composited_overlay_pixel([40, 50, 60, 255], 1, 0, None, 3);
+        assert_eq!(pixel_at(&data, 2, 1, 0), dimmed_right);
+    }
+
+    /// The with-cursor capture is stored as a patch on the without-cursor one.
+    ///
+    /// Measured on a real 1920x1080 output the two differ by 1 440–2 706 pixels
+    /// of 2 073 600 (0.07–0.13%), so this is a mouse-pointer-sized patch instead
+    /// of a second 8.3 MB frame — and the second output, where the cursor is not,
+    /// costs nothing at all.
+    #[test]
+    fn the_cursor_frame_is_stored_as_a_patch_on_the_frozen_one() {
+        let info = OutputInfo {
+            global_name: 1,
+            logical: LogicalRect { x: 0, y: 0, width: 8, height: 4 },
+            scale: 1,
+        };
+        let base = frozen_test_output(info, 8, 4, [10, 10, 10, 255]);
+        let mut cursor = frozen_test_output(info, 8, 4, [10, 10, 10, 255]);
+        // A 2x2 cursor at (3,1), which is all the two captures differ by.
+        for y in 1..3 {
+            for x in 3..5 {
+                let offset = (y * 8 + x) * 4;
+                cursor.data[offset..offset + 4].copy_from_slice(&[200, 200, 200, 255]);
+            }
+        }
+
+        let delta = CursorDelta::between(&base, &cursor);
+        assert_eq!(delta.bounds, Some((3, 1, 2, 2)));
+        assert_eq!(delta.rows.len(), 2, "only the two cursor rows carry a patch");
+        assert!(
+            delta.bytes <= 4 * std::mem::size_of::<(u32, [u8; 4])>(),
+            "the patch is the cursor's pixels, got {} bytes",
+            delta.bytes
+        );
+
+        // Drawing with the patch reproduces the with-cursor frame exactly…
+        let base_pixels = base.data.clone();
+        let with_patch = FrozenOutput {
+            cursor_delta: delta,
+            ..base
+        };
+        for y in 0..4 {
+            for x in 0..8 {
+                assert_eq!(
+                    frozen_pixel(&with_patch, 8, 4, x, y, true),
+                    frozen_base_pixel(&cursor, 8, 4, x, y),
+                    "with-cursor pixel ({x},{y})"
+                );
+                // …and without it, the frame the session stored.
+                let offset = (y * 8 + x) as usize * 4;
+                let stored = &base_pixels[offset..offset + 4];
+                assert_eq!(
+                    frozen_pixel(&with_patch, 8, 4, x, y, false),
+                    [stored[0], stored[1], stored[2], stored[3]],
+                    "without-cursor pixel ({x},{y})"
+                );
+            }
+        }
+    }
+
+    /// A pair that does not share a geometry records no patch at all.
+    ///
+    /// The overlay then keeps showing the base frame, which is what the user
+    /// selected minus the cursor. Showing a mis-mapped patch would put garbage
+    /// on screen; a missing cursor is not a wrong capture.
+    #[test]
+    fn a_cursor_patch_needs_a_matching_geometry() {
+        let info = OutputInfo {
+            global_name: 1,
+            logical: LogicalRect { x: 0, y: 0, width: 4, height: 4 },
+            scale: 1,
+        };
+        let base = frozen_test_output(info, 4, 4, [10, 10, 10, 255]);
+        let other = frozen_test_output(info, 2, 2, [90, 90, 90, 255]);
+        let delta = CursorDelta::between(&base, &other);
+        assert!(delta.is_empty());
+        assert_eq!(delta.bounds, None);
+        assert_eq!(delta.bytes, 0);
+        // Reading through an empty patch is the base frame, not a panic.
+        let with_patch = FrozenOutput {
+            cursor_delta: delta,
+            ..base
+        };
+        let _ = &with_patch;
+        assert_eq!(frozen_pixel(&with_patch, 4, 4, 1, 1, true), [10, 10, 10, 255]);
+    }
+
+    /// The frame handed to the PNG compositor is the one that was displayed.
+    ///
+    /// The session stores the without-cursor capture plus a patch, so the
+    /// with-cursor frame has to be materialised at the end — once, not held.
+    #[test]
+    fn the_capture_handed_to_the_compositor_matches_what_was_shown() {
+        let info = OutputInfo {
+            global_name: 7,
+            logical: LogicalRect { x: 0, y: 0, width: 4, height: 2 },
+            scale: 1,
+        };
+        let base = frozen_test_output(info, 4, 2, [10, 10, 10, 255]);
+        let mut cursor = frozen_test_output(info, 4, 2, [10, 10, 10, 255]);
+        // One cursor pixel at (2,1).
+        cursor.data[(1 * 4 + 2) * 4..(1 * 4 + 2) * 4 + 4].copy_from_slice(&[250, 0, 0, 255]);
+        let delta = CursorDelta::between(&base, &cursor);
+        assert_eq!(delta.bounds, Some((2, 1, 1, 1)));
+        let stored = FrozenOutput { cursor_delta: delta, ..base };
+
+        // Without the cursor: the stored frame, byte for byte.
+        let without = stored.to_image(false);
+        assert_eq!((without.width, without.height, without.stride), (4, 2, 16));
+        assert_eq!(without.data, stored.data);
+        // With the cursor: the patch applied, and only there.
+        let with = stored.to_image(true);
+        assert_eq!(
+            &with.data[(1 * 4 + 2) * 4..(1 * 4 + 2) * 4 + 4],
+            &[250, 0, 0, 255]
+        );
+        assert_eq!(&with.data[0..4], &[10, 10, 10, 255]);
+        assert_eq!(with.data.len(), stored.data.len());
     }
 
     #[test]
@@ -3712,7 +4070,7 @@ mod tests {
         let mut frozen = frozen_test_output(output_info, 4, 4, [0, 0, 0, 255]);
         frozen.data[(2 * frozen.stride + 2 * 4) as usize..(2 * frozen.stride + 3 * 4) as usize].copy_from_slice(&[11, 22, 33, 255]);
 
-        assert_eq!(frozen_pixel(&frozen, 2, 2, 1, 1), [11, 22, 33, 255]);
+        assert_eq!(frozen_pixel(&frozen, 2, 2, 1, 1, false), [11, 22, 33, 255]);
     }
 
     fn pixel_at(data: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
@@ -3725,6 +4083,13 @@ mod tests {
         for _ in 0..width * height {
             data.extend_from_slice(&pixel);
         }
-        FrozenOutput { info, width, height, stride: width * 4, data }
+        FrozenOutput {
+            info,
+            width,
+            height,
+            stride: width * 4,
+            data,
+            cursor_delta: CursorDelta::EMPTY,
+        }
     }
 }
