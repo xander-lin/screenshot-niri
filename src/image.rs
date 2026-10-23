@@ -13,6 +13,13 @@ pub struct Image {
     pub height: u32,
     pub stride: u32,
     pub format: Format,
+    /// Pixel bytes.
+    ///
+    /// May be *longer* than `stride * height`: the preview path recycles a
+    /// buffer across frames, and the allocation is a high-water mark so a
+    /// window that shrinks does not have to reallocate. Readers must bound
+    /// themselves by `stride * height`, which is what every one of them
+    /// already does; nothing may assume the two lengths are equal.
     pub data: Vec<u8>,
 }
 

@@ -2,6 +2,11 @@
 name = "screenshot-rs-rebuild"
 version = "0.1.0"
 edition = "2021"
+# Arch ships a rolling toolchain and releases are prebuilt binaries, so there is
+# no reason to hold back on the standard library. 1.88 is what `as_chunks` needs;
+# `is_none_or` and `repeat_n` (1.82) were already in use before it was declared,
+# which is why this is now enforced here rather than only stated in the README.
+rust-version = "1.88"
 
 [[bin]]
 name = "screenshot"
@@ -18,8 +23,12 @@ stitch-legacy = []
 
 [dependencies]
 libc = "0.2"
-lz4_flex = { version = "0.11", default-features = false }
-png = "0.17"
+# `default-features = false` keeps the frame and dictionary machinery out, which
+# this does not use. The rest is named explicitly because 0.14 moved what used to
+# be unconditional behind features: `block::compress` needs `alloc` (which only
+# `std` pulls in), and both codecs need their `safe-*` gate.
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
+png = "0.18"
 tempfile = "3"
 wayland-client = { version = "0.31", default-features = false }
 wayland-protocols = { version = "0.32", default-features = false, features = ["client", "unstable", "staging"] }

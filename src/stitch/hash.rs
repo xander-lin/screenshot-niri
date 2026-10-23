@@ -413,9 +413,9 @@ mod tests {
     }
 
     fn read_png_as_rgb_frame(path: &Path) -> Result<RgbFrame, Box<dyn Error>> {
-        let decoder = png::Decoder::new(fs::File::open(path)?);
+        let decoder = png::Decoder::new(std::io::BufReader::new(fs::File::open(path)?));
         let mut reader = decoder.read_info()?;
-        let mut buf = vec![0; reader.output_buffer_size()];
+        let mut buf = vec![0; reader.output_buffer_size().ok_or("PNG reports no output size")?];
         let info = reader.next_frame(&mut buf)?;
 
         let (width, height) = (info.width, info.height);

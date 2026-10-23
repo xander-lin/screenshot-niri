@@ -274,6 +274,10 @@ fn run_long_capture(
     let mut capture_finished = false;
     let mut capture_error = None;
     let mut prev_raw: Option<(CaptureOutputRegion, crate::image::Image)> = None;
+    // Allocation for the next preview image. The overlay window is the same
+    // size on almost every frame, so this makes the 8.3 MB (1080p) preview
+    // buffer a one-time cost instead of a per-frame allocation.
+    let mut preview_buffer: Vec<u8> = Vec::new();
     // Live selection state followed from edit-mode edge drags.
     let mut live_rect = viewport.rect;
 
@@ -396,7 +400,12 @@ fn run_long_capture(
                             current_frame.height,
                             live_rect,
                         );
-                        if let Ok(image) = crate::stitch::image_from_stitched_window(s, window) {
+                        let recycled = std::mem::take(&mut preview_buffer);
+                        if let Ok(image) = crate::stitch::image_from_stitched_window_reusing(
+                            s,
+                            window,
+                            recycled,
+                        ) {
                             // Map the preview through the frame's own capture
                             // region (the inset rectangle the stitched content
                             // actually came from), not the un-inset selection

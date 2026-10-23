@@ -152,4 +152,4 @@ cargo build --release
 # binary: target/release/screenshot
 ```
 
-Requires Rust 1.80+.
+Requires Rust 1.88+ (declared as `rust-version` in `Cargo.toml`).

@@ -54,15 +54,19 @@ use placement::{canvas_search_axis, find_canvas_placement_match};
 // in a `stitch-legacy` one, where `new_placement_engine` returns `LegacyPipeline`
 // instead.
 #[cfg_attr(feature = "stitch-legacy", allow(unused_imports))]
-use engine::{EngineDecision, PlacementEngine, PlacementRequest, WindowedEdgeMatcher};
+use engine::{CanvasRegion, EngineDecision, PlacementEngine, PlacementRequest, WindowedEdgeMatcher};
 use rgb::{
     average_difference_same_source, average_luminance_difference_source, crop_rgb_frame,
     luminance_range_source,
-    pixel_difference_source, pixel_offset, rgb_frame_from_source, validate_rgb_frame,
+    pixel_difference_source, pixel_offset, rgb_frame_from_source,
+    rgb_frame_from_source_reusing, validate_rgb_frame,
     validate_rgb_source, CroppedRgbSource,
 };
 
-pub use canvas::{image_from_stitched_frame, image_from_stitched_window, CanvasWindow};
+pub use canvas::{
+    image_from_stitched_frame, image_from_stitched_window_reusing, CanvasWindow,
+};
+use canvas::crop_rgb_frame_if_needed;
 #[allow(unused_imports)]
 pub use hash::{
     estimate_vertical_fuzzy_hash_motion, estimate_vertical_lazy_fuzzy_hash_motion,
@@ -439,6 +443,15 @@ pub struct RawStitcher {
     viewport_rect: Option<ViewportRect>,
     active_crop: Option<ComposeCrop>,
     previous_compose_frame: Option<RgbFrame>,
+    /// Allocation handed back by the frame that `previous_compose_frame` just
+    /// replaced, waiting to be filled with the next one.
+    ///
+    /// The stitcher keeps exactly two compose frames alive — the current and the
+    /// previous — so this makes that pair cycle instead of allocating 6.2 MB per
+    /// push (1080p) and re-faulting every page of it. It is deliberately *not*
+    /// `previous_compose_frame`: a refused frame must leave the reference state
+    /// untouched, so the buffer has to be recoverable without consuming it.
+    spare_compose_buffer: Vec<u8>,
     previous_perceptual_frame: Option<PerceptualFrame>,
     previous_perceptual_delta: Option<Option<i32>>,
     #[cfg_attr(not(feature = "trace-logs"), allow(dead_code))]
@@ -477,12 +490,30 @@ pub struct RawStitcher {
 }
 
 impl RawStitcher {
+    /// Whether anything in this build will read a `PerceptualFrame`.
+    ///
+    /// The luminance image is 4 bytes per pixel — 8.3 MB on a 1080p frame — and
+    /// it is rebuilt for every pushed frame. Two things read it: the legacy
+    /// pipeline's perceptual stage (`stitch-legacy`) and the deep-profile
+    /// trace. The shipped windowed-edge matcher reads its boundary descriptor
+    /// instead, so in a default build the frame was built and dropped unread:
+    /// measured at 18.7% of a 1080p frame's CPU and 8.3 MB of its allocation.
+    fn perceptual_frame_needed() -> bool {
+        cfg!(any(test, feature = "stitch-legacy")) || crate::trace::trace_deep_profile_enabled()
+    }
+
+    /// The perceptual frame for this push, or `None` when nothing reads it.
+    fn perceptual_frame_for(analysis_frame: &impl RgbSource) -> Option<PerceptualFrame> {
+        Self::perceptual_frame_needed().then(|| PerceptualFrame::from_source(analysis_frame))
+    }
+
     pub fn new() -> Self {
         Self {
             stitched: None,
             viewport_rect: None,
             active_crop: None,
             previous_compose_frame: None,
+            spare_compose_buffer: Vec::new(),
             previous_perceptual_frame: None,
             previous_perceptual_delta: None,
             previous_fixed_bands_trace: None,
@@ -642,7 +673,7 @@ impl RawStitcher {
         self.active_crop = Some(new_crop);
         self.fixed_detector = FixedBandDetector::default();
         self.previous_compose_frame = Some(frame);
-        self.previous_perceptual_frame = Some(PerceptualFrame::from_source(analysis_frame));
+        self.previous_perceptual_frame = Self::perceptual_frame_for(analysis_frame);
         self.previous_perceptual_delta = None;
         // A geometry change is a *known* step, not a matched one: the box moved
         // by exactly `delta`, so the content moved with it. Recording it keeps
@@ -719,7 +750,7 @@ impl RawStitcher {
             self.engine
                 .commit(viewport_rect, 0, &CroppedRgbSource::new(&compose_frame, active_crop)?);
             self.previous_compose_frame = Some(compose_frame);
-            self.previous_perceptual_frame = Some(PerceptualFrame::from_source(analysis_frame));
+            self.previous_perceptual_frame = Self::perceptual_frame_for(analysis_frame);
             self.last_profile_breakdown.path = Some(StitchDecisionPath::Initialized);
             return Ok(PushResult::Initialized);
         }
@@ -728,10 +759,19 @@ impl RawStitcher {
         let active_compose = CroppedRgbSource::new(compose_frame, active_crop)?;
 
         let previous_rect = self.viewport_rect.ok_or("missing viewport rect")?;
-        let previous = extract_stitched_region(
-            self.stitched.as_ref().ok_or("missing stitched frame")?,
-            previous_rect,
-        )?;
+        // The near-duplicate check samples every fourth pixel in both axes, so
+        // it does not need the previous viewport as a buffer: reading the canvas
+        // through a view costs the samples and nothing else. Materialising the
+        // region cost a 6.2 MB allocation and copy per push on 1080p — the
+        // largest remaining per-frame allocation.
+        let stitched = self.stitched.as_ref().ok_or("missing stitched frame")?;
+        let previous = CanvasRegion::new(
+            stitched,
+            u32::try_from(previous_rect.x)?,
+            u32::try_from(previous_rect.y)?,
+            previous_rect.width,
+            previous_rect.height,
+        );
         let duplicate_started_at = profile_enabled.then(Instant::now);
         let duplicate_difference = average_difference_same_source(&previous, &active_compose);
         if let Some(started_at) = duplicate_started_at {
@@ -766,8 +806,17 @@ impl RawStitcher {
             LongDirection::Left => SearchDirection::Left,
         });
 
-        let compose_frame = rgb_frame_from_source(compose_frame)?;
-        let active_compose_frame = crop_rgb_frame(&compose_frame, active_crop)?;
+        // Recycle the buffer of the frame we are about to replace. The stitcher
+        // keeps exactly two frames alive, so this makes the pair of 6.2 MB
+        // allocations cycle instead of being freed and re-faulted every push.
+        let recycled = std::mem::take(&mut self.spare_compose_buffer);
+        let compose_frame = rgb_frame_from_source_reusing(compose_frame, recycled)?;
+        // The active crop is the whole frame in the shipped configuration (the
+        // fixed-band detector is trace-only, so its top/bottom are zero), and
+        // copying a whole 1080p frame to obtain an identical one cost 6.2 MB of
+        // allocation per push. Crop only when the crop is not the whole frame.
+        let cropped_compose = crop_rgb_frame_if_needed(&compose_frame, active_crop)?;
+        let active_compose_frame: &RgbFrame = cropped_compose.as_ref().unwrap_or(&compose_frame);
 
         // The impulse decides which axis is asked first.
         //
@@ -863,14 +912,14 @@ impl RawStitcher {
         };
 
         if let Some(recovery) =
-            self.find_dirty_overlap_recovery(previous_rect, &active_compose_frame, match_info)
+            self.find_dirty_overlap_recovery(previous_rect, active_compose_frame, match_info)
         {
             let append_started_at = profile_enabled.then(Instant::now);
             let stitched = self.stitched.as_mut().ok_or("missing stitched frame")?;
             let new_rect = append_frame_at_position_overwriting_overlap_rows(
                 stitched,
                 previous_rect,
-                &active_compose_frame,
+                active_compose_frame,
                 recovery.match_info,
                 recovery.overwrite_frame_y,
                 recovery.overwrite_rows,
@@ -878,6 +927,12 @@ impl RawStitcher {
             if let Some(started_at) = append_started_at {
                 self.last_profile_breakdown.append_frame += started_at.elapsed();
             }
+            // The engine commit runs first: `active_compose_frame` may borrow
+            // `compose_frame`, which `commit_accepted` takes ownership of.
+            self.last_engine_top = Some(candidate_rect.y);
+            self.canvas_origin = candidate_rect.y - new_rect.y;
+            self.engine
+                .commit(new_rect, candidate_rect.y, active_compose_frame);
             self.commit_accepted(
                 new_rect,
                 compose_frame,
@@ -886,10 +941,6 @@ impl RawStitcher {
                 None,
                 recovery.match_info.direction,
             );
-            self.last_engine_top = Some(candidate_rect.y);
-            self.canvas_origin = candidate_rect.y - new_rect.y;
-            self.engine
-                .commit(new_rect, candidate_rect.y, &active_compose_frame);
             return Ok(PushResult::Accepted {
                 match_info: recovery.match_info,
             });
@@ -897,19 +948,11 @@ impl RawStitcher {
 
         if self.try_apply_match(
             previous_rect,
-            &active_compose_frame,
+            active_compose_frame,
             match_info,
             profile_enabled,
         )? {
             let applied = self.viewport_rect.ok_or("missing viewport rect after apply")?;
-            self.commit_accepted(
-                applied,
-                compose_frame,
-                analysis_frame,
-                Some(StitchDecisionPath::CanvasAccepted),
-                None,
-                match_info.direction,
-            );
             if horizontal {
                 // The engine's canvas is one column of rows: every row's
                 // descriptor was built from whichever column happened to
@@ -922,23 +965,33 @@ impl RawStitcher {
                 self.engine.reset();
                 self.last_engine_top = Some(applied.y);
                 self.canvas_origin = 0;
-                self.engine.commit(applied, applied.y, &active_compose_frame);
+                self.engine.commit(applied, applied.y, active_compose_frame);
             } else {
                 self.last_engine_top = Some(candidate_rect.y);
                 self.canvas_origin = candidate_rect.y - applied.y;
                 self.engine
-                    .commit(applied, candidate_rect.y, &active_compose_frame);
+                    .commit(applied, candidate_rect.y, active_compose_frame);
             }
+            // After the engine commit: `active_compose_frame` may borrow
+            // `compose_frame`, which `commit_accepted` takes ownership of.
+            self.commit_accepted(
+                applied,
+                compose_frame,
+                analysis_frame,
+                Some(StitchDecisionPath::CanvasAccepted),
+                None,
+                match_info.direction,
+            );
             return Ok(PushResult::Accepted { match_info });
         }
 
-        if let Some(recovery) = self.find_nomatch_recovery(previous_rect, &active_compose_frame) {
+        if let Some(recovery) = self.find_nomatch_recovery(previous_rect, active_compose_frame) {
             let append_started_at = profile_enabled.then(Instant::now);
             let stitched = self.stitched.as_mut().ok_or("missing stitched frame")?;
             let new_rect = append_frame_at_position_overwriting_overlap_rows(
                 stitched,
                 previous_rect,
-                &active_compose_frame,
+                active_compose_frame,
                 recovery.match_info,
                 recovery.overwrite_frame_y,
                 recovery.overwrite_rows,
@@ -946,6 +999,12 @@ impl RawStitcher {
             if let Some(started_at) = append_started_at {
                 self.last_profile_breakdown.append_frame += started_at.elapsed();
             }
+            // The engine commit runs first: `active_compose_frame` may borrow
+            // `compose_frame`, which `commit_accepted` takes ownership of.
+            self.last_engine_top = Some(candidate_rect.y);
+            self.canvas_origin = candidate_rect.y - new_rect.y;
+            self.engine
+                .commit(new_rect, candidate_rect.y, active_compose_frame);
             self.commit_accepted(
                 new_rect,
                 compose_frame,
@@ -954,10 +1013,6 @@ impl RawStitcher {
                 None,
                 recovery.match_info.direction,
             );
-            self.last_engine_top = Some(candidate_rect.y);
-            self.canvas_origin = candidate_rect.y - new_rect.y;
-            self.engine
-                .commit(new_rect, candidate_rect.y, &active_compose_frame);
             return Ok(PushResult::Accepted {
                 match_info: recovery.match_info,
             });
@@ -1137,8 +1192,10 @@ impl RawStitcher {
         direction: AppendDirection,
     ) {
         self.viewport_rect = Some(new_rect);
-        self.previous_perceptual_frame = Some(PerceptualFrame::from_source(analysis_frame));
-        self.previous_compose_frame = Some(compose_frame);
+        self.previous_perceptual_frame = Self::perceptual_frame_for(analysis_frame);
+        if let Some(replaced) = self.previous_compose_frame.replace(compose_frame) {
+            self.spare_compose_buffer = replaced.data;
+        }
         self.last_profile_breakdown.path = path;
         self.last_fast_motion_trace = fast_motion_trace;
         self.accepted_direction.record(direction);

@@ -1116,10 +1116,10 @@ fn write_descriptor_dump(
 
 fn load_image(path: &Path) -> Result<Image, Box<dyn Error>> {
     let file = std::fs::File::open(path)?;
-    let mut decoder = png::Decoder::new(file);
+    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
     decoder.set_transformations(png::Transformations::EXPAND);
     let mut reader = decoder.read_info()?;
-    let mut buf = vec![0; reader.output_buffer_size()];
+    let mut buf = vec![0; reader.output_buffer_size().ok_or("PNG reports no output size")?];
     let info = reader.next_frame(&mut buf)?;
     let (width, height) = (info.width, info.height);
     let color = info.color_type;

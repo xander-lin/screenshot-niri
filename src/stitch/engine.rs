@@ -176,6 +176,28 @@ impl EdgeLadder {
         }
     }
 
+    /// Reads one line across the axis into packed RGB.
+    ///
+    /// A vertical scroll compares rows, so a line is a row; a horizontal one
+    /// compares columns, so a line is a column and is gathered pixel by pixel.
+    /// The column case stays per-pixel on purpose: gathering a column through a
+    /// row-oriented buffer would read `across` rows to build one line, which is
+    /// more traffic than it saves. Horizontal placements are rare by
+    /// construction (the matcher is built on demand for them), so the common
+    /// path is the one that matters.
+    fn read_across_on(frame: &dyn RgbSource, axis: SearchAxis, position: u32, out: &mut [u8]) {
+        let (_, across) = Self::extent_on(frame, axis);
+        match axis {
+            SearchAxis::Vertical => frame.row_rgb_into(0, position, across, out),
+            SearchAxis::Horizontal => {
+                for a in 0..across as usize {
+                    let pixel = Self::pixel_on(frame, axis, position, a as u32);
+                    out[a * 3..a * 3 + 3].copy_from_slice(&pixel);
+                }
+            }
+        }
+    }
+
     fn extent_on(frame: &dyn RgbSource, axis: SearchAxis) -> (u32, u32) {
         match axis {
             SearchAxis::Vertical => (frame.height(), frame.width()),
@@ -262,18 +284,26 @@ impl EdgeLadder {
         let bins_usize = bins as usize;
 
         // Per-position, per-bin luminance means.
+        //
+        // One row is read at a time into `row`, then the bins are summed from
+        // that buffer. Reading a pixel at a time through the trait cost a
+        // virtual call, a bounds check and a strided access per pixel — 14.6% of
+        // a 1080p frame — to add one luminance to an accumulator.
         let mut means = vec![0f32; along as usize * bins_usize];
+        let mut row = vec![0u8; across as usize * 3];
         for position in 0..along {
+            Self::read_across_on(frame, axis, position, &mut row);
             for b in 0..bins {
                 let a0 = body_start + b * bin_width;
                 let a1 = if b + 1 == bins { body_end } else { a0 + bin_width };
                 let mut sum = 0u32;
-                let mut count = 0u32;
                 for a in a0..a1 {
-                    let [r, g, bl] = Self::pixel_on(frame, axis, position, a);
-                    sum += 77 * u32::from(r) + 150 * u32::from(g) + 29 * u32::from(bl);
-                    count += 1;
+                    let pixel = a as usize * 3;
+                    sum += 77 * u32::from(row[pixel])
+                        + 150 * u32::from(row[pixel + 1])
+                        + 29 * u32::from(row[pixel + 2]);
                 }
+                let count = a1 - a0;
                 let mean = if count == 0 { 0.0 } else { (sum >> 8) as f32 / count as f32 };
                 means[position as usize * bins_usize + b as usize] = mean;
             }
@@ -707,7 +737,7 @@ pub(super) struct CanvasRegion<'a> {
 }
 
 impl<'a> CanvasRegion<'a> {
-    fn new(canvas: &'a StitchedFrame, x: u32, y: u32, width: u32, height: u32) -> Self {
+    pub(super) fn new(canvas: &'a StitchedFrame, x: u32, y: u32, width: u32, height: u32) -> Self {
         Self {
             canvas,
             x,

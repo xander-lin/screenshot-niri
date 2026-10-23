@@ -4,7 +4,7 @@ use wayland_client::protocol::wl_shm::Format;
 
 use crate::image::Image;
 
-use super::rgb::{validate_rgb_frame, RgbSource};
+use super::rgb::{crop_rgb_frame, validate_rgb_frame, RgbSource};
 use super::store::CanvasStore;
 use super::{
     ComposeCrop, FixedBands, FrameMatch, RgbFrame, RowCoverage, StitchedFrame, ViewportRect,
@@ -153,13 +153,22 @@ impl CanvasWindow {
 }
 
 pub fn image_from_stitched_frame(frame: &StitchedFrame) -> Result<Image, Box<dyn Error>> {
-    image_from_stitched_window(frame, CanvasWindow::full(frame))
+    image_from_stitched_window_reusing(frame, CanvasWindow::full(frame), Vec::new())
 }
 
 /// One region of the canvas, as RGBA.
-pub fn image_from_stitched_window(
+///
+/// Reuses `buffer`'s allocation when it is large enough.
+///
+/// The overlay asks for one window per accepted frame and the window is almost
+/// always the same size, so a caller that keeps the previous image's buffer
+/// turns an 8.3 MB allocation (1080p) into a no-op after the first frame. The
+/// fresh pages were also the largest remaining source of page faults in a long
+/// capture.
+pub fn image_from_stitched_window_reusing(
     frame: &StitchedFrame,
     window: CanvasWindow,
+    mut buffer: Vec<u8>,
 ) -> Result<Image, Box<dyn Error>> {
     if window.width == 0 || window.height == 0 {
         return Err("empty canvas window".into());
@@ -176,7 +185,15 @@ pub fn image_from_stitched_window(
     let size = (stride as usize)
         .checked_mul(window.height as usize)
         .ok_or("output image size overflow")?;
-    let mut data = vec![0; size];
+    // The caller's buffer is a high-water mark, not an exact fit: the overlay's
+    // window grows as the canvas grows and shrinks when a selection-box edit
+    // narrows it, and reallocating on every change would defeat the point.
+    // Only the first `size` bytes are used; the rest stays allocated for the
+    // next frame.
+    if buffer.len() < size {
+        buffer.resize(size, 0);
+    }
+    let mut data = buffer;
     // One row at a time: a per-pixel accessor would put a borrow check and a
     // working-set lookup on every one of them (measured: 3× the cost of the
     // whole rest of the frame).
@@ -188,15 +205,44 @@ pub fn image_from_stitched_window(
         let have_row = frame
             .store
             .row_into(window.x as u32, canvas_y as i32, &mut source);
+        if !have_row {
+            // Nothing was ever written here; the row stays transparent.
+            continue;
+        }
+        // Coverage is decided per row, not per pixel. The common canvas is
+        // rectangular and every row is `Full`, so this branch settles the whole
+        // row at once instead of asking `contains` 1920 times — the per-pixel
+        // form was 18% of a 1080p frame's cost.
+        let first = window.x as u32;
+        let last = first + window.width;
+        let whole_row = match covered {
+            None | Some(RowCoverage::Full) => true,
+            Some(RowCoverage::Empty) => false,
+            Some(RowCoverage::Spans(_)) => covered.is_some_and(|row| row.covers(first, last)),
+        };
+        if whole_row {
+            // Whole row visible: one pass, channel-swapped and opaque.
+            for (source_pixel, destination) in source
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .zip(data[dst_row..dst_row + stride as usize].as_chunks_mut::<4>().0.iter_mut())
+            {
+                destination[0] = source_pixel[2];
+                destination[1] = source_pixel[1];
+                destination[2] = source_pixel[0];
+                destination[3] = 255;
+            }
+            continue;
+        }
+        // Ragged row (T/L/arch shapes): only the captured extents are opaque,
+        // so the gaps stay transparent rather than being filled with black.
         for column in 0..window.width {
-            let dst = dst_row + column as usize * 4;
-            // No per-row map at all: the canvas is rectangular.
-            let filled = covered.is_none_or(|row| row.contains(window.x as u32 + column));
-            if !filled || !have_row {
-                // Never captured: keep RGB zeroed and fully transparent so the
-                // ragged corners of T/L/arch-shaped stitches stay see-through.
+            let filled = covered.is_none_or(|row| row.contains(first + column));
+            if !filled {
                 continue;
             }
+            let dst = dst_row + column as usize * 4;
             let src = column as usize * 3;
             data[dst] = source[src + 2];
             data[dst + 1] = source[src + 1];
@@ -211,6 +257,22 @@ pub fn image_from_stitched_window(
         format: Format::Argb8888,
         data,
     })
+}
+
+/// `crop_rgb_frame` unless the crop is the whole frame, in which case the
+/// caller can keep borrowing the original.
+///
+/// The shipped fixed-band detector never crops (it is trace-only, so its
+/// `top`/`bottom` stay zero), which made the unconditional copy a full-frame
+/// duplicate: 6.2 MB of allocation and a memcpy per push on 1080p.
+pub(super) fn crop_rgb_frame_if_needed(
+    frame: &RgbFrame,
+    crop: ComposeCrop,
+) -> Result<Option<RgbFrame>, Box<dyn Error>> {
+    if crop.x == 0 && crop.y == 0 && crop.width == frame.width && crop.height == frame.height {
+        return Ok(None);
+    }
+    crop_rgb_frame(frame, crop).map(Some)
 }
 
 pub(super) fn append_frame_at_position(
