@@ -368,7 +368,25 @@ fn run_long_capture(
                 }
                 if matches!(outcome, PushResult::Initialized | PushResult::Accepted { .. }) {
                     if let Some(s) = stitcher.stitched() {
-                        if let Ok(image) = crate::stitch::image_from_stitched_frame(s) {
+                        // Only the part of the canvas the overlay can reach.
+                        //
+                        // The overlay samples the screen through the capture's
+                        // own density, so at most one output's worth of canvas
+                        // is visible: the selection box plus the rows around it
+                        // that the box has already scrolled past. Handing it the
+                        // whole canvas meant a full RGBA copy of the entire
+                        // capture on every accepted frame — 22 MB on `real-1`,
+                        // 45 MB on `real-long` — of which the overlay read one
+                        // screenful.
+                        let window = preview_window(
+                            s,
+                            s.current_origin_x,
+                            s.current_origin_y,
+                            current_frame.width,
+                            current_frame.height,
+                            live_rect,
+                        );
+                        if let Ok(image) = crate::stitch::image_from_stitched_window(s, window) {
                             // Map the preview through the frame's own capture
                             // region (the inset rectangle the stitched content
                             // actually came from), not the un-inset selection
@@ -386,8 +404,8 @@ fn run_long_capture(
                             );
                             let snapshot = crate::wayland::selection::LongPreviewSnapshot {
                                 image,
-                                current_origin_x: s.current_origin_x,
-                                current_origin_y: s.current_origin_y,
+                                current_origin_x: s.current_origin_x - window.x,
+                                current_origin_y: s.current_origin_y - window.y,
                                 viewport_rect: preview_viewport,
                                 capture_width: capture_width.max(1),
                                 capture_height: capture_height.max(1),
@@ -465,6 +483,37 @@ fn run_long_capture(
     crate::clipboard::serve_path_detached(&args.output_path, args.clipboard_mode)?;
     println!("saved {}", args.output_path.display());
     Ok(())
+}
+
+/// The canvas region the overlay can display, as a [`CanvasWindow`].
+///
+/// The overlay maps its own buffer onto the canvas through the capture's
+/// density, so the canvas pixels it can reach are the selection's own rectangle
+/// plus the screen area around it — everything the box has scrolled past and
+/// that is still on screen, up to one output's worth of canvas in each
+/// direction. Anything beyond that is not addressable from the overlay at all.
+///
+/// The window is generous by one viewport on every side: the mapping also draws
+/// the canvas rows *above* the box (that is the point of the live preview), and
+/// a selection-box edit can move the box while a frame is in flight.
+fn preview_window(
+    canvas: &crate::stitch::StitchedFrame,
+    origin_x: i32,
+    origin_y: i32,
+    capture_width: u32,
+    capture_height: u32,
+    live_rect: crate::geometry::LogicalRect,
+) -> crate::stitch::CanvasWindow {
+    let reach_x = capture_width.max(live_rect.width.max(0) as u32) as i32;
+    let reach_y = capture_height.max(live_rect.height.max(0) as u32) as i32;
+    crate::stitch::CanvasWindow::clipped(
+        canvas,
+        origin_x - reach_x,
+        origin_y - reach_y,
+        reach_x.saturating_mul(3),
+        reach_y.saturating_mul(3),
+    )
+    .unwrap_or_else(|| crate::stitch::CanvasWindow::full(canvas))
 }
 
 /// Convert logical screen offsets into the returned frame's pixel space.

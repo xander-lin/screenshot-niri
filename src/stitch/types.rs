@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use super::store::{CanvasMemoryReport, CanvasStore};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RgbFrame {
     pub width: u32,
@@ -122,12 +124,31 @@ impl RowCoverage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Rows per tile in the canvas store.
+///
+/// Fixed rather than per-session: the append path moves one band at a time when
+/// the canvas grows, and a band has to be a whole number of rows for a tile to
+/// hold whole rows of pixels. 64 rows is where the measured ratio flattens
+/// (5.5% lz4 at 64 rows vs 5.3% at 128 and 5.2% at 256, for twice and four times
+/// the granularity), so it is the smallest band that does not cost ratio.
+pub const CANVAS_TILE_ROWS: u32 = 64;
+
 pub struct StitchedFrame {
     pub width: u32,
     pub height: u32,
     pub stride: u32,
-    pub data: Vec<u8>,
+    /// The canvas pixels, in row bands, packed when cold.
+    ///
+    /// Deliberately not a `Vec<u8>`: a long capture keeps every pixel it has
+    /// ever stitched for the whole session (16.5 MB on `real-1`, 34.9 MB on
+    /// `real-long`), and most of it is never read again — the stitcher touches
+    /// the previous frame's rectangle, the overlay displays at most one
+    /// screenful, and everything else waits for the final PNG. Tiles that have
+    /// gone cold are packed; reading one unpacks it into a bounded working set.
+    ///
+    /// `StitchedFrame` is `!Clone` for that reason (it used to be), and every
+    /// read goes through the store's accessors.
+    pub(crate) store: CanvasStore,
     pub current_origin_x: i32,
     pub current_origin_y: i32,
     pub anchor_origin_x: i32,
@@ -141,6 +162,79 @@ pub struct StitchedFrame {
     /// An empty *outer* vector means every row is fully covered (the
     /// rectangular case, and the default for a canvas that never went ragged).
     pub row_coverage: Vec<RowCoverage>,
+}
+
+impl std::fmt::Debug for StitchedFrame {
+    /// Summarises the store rather than dumping pixels: a `Debug` print of a
+    /// 12 000-row canvas is not something anyone wants in a test failure.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let report = self.store.report();
+        f.debug_struct("StitchedFrame")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("stride", &self.stride)
+            .field("origin", &(self.anchor_origin_x, self.anchor_origin_y))
+            .field("current", &(self.current_origin_x, self.current_origin_y))
+            .field("memory", &report)
+            .field("coverage_rows", &self.row_coverage.len())
+            .finish()
+    }
+}
+
+impl StitchedFrame {
+    /// One canvas pixel, or `None` where the canvas never captured anything.
+    pub fn pixel(&self, x: u32, y: u32) -> Option<[u8; 3]> {
+        self.store.pixel(x, y as i32)
+    }
+
+    /// Copies one row's RGB bytes into `out` (`stride` bytes).
+    pub fn copy_row(&self, y: u32, out: &mut [u8]) -> bool {
+        self.store.row_into(0, y as i32, out)
+    }
+
+    /// Copies a rectangle out, row by row, into `out` at `out_stride`.
+    pub fn copy_region(
+        &self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        out: &mut [u8],
+        out_stride: u32,
+    ) -> bool {
+        self.store.region_into(x, y as i32, width, height, out, out_stride)
+    }
+
+    /// The whole canvas as packed RGB rows, in canvas order.
+    ///
+    /// For consumers that need every pixel at once — the final PNG encode, the
+    /// offline replay tool — and only there: it materialises the canvas that the
+    /// store exists to avoid materialising.
+    pub fn to_rgb_buffer(&self) -> Vec<u8> {
+        let mut out = vec![0u8; self.stride as usize * self.height as usize];
+        for y in 0..self.height {
+            let start = y as usize * self.stride as usize;
+            let end = start + self.stride as usize;
+            self.copy_row(y, &mut out[start..end]);
+        }
+        out
+    }
+
+    /// Identity of the pixel content, independent of how it is stored.
+    ///
+    /// Two frames with the same digest hold the same pixels whether one of them
+    /// has its bands packed and the other does not, which is what makes it
+    /// usable as a "nothing was written" assertion across the store.
+    pub fn pixel_digest(&self) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let _ = self.store.with_row_digest(&mut hash);
+        hash
+    }
+
+    /// What the canvas costs right now, in bytes.
+    pub fn memory_report(&self) -> CanvasMemoryReport {
+        self.store.report()
+    }
 }
 
 /// On-screen top-left offset (in capture buffer pixels) of the region a frame

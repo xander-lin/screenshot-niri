@@ -5,6 +5,7 @@ use wayland_client::protocol::wl_shm::Format;
 use crate::image::Image;
 
 use super::rgb::{validate_rgb_frame, RgbSource};
+use super::store::CanvasStore;
 use super::{
     ComposeCrop, FixedBands, FrameMatch, RgbFrame, RowCoverage, StitchedFrame, ViewportRect,
 };
@@ -28,7 +29,7 @@ impl StitchedFrame {
             width: frame.width,
             height: frame.height,
             stride: frame.width * 3,
-            data: frame.data.clone(),
+            store: first_frame_store(frame),
             current_origin_x: 0,
             current_origin_y: 0,
             anchor_origin_x: 0,
@@ -113,36 +114,98 @@ fn uncovered_spans(start: u32, end: u32, covered: &[(u32, u32)]) -> Vec<(u32, u3
     spans
 }
 
+/// The part of a canvas the overlay can actually display.
+///
+/// A live preview used to be the whole canvas as RGBA: 22 MB at the end of
+/// `real-1` and 45 MB on `real-long`, rebuilt on every accepted frame, while the
+/// overlay samples at most one screenful of it (everything outside the selection
+/// box, mapped through the capture's own density). This is that screenful.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanvasWindow {
+    /// Canvas pixel of the window's own pixel (0, 0).
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl CanvasWindow {
+    /// The whole canvas: what a caller that needs every pixel wants.
+    pub fn full(frame: &StitchedFrame) -> Self {
+        Self { x: 0, y: 0, width: frame.width, height: frame.height }
+    }
+
+    /// Clips `(x, y, width, height)` to the canvas, returning `None` when it
+    /// misses it entirely.
+    pub fn clipped(frame: &StitchedFrame, x: i32, y: i32, width: i32, height: i32) -> Option<Self> {
+        let x0 = x.max(0);
+        let y0 = y.max(0);
+        let x1 = (x.saturating_add(width)).min(frame.width as i32);
+        let y1 = (y.saturating_add(height)).min(frame.height as i32);
+        (x0 < x1 && y0 < y1).then_some(Self {
+            x: x0,
+            y: y0,
+            width: (x1 - x0) as u32,
+            height: (y1 - y0) as u32,
+        })
+    }
+}
+
 pub fn image_from_stitched_frame(frame: &StitchedFrame) -> Result<Image, Box<dyn Error>> {
+    image_from_stitched_window(frame, CanvasWindow::full(frame))
+}
+
+/// One region of the canvas, as RGBA.
+pub fn image_from_stitched_window(
+    frame: &StitchedFrame,
+    window: CanvasWindow,
+) -> Result<Image, Box<dyn Error>> {
+    if window.width == 0 || window.height == 0 {
+        return Err("empty canvas window".into());
+    }
+    if window.x < 0
+        || window.y < 0
+        || window.x as u32 + window.width > frame.width
+        || window.y as u32 + window.height > frame.height
+    {
+        return Err("canvas window exceeds the canvas".into());
+    }
     validate_stitched_frame(frame)?;
-    let stride = frame.width.checked_mul(4).ok_or("output stride overflow")?;
+    let stride = window.width.checked_mul(4).ok_or("output stride overflow")?;
     let size = (stride as usize)
-        .checked_mul(frame.height as usize)
+        .checked_mul(window.height as usize)
         .ok_or("output image size overflow")?;
     let mut data = vec![0; size];
-    for y in 0..frame.height as usize {
-        let src_row = y * frame.stride as usize;
-        let dst_row = y * stride as usize;
-        let covered = frame.row_coverage.get(y);
-        for x in 0..frame.width as usize {
-            let dst = dst_row + x * 4;
+    // One row at a time: a per-pixel accessor would put a borrow check and a
+    // working-set lookup on every one of them (measured: 3× the cost of the
+    // whole rest of the frame).
+    let mut source = vec![0u8; window.width as usize * 3];
+    for row in 0..window.height {
+        let canvas_y = window.y as u32 + row;
+        let dst_row = row as usize * stride as usize;
+        let covered = frame.row_coverage.get(canvas_y as usize);
+        let have_row = frame
+            .store
+            .row_into(window.x as u32, canvas_y as i32, &mut source);
+        for column in 0..window.width {
+            let dst = dst_row + column as usize * 4;
             // No per-row map at all: the canvas is rectangular.
-            let filled = covered.map_or(true, |row| row.contains(x as u32));
-            if !filled {
+            let filled = covered.is_none_or(|row| row.contains(window.x as u32 + column));
+            if !filled || !have_row {
                 // Never captured: keep RGB zeroed and fully transparent so the
                 // ragged corners of T/L/arch-shaped stitches stay see-through.
                 continue;
             }
-            let src = src_row + x * 3;
-            data[dst] = frame.data[src + 2];
-            data[dst + 1] = frame.data[src + 1];
-            data[dst + 2] = frame.data[src];
+            let src = column as usize * 3;
+            data[dst] = source[src + 2];
+            data[dst + 1] = source[src + 1];
+            data[dst + 2] = source[src];
             data[dst + 3] = 255;
         }
     }
     Ok(Image {
-        width: frame.width,
-        height: frame.height,
+        width: window.width,
+        height: window.height,
         stride,
         format: Format::Argb8888,
         data,
@@ -231,10 +294,6 @@ fn append_frame_at_position_with_overlap_mode(
     let output_stride = output_width
         .checked_mul(3)
         .ok_or("stitched stride overflow")?;
-    let output_size = (output_stride as usize)
-        .checked_mul(output_height as usize)
-        .ok_or("stitched size overflow")?;
-    let mut data = vec![0; output_size];
 
     let stitched_dst_x = (-min_x) as u32;
     let stitched_dst_y = (-min_y) as u32;
@@ -265,10 +324,12 @@ fn append_frame_at_position_with_overlap_mode(
         vec![RowCoverage::Empty; output_height as usize]
     };
     let mut spans: Vec<(u32, u32)> = Vec::with_capacity(4);
+    #[allow(clippy::needless_range_loop)] // `row` is also the canvas row
     for row in 0..output_height as usize {
         if vertical_only {
             break;
         }
+
         spans.clear();
         // The old row index, not the new one: the canvas may have moved down
         // (prepend) or right (selection moved left) as well as grown.
@@ -300,16 +361,34 @@ fn append_frame_at_position_with_overlap_mode(
         }
         row_coverage[row] = RowCoverage::from_spans(&spans, output_width);
     }
-    blit_rgb(
-        &stitched.data,
-        stitched.width,
-        stitched.height,
-        stitched.stride,
-        &mut data,
-        output_stride,
-        stitched_dst_x,
-        stitched_dst_y,
-    );
+
+    // The canvas now grows in place instead of being rebuilt.
+    //
+    // Growing *downward* appends bands; growing *upward* relabels the whole
+    // grid by `stitched_dst_y` rows, which moves band headers rather than
+    // pixels. A width change is the one case that cannot be done in place: the
+    // row length changes, so every band is re-cut — and that is rare (a
+    // horizontal step or a selection-box width edit), not the per-frame cost it
+    // used to be.
+    if output_width == stitched.width {
+        if stitched_dst_y > 0 {
+            stitched.store.relabel(stitched_dst_y as i32);
+        }
+        stitched.store.ensure_top(0);
+        stitched.store.ensure_bottom(output_height as i32);
+    } else {
+        reflow_store(
+            stitched,
+            output_width,
+            output_stride,
+            output_height,
+            stitched_dst_x,
+            stitched_dst_y,
+        );
+    }
+
+    // The frame's own rows, row by row, written only where the canvas has no
+    // pixels yet — or over the proven-overlap rows of a recovery.
     let overlap_rect = intersect_rects(
         stitched_dst_x,
         stitched_dst_y,
@@ -320,73 +399,75 @@ fn append_frame_at_position_with_overlap_mode(
         frame.width,
         frame.height,
     );
-    match overlap_write_mode {
-        OverlapWriteMode::Preserve | OverlapWriteMode::Rows { .. } => {
-            // Preserve captured pixels, not the entire canvas bounding box.
-            // Widening after a narrow scroll must fill previously transparent
-            // strips even though they lie inside that bounding box, and the
-            // frame is written only where the canvas has no pixels yet — which
-            // on a ragged canvas is a *set* of strips per row, not one.
-            let mut covered: Vec<(u32, u32)> = Vec::with_capacity(4);
-            for y in 0..frame.height {
-                let dst_y = frame_dst_y + y;
-                covered.clear();
-                let old_row = dst_y.checked_sub(stitched_dst_y);
-                match old_row.and_then(|row| stitched.row_coverage.get(row as usize)) {
-                    Some(existing) => existing.push_into(
+    let mut covered: Vec<(u32, u32)> = Vec::with_capacity(4);
+    let mut targets: Vec<(u32, u32)> = Vec::with_capacity(4);
+    for y in 0..frame.height {
+        let dst_y = frame_dst_y + y;
+        // Two independent reasons to write a span of this row, and a recovery
+        // frame can need both at once: the canvas has no pixels there yet, or
+        // the frame proved the pixels it has are stale.
+        covered.clear();
+        let old_row = dst_y.checked_sub(stitched_dst_y);
+        match old_row.and_then(|row| stitched.row_coverage.get(row as usize)) {
+            Some(existing) => existing.push_into(
+                &mut covered,
+                stitched_dst_x,
+                stitched.width,
+                output_width,
+            ),
+            None if stitched.row_coverage.is_empty() => {
+                // Empty map: the old canvas was rectangular, so every row it
+                // held was fully covered.
+                if old_row.is_some_and(|row| row < stitched.height) {
+                    merge_interval(
                         &mut covered,
-                        stitched_dst_x,
-                        stitched.width,
-                        output_width,
-                    ),
-                    None if stitched.row_coverage.is_empty() => {
-                        if let Some(row) = old_row {
-                            if (row as u32) < stitched.height {
-                                merge_interval(
-                                    &mut covered,
-                                    stitched_dst_x.min(output_width),
-                                    stitched_dst_x
-                                        .saturating_add(stitched.width)
-                                        .min(output_width),
-                                );
-                            }
+                        stitched_dst_x.min(output_width),
+                        stitched_dst_x
+                            .saturating_add(stitched.width)
+                            .min(output_width),
+                    );
+                }
+            }
+            None => {}
+        }
+        // Preserve captured pixels, not the entire canvas bounding box.
+        // Widening after a narrow scroll must fill previously transparent
+        // strips even though they lie inside that bounding box, and the frame
+        // is written only where the canvas has no pixels yet — which on a
+        // ragged canvas is a *set* of strips per row, not one.
+        let frame_end = frame_dst_x + frame.width;
+        targets.clear();
+        for (start, end) in uncovered_spans(frame_dst_x, frame_end, &covered) {
+            if start < end {
+                targets.push((start, end));
+            }
+        }
+        if let OverlapWriteMode::Rows { frame_y, rows } = overlap_write_mode {
+            // A recovery also rewrites the rows whose content it proved stale,
+            // inside the overlap it validated.
+            if y >= frame_y && y < frame_y.saturating_add(rows) {
+                if let Some((x0, y0, x1, y1)) = overlap_rect {
+                    if dst_y >= y0 && dst_y < y1 {
+                        let start = frame_dst_x.max(x0);
+                        let end = frame_end.min(x1);
+                        if start < end {
+                            merge_interval(&mut targets, start, end);
                         }
                     }
-                    None => {}
-                }
-                let frame_end = frame_dst_x + frame.width;
-                for (start, end) in uncovered_spans(frame_dst_x, frame_end, &covered) {
-                    if start >= end {
-                        continue;
-                    }
-                    let src = (y * frame.stride + (start - frame_dst_x) * 3) as usize;
-                    let dst = (dst_y * output_stride + start * 3) as usize;
-                    let len = ((end - start) * 3) as usize;
-                    data[dst..dst + len].copy_from_slice(&frame.data[src..src + len]);
                 }
             }
         }
-    }
-    if let OverlapWriteMode::Rows { frame_y, rows } = overlap_write_mode {
-        blit_rgb_rows_in_rect(
-            &frame.data,
-            frame.width,
-            frame.height,
-            frame.stride,
-            &mut data,
-            output_stride,
-            frame_dst_x,
-            frame_dst_y,
-            frame_y,
-            rows,
-            overlap_rect,
-        );
+        if targets.is_empty() {
+            continue;
+        }
+        stitched
+            .store
+            .write_spans(dst_y as i32, &targets, &frame.data, frame.stride, frame_dst_x, y);
     }
 
     stitched.width = output_width;
     stitched.height = output_height;
     stitched.stride = output_stride;
-    stitched.data = data;
     stitched.row_coverage = row_coverage;
     stitched.current_origin_x = frame_x - min_x;
     stitched.current_origin_y = frame_y - min_y;
@@ -400,34 +481,51 @@ fn append_frame_at_position_with_overlap_mode(
     })
 }
 
-fn blit_rgb_rows_in_rect(
-    src: &[u8],
+/// Re-cuts every band for a canvas whose *width* changed.
+///
+/// The only case the store cannot absorb in place: a tile is a run of rows at a
+/// fixed row length, so a new width means new tiles. It happens on a horizontal
+/// step and on a selection-box width edit, not on the vertical scrolls that
+/// make up almost all of a long capture.
+fn reflow_store(
+    stitched: &mut StitchedFrame,
     width: u32,
-    height: u32,
     stride: u32,
-    dst: &mut [u8],
-    dst_stride: u32,
+    height: u32,
     dst_x: u32,
     dst_y: u32,
-    start_y: u32,
-    rows: u32,
-    include: Option<(u32, u32, u32, u32)>,
 ) {
-    let Some((x0, y0, x1, y1)) = include else {
-        return;
-    };
-    let end_y = start_y.saturating_add(rows).min(height);
-    for y in start_y..end_y {
-        for x in 0..width {
-            let out_x = dst_x + x;
-            let out_y = dst_y + y;
-            if out_x < x0 || out_x >= x1 || out_y < y0 || out_y >= y1 {
-                continue;
-            }
-            let src_start = y as usize * stride as usize + x as usize * 3;
-            let dst_start = out_y as usize * dst_stride as usize + out_x as usize * 3;
-            dst[dst_start..dst_start + 3].copy_from_slice(&src[src_start..src_start + 3]);
+    let old_width = stitched.width;
+    let old_height = stitched.height;
+    let mut rows: Vec<Vec<u8>> = Vec::with_capacity(old_height as usize);
+    let mut row = vec![0u8; old_width as usize * 3];
+    for y in 0..old_height as i32 {
+        if stitched.store.row_into(0, y, &mut row) {
+            rows.push(row.clone());
+        } else {
+            rows.push(Vec::new());
         }
+    }
+    let origin = stitched.store.origin_row() + dst_y as i32;
+    let store = &mut stitched.store;
+    store.rebuild(width, stride, origin);
+    store.ensure_top(0);
+    store.ensure_bottom(height as i32);
+    for (y, bytes) in rows.iter().enumerate() {
+        if bytes.is_empty() {
+            continue;
+        }
+        // `src_x` is the canvas column the copy's own column 0 lands in: the
+        // canvas may have grown leftward, so the old rows start at `dst_x`, not
+        // at 0.
+        store.write_spans(
+            y as i32 + dst_y as i32,
+            &[(dst_x, dst_x + old_width)],
+            bytes,
+            old_width * 3,
+            dst_x,
+            0,
+        );
     }
 }
 
@@ -524,11 +622,11 @@ pub(super) fn extract_stitched_region(
         .checked_mul(rect.height as usize)
         .ok_or("viewport size overflow")?;
     let mut data = vec![0; size];
-    for row in 0..rect.height as usize {
-        let src_row = (y as usize + row) * stitched.stride as usize + x as usize * 3;
-        let dst_row = row * stride as usize;
-        data[dst_row..dst_row + stride as usize]
-            .copy_from_slice(&stitched.data[src_row..src_row + stride as usize]);
+    if !stitched
+        .store
+        .region_into(x, y as i32, rect.width, rect.height, &mut data, stride)
+    {
+        return Err("stitched canvas is missing a row the viewport covers".into());
     }
     Ok(RgbFrame {
         width: rect.width,
@@ -558,24 +656,6 @@ pub(super) fn canvas_overlap_rect(
     ))
 }
 
-fn blit_rgb(
-    src: &[u8],
-    width: u32,
-    height: u32,
-    stride: u32,
-    dst: &mut [u8],
-    dst_stride: u32,
-    dst_x: u32,
-    dst_y: u32,
-) {
-    let row_len = width as usize * 3;
-    for y in 0..height as usize {
-        let src_start = y * stride as usize;
-        let dst_start = (dst_y as usize + y) * dst_stride as usize + dst_x as usize * 3;
-        dst[dst_start..dst_start + row_len].copy_from_slice(&src[src_start..src_start + row_len]);
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn intersect_rects(
     ax: u32,
@@ -598,11 +678,32 @@ pub(super) fn validate_stitched_frame(frame: &StitchedFrame) -> Result<(), Box<d
     if frame.width == 0 || frame.height == 0 || frame.stride < frame.width.saturating_mul(3) {
         return Err("invalid stitched frame geometry".into());
     }
-    let required = (frame.stride as usize)
-        .checked_mul(frame.height as usize)
-        .ok_or("stitched frame size overflow")?;
-    if frame.data.len() < required {
-        return Err("stitched frame data too short".into());
+    if frame.store.width() != frame.width || frame.store.stride() != frame.stride {
+        return Err("stitched canvas store does not match the frame geometry".into());
+    }
+    // The store's grid is cut in whole bands and only ever grows, so it may
+    // legitimately extend past the frame's height; it must never fall short of
+    // row 0. The rows *below* the height are simply never written, which is what
+    // `is_written` reports.
+    if frame.store.grid_end_row() < frame.height as i32 {
+        return Err("stitched canvas store is shorter than the frame".into());
     }
     Ok(())
+}
+
+/// A store holding one frame, which is what a fresh canvas is.
+fn first_frame_store(frame: &RgbFrame) -> CanvasStore {
+    let frame_bytes = frame.stride as usize * frame.height as usize;
+    let mut store = CanvasStore::new(
+        frame.width,
+        frame.width * 3,
+        0,
+        CanvasStore::default_budget(frame_bytes),
+    );
+    store.ensure_bottom(frame.height as i32);
+    let spans = [(0u32, frame.width)];
+    for y in 0..frame.height {
+        store.write_spans(y as i32, &spans, &frame.data, frame.stride, 0, y);
+    }
+    store
 }

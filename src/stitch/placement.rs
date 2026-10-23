@@ -685,12 +685,10 @@ fn pixel_difference_stitched_source(
     frame_x: u32,
     frame_y: u32,
 ) -> u32 {
-    let stitched_offset = stitched_y as usize * stitched.stride as usize + stitched_x as usize * 3;
-    let a = [
-        stitched.data[stitched_offset],
-        stitched.data[stitched_offset + 1],
-        stitched.data[stitched_offset + 2],
-    ];
+    let a = stitched
+        .store
+        .pixel(stitched_x, stitched_y as i32)
+        .unwrap_or([0, 0, 0]);
     let b = frame.pixel_rgb(frame_x, frame_y);
     (i32::from(a[0]) - i32::from(b[0])).unsigned_abs()
         + (i32::from(a[1]) - i32::from(b[1])).unsigned_abs()

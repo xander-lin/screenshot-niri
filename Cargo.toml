@@ -9,12 +9,16 @@ path = "src/main.rs"
 
 [features]
 trace-logs = []
+# Keeps the canvas tiles uncompressed: the pre-compression behaviour, for A/B
+# and for measuring what the packing costs.
+canvas-raw-tiles = []
 # Keeps the previous canvas-scan matcher available for A/B comparison.
 # Removed once the windowed edge matcher is the only implementation.
 stitch-legacy = []
 
 [dependencies]
 libc = "0.2"
+lz4_flex = { version = "0.11", default-features = false }
 png = "0.17"
 tempfile = "3"
 wayland-client = { version = "0.31", default-features = false }

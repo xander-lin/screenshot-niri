@@ -873,15 +873,14 @@ struct CanvasLuma {
 
 impl CanvasLuma {
     fn new(stitched: &screenshot_rs_rebuild::stitch::StitchedFrame) -> Self {
+        let rgb = stitched.to_rgb_buffer();
         let mut data = Vec::with_capacity(stitched.width as usize * stitched.height as usize);
         for y in 0..stitched.height as usize {
             let row = y * stitched.stride as usize;
             for x in 0..stitched.width as usize {
                 let c = row + x * 3;
                 data.push(
-                    ((u32::from(stitched.data[c]) * 77
-                        + u32::from(stitched.data[c + 1]) * 150
-                        + u32::from(stitched.data[c + 2]) * 29)
+                    ((u32::from(rgb[c]) * 77 + u32::from(rgb[c + 1]) * 150 + u32::from(rgb[c + 2]) * 29)
                         >> 8) as u8,
                 );
             }
@@ -1025,15 +1024,16 @@ const BAND_MARGIN: f64 = 1.0;
 /// Converts the stitched RGB canvas into the BGRA layout `write_png` expects.
 fn rgba_from_rgb(stitched: &screenshot_rs_rebuild::stitch::StitchedFrame) -> Vec<u8> {
     let mut data = vec![255u8; stitched.width as usize * stitched.height as usize * 4];
+    let rgb = stitched.to_rgb_buffer();
     for y in 0..stitched.height as usize {
         let src_row = y * stitched.stride as usize;
         let dst_row = y * stitched.width as usize * 4;
         for x in 0..stitched.width as usize {
             let s = src_row + x * 3;
             let d = dst_row + x * 4;
-            data[d] = stitched.data[s + 2];
-            data[d + 1] = stitched.data[s + 1];
-            data[d + 2] = stitched.data[s];
+            data[d] = rgb[s + 2];
+            data[d + 1] = rgb[s + 1];
+            data[d + 2] = rgb[s];
             data[d + 3] = 255;
         }
     }

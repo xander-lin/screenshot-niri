@@ -719,15 +719,10 @@ impl RgbSource for CanvasRegion<'_> {
     }
 
     fn pixel_rgb(&self, x: u32, y: u32) -> [u8; 3] {
-        let canvas_x = self.x + x;
-        let canvas_y = self.y + y;
-        let offset =
-            canvas_y as usize * self.canvas.stride as usize + canvas_x as usize * 3;
-        [
-            self.canvas.data[offset],
-            self.canvas.data[offset + 1],
-            self.canvas.data[offset + 2],
-        ]
+        self.canvas
+            .store
+            .pixel(self.x + x, (self.y + y) as i32)
+            .unwrap_or([0, 0, 0])
     }
 }
 
@@ -1162,16 +1157,9 @@ impl WindowedEdgeMatcher {
                     }
                 }
                 let f = frame.pixel_rgb(frame_x, frame_y);
-                let so = canvas_y as usize * stitched.stride as usize
-                    + canvas_x as usize * 3;
-                if so + 2 >= stitched.data.len() {
+                let Some(c) = stitched.store.pixel(canvas_x as u32, canvas_y) else {
                     continue;
-                }
-                let c = [
-                    stitched.data[so],
-                    stitched.data[so + 1],
-                    stitched.data[so + 2],
-                ];
+                };
                 total += u64::from(f[0].abs_diff(c[0]))
                     + u64::from(f[1].abs_diff(c[1]))
                     + u64::from(f[2].abs_diff(c[2]));
@@ -2101,11 +2089,18 @@ mod tests {
         } else {
             0
         };
+        let mut store = crate::stitch::store::CanvasStore::for_tests(W, W * 3);
+        store.ensure_bottom(height as i32);
+        for row in 0..height {
+            if rows.get(row as usize).is_some_and(|content| content.is_some()) {
+                store.write_spans(row as i32, &[(0, W)], &data, W * 3, 0, row as u32);
+            }
+        }
         let stitched = StitchedFrame {
             width: W,
             height,
             stride: W * 3,
-            data,
+            store,
             current_origin_x: 0,
             current_origin_y: 0,
             anchor_origin_x: 0,
@@ -2192,8 +2187,9 @@ mod tests {
         let seeded = frame_from(0, 60);
         let committed: Vec<(i32, &RgbFrame)> = vec![(0, &seeded)];
         let req = request_on_canvas(&frame, rect, &committed);
-        let EngineDecision::Place { rect: placed, match_info } = engine.place(&req) else {
-            panic!("expected a placement for a 17-row shift");
+        let decision = engine.place(&req);
+        let EngineDecision::Place { rect: placed, match_info } = decision else {
+            panic!("expected a placement for a 17-row shift, got {decision:?}");
         };
         assert_eq!(placed.y, 17);
         assert_eq!(match_info.delta_y, 17);

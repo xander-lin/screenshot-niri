@@ -18,6 +18,7 @@ mod motion;
 mod perceptual;
 mod placement;
 mod rgb;
+mod store;
 mod types;
 
 use canvas::{
@@ -59,7 +60,7 @@ use rgb::{
     validate_rgb_source, CroppedRgbSource,
 };
 
-pub use canvas::image_from_stitched_frame;
+pub use canvas::{image_from_stitched_frame, image_from_stitched_window, CanvasWindow};
 #[allow(unused_imports)]
 pub use hash::{
     estimate_vertical_fuzzy_hash_motion, estimate_vertical_lazy_fuzzy_hash_motion,
@@ -2303,17 +2304,20 @@ fn rgb_row_average_difference(
     if width == 0 || stitched_y >= stitched.height || frame_y >= frame.height {
         return f64::MAX;
     }
+    let Some(row) = stitched.store.with_row(stitched_y as i32, |row| row.to_vec()) else {
+        return f64::MAX;
+    };
     let mut total = 0u64;
     let mut samples = 0u32;
     for x in (0..width).step_by(MATCH_LINE_SAMPLE_STEP as usize) {
-        let stitched_offset = stitched_y as usize * stitched.stride as usize + x as usize * 3;
+        let stitched_offset = x as usize * 3;
         let frame_offset = pixel_offset(frame, x, frame_y);
-        total += (i32::from(stitched.data[stitched_offset]) - i32::from(frame.data[frame_offset]))
+        total += (i32::from(row[stitched_offset]) - i32::from(frame.data[frame_offset]))
             .unsigned_abs() as u64;
-        total += (i32::from(stitched.data[stitched_offset + 1])
+        total += (i32::from(row[stitched_offset + 1])
             - i32::from(frame.data[frame_offset + 1]))
         .unsigned_abs() as u64;
-        total += (i32::from(stitched.data[stitched_offset + 2])
+        total += (i32::from(row[stitched_offset + 2])
             - i32::from(frame.data[frame_offset + 2]))
         .unsigned_abs() as u64;
         samples += 1;
@@ -2763,12 +2767,13 @@ mod tests {
     }
 
     fn stitched_pixel_rgb(frame: &StitchedFrame, x: u32, y: u32) -> [u8; 3] {
-        let offset = y as usize * frame.stride as usize + x as usize * 3;
-        [
-            frame.data[offset],
-            frame.data[offset + 1],
-            frame.data[offset + 2],
-        ]
+        frame.pixel(x, y).expect("captured pixel")
+    }
+
+    /// The canvas's pixels as one packed buffer, for comparisons that used to
+    /// read `stitched.data` directly.
+    fn stitched_rgb(frame: &StitchedFrame) -> Vec<u8> {
+        frame.to_rgb_buffer()
     }
 
     fn fixed_band_estimate(delta_y: i32) -> PerceptualMotionEstimate {
@@ -2866,7 +2871,7 @@ mod tests {
         assert_eq!(stitched.width, frame.width);
         assert_eq!(stitched.height, frame.height);
         assert_eq!(stitched.stride, frame.stride);
-        assert_eq!(stitched.data, frame.data);
+        assert_eq!(stitched_rgb(&stitched), frame.data);
         assert_eq!(stitched.current_origin_x, 0);
         assert_eq!(stitched.current_origin_y, 0);
         assert_eq!(stitched.compose_width, frame.width);
@@ -3358,14 +3363,15 @@ mod tests {
         stitcher
             .push_frame(first, Some(LongDirection::Down))
             .unwrap();
-        let before = stitcher.stitched.as_ref().unwrap().clone();
+        let before = stitcher.stitched.as_ref().unwrap().pixel_digest();
+        let before_height = stitcher.stitched.as_ref().unwrap().height;
         assert_eq!(
             push_until_refused(&mut stitcher, &stale, Some(LongDirection::Down)),
             PushResult::NoMatch
         );
         let after = stitcher.stitched.as_ref().unwrap();
-        assert_eq!(after.height, before.height, "a refused jump must not grow the canvas");
-        assert_eq!(after.data, before.data, "a refused jump must not rewrite pixels");
+        assert_eq!(after.height, before_height, "a refused jump must not grow the canvas");
+        assert_eq!(after.pixel_digest(), before, "a refused jump must not rewrite pixels");
     }
 
     fn image_from_rgb_frame(frame: &RgbFrame) -> Image {
@@ -3435,7 +3441,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(view_result, rgb_result);
-        assert_eq!(view_stitcher.finish(), rgb_stitcher.finish());
+        let view_canvas = view_stitcher.finish().expect("view canvas");
+        let rgb_canvas = rgb_stitcher.finish().expect("rgb canvas");
+        assert_eq!(
+            (view_canvas.width, view_canvas.height, view_canvas.stride),
+            (rgb_canvas.width, rgb_canvas.height, rgb_canvas.stride)
+        );
+        assert_eq!(
+            view_canvas.to_rgb_buffer(),
+            rgb_canvas.to_rgb_buffer(),
+            "the composed-view path must stitch exactly what the RGB path stitches"
+        );
     }
 
     #[test]
@@ -3911,7 +3927,11 @@ mod tests {
                 .unwrap(),
             PushResult::Accepted { .. }
         ));
-        let before = stitcher.stitched.clone().unwrap();
+        let before = stitcher.stitched.as_ref().unwrap().pixel_digest();
+        let before_size = {
+            let canvas = stitcher.stitched.as_ref().unwrap();
+            (canvas.width, canvas.height)
+        };
 
         let result = stitcher
             .push_frame(contained, Some(LongDirection::Up))
@@ -3923,9 +3943,8 @@ mod tests {
         assert_eq!(match_info.delta_y, -6);
         assert_eq!(stitcher.viewport_rect.unwrap().y, 2);
         let after = stitcher.stitched.as_ref().unwrap();
-        assert_eq!(after.width, before.width);
-        assert_eq!(after.height, before.height);
-        assert_eq!(after.data, before.data);
+        assert_eq!((after.width, after.height), before_size);
+        assert_eq!(after.pixel_digest(), before, "a contained step must not repaint the canvas");
     }
 
     #[test]
@@ -3972,7 +3991,11 @@ mod tests {
         stitcher
             .push_frame(right, Some(LongDirection::Right))
             .unwrap();
-        let before = stitcher.stitched.clone().unwrap();
+        let before = stitcher.stitched.as_ref().unwrap().pixel_digest();
+        let before_size = {
+            let canvas = stitcher.stitched.as_ref().unwrap();
+            (canvas.width, canvas.height)
+        };
 
         let result = stitcher
             .push_frame(contained, Some(LongDirection::Left))
@@ -3984,9 +4007,8 @@ mod tests {
         assert_eq!(match_info.delta_x, -6);
         assert_eq!(stitcher.viewport_rect.unwrap().x, 2);
         let after = stitcher.stitched.as_ref().unwrap();
-        assert_eq!(after.width, before.width);
-        assert_eq!(after.height, before.height);
-        assert_eq!(after.data, before.data);
+        assert_eq!((after.width, after.height), before_size);
+        assert_eq!(after.pixel_digest(), before, "a contained step must not repaint the canvas");
     }
 
     #[test]
@@ -4140,7 +4162,7 @@ mod tests {
     fn engine_place_is_pure_and_does_not_mutate_state() {
         let world = textured_frame(32, 140);
         let stitched = StitchedFrame::from_first_frame(&crop_frame(&world, 0, 0, 32, 60));
-        let before = stitched.clone();
+        let before = stitched.pixel_digest();
         let previous_rect = ViewportRect { x: 0, y: 0, width: 32, height: 60 };
         let target = crop_frame(&world, 0, 20, 32, 60);
 
@@ -4157,7 +4179,11 @@ mod tests {
         let first = engine.place(&request);
         let second = engine.place(&request);
         assert_eq!(first, second, "place must be deterministic and side-effect free");
-        assert_eq!(stitched, before, "place must not touch the stitched frame");
+        assert_eq!(
+            stitched.pixel_digest(),
+            before,
+            "place must not touch the stitched frame"
+        );
         assert!(matches!(first, EngineDecision::Place { .. }));
     }
 
@@ -4195,26 +4221,24 @@ mod tests {
         assert_eq!(stitched.height, 28);
 
         let old_overlap = pixel_offset(&previous, 7, 9);
-        let stitched_overlap = pixel_offset(
-            &RgbFrame {
-                width: stitched.width,
-                height: stitched.height,
-                stride: stitched.stride,
-                data: stitched.data.clone(),
-            },
-            7,
-            9,
-        );
         assert_eq!(
-            stitched.data[stitched_overlap..stitched_overlap + 3],
-            previous.data[old_overlap..old_overlap + 3]
+            stitched.pixel(7, 9),
+            Some([
+                previous.data[old_overlap],
+                previous.data[old_overlap + 1],
+                previous.data[old_overlap + 2],
+            ])
         );
 
         let current_tail = pixel_offset(&current, 7, 23);
-        let stitched_tail = (27 * stitched.stride + 7 * 3) as usize;
         assert_eq!(
-            stitched.data[stitched_tail..stitched_tail + 3],
-            current.data[current_tail..current_tail + 3]
+            stitched.pixel(7, 27),
+            Some([
+                current.data[current_tail],
+                current.data[current_tail + 1],
+                current.data[current_tail + 2],
+            ]),
+            "the appended tail row must hold the frame's own last row"
         );
     }
 
@@ -4346,8 +4370,12 @@ mod tests {
         assert_eq!(stitched.current_origin_y, 0);
         // Canvas row 0 shows the frame's top row; the old content moved down
         // by exactly the anchor-corrected delta.
-        assert_eq!(taller.data[0], stitched.data[0]);
-        assert_eq!(first.data[0], stitched.data[(4 * stitched.stride) as usize]);
+        assert_eq!(Some(taller.data[0]), stitched.pixel(0, 0).map(|p| p[0]));
+        assert_eq!(
+            Some(first.data[0]),
+            stitched.pixel(0, 4).map(|p| p[0]),
+            "the old content moved down by four rows"
+        );
     }
 
     #[test]
@@ -4680,11 +4708,12 @@ mod tests {
         assert_eq!(stitched.current_origin_y, 80);
 
         // Every canvas row still maps to its true page row.
+        let mut row = vec![0u8; stitched.stride as usize];
         for y in (0..stitched.height).step_by(20) {
             let want = row_texture(width, y);
-            let offset = (y * stitched.stride) as usize;
+            assert!(stitched.copy_row(y, &mut row), "canvas row {y} is missing");
             assert_eq!(
-                &stitched.data[offset..offset + width as usize * 3],
+                &row[..width as usize * 3],
                 &want[..],
                 "canvas row {y} does not match page row {y}"
             );
@@ -4720,11 +4749,12 @@ mod tests {
         assert_eq!(stitched.current_origin_y, 120);
         // Canvas extends only by the genuinely new 40 rows at the bottom.
         assert_eq!(stitched.height, 320);
+        let mut row = vec![0u8; stitched.stride as usize];
         for y in (0..stitched.height).step_by(20) {
             let want = row_texture(width, y);
-            let offset = (y * stitched.stride) as usize;
+            assert!(stitched.copy_row(y, &mut row), "canvas row {y} is missing");
             assert_eq!(
-                &stitched.data[offset..offset + width as usize * 3],
+                &row[..width as usize * 3],
                 &want[..],
                 "canvas row {y} does not match page row {y} after recovery"
             );
