@@ -420,12 +420,24 @@ pub enum SelectionEdge {
 
 /// An in-progress edit-mode drag: either reshaping one edge or moving the
 /// whole box by its interior.
+///
+/// `origin` is the box as it was when the drag started. A long-mode drag that
+/// ends up spanning outputs is reverted to it, so the drag behaves as if it had
+/// never happened instead of leaving a box that can never be captured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditDrag {
-    Edge(SelectionEdge),
+    Edge { edge: SelectionEdge, origin: LogicalRect },
     /// Pointer grab offset from the box origin, so the box follows the
     /// pointer without jumping to it.
-    Move { offset_x: i32, offset_y: i32 },
+    Move { offset_x: i32, offset_y: i32, origin: LogicalRect },
+}
+
+impl EditDrag {
+    fn origin(self) -> LogicalRect {
+        match self {
+            Self::Edge { origin, .. } | Self::Move { origin, .. } => origin,
+        }
+    }
 }
 
 /// Border color for the current selection.
@@ -1463,30 +1475,35 @@ fn toggle_edit_mode(state: &mut UiState) -> Option<OverlayInputMode> {
     }
 }
 
-/// Output-local bounds the selection is being edited within, so edge drags
-/// cannot move the box off the output it was captured on.
-fn selection_output_bounds(state: &UiState, rect: LogicalRect) -> LogicalRect {
-    let center_x = rect.x + rect.width / 2;
-    let center_y = rect.y + rect.height / 2;
-    state
-        .outputs
+/// Bounds the selection box may be dragged within: the union of every output.
+///
+/// The box is deliberately *not* confined to the output it was captured on.
+/// A long-mode box that crosses outputs turns red and is reverted on release
+/// (`settled_edit_rect`), which tells the user why the drag was refused;
+/// clamping at the output edge instead looks like the pointer stopped working.
+fn selection_drag_bounds(infos: &[OutputInfo]) -> Option<LogicalRect> {
+    infos
         .iter()
-        .find(|output| {
-            let logical = output.info.logical;
-            center_x >= logical.x
-                && center_x < logical.right()
-                && center_y >= logical.y
-                && center_y < logical.bottom()
+        .map(|info| info.logical)
+        .reduce(|left, right| LogicalRect {
+            x: left.x.min(right.x),
+            y: left.y.min(right.y),
+            width: left.right().max(right.right()) - left.x.min(right.x),
+            height: left.bottom().max(right.bottom()) - left.y.min(right.y),
         })
-        .map(|output| output.info.logical)
-        .or_else(|| {
-            state
-                .outputs
-                .iter()
-                .find(|output| output.info.logical.intersection(rect).is_some())
-                .map(|output| output.info.logical)
-        })
-        .unwrap_or(rect)
+}
+
+/// The rect an edit drag settles on.
+///
+/// A long-mode box that would end up spanning outputs is not a selection (long
+/// capture is single-screen), so the drag is undone: the box goes back to where
+/// it was when the drag started, exactly as if the drag had never happened.
+fn settled_edit_rect(long_mode: bool, dragged: LogicalRect, origin: LogicalRect, infos: &[OutputInfo]) -> LogicalRect {
+    if long_mode && crate::geometry::rect_spans_outputs(dragged, infos) {
+        origin
+    } else {
+        dragged
+    }
 }
 
 fn full_output_rect_by_index(output_infos: &[OutputInfo], index: usize) -> Option<LogicalRect> {
@@ -1879,8 +1896,6 @@ fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, prev
     let logical_w = output_logical.width.max(1);
     let logical_h = output_logical.height.max(1);
     let vp = preview.viewport_rect;
-    let vp_w = vp.width.max(1);
-    let vp_h = vp.height.max(1);
     let cw = preview.capture_width.max(1) as i32;
     let ch = preview.capture_height.max(1) as i32;
     let origin_x = preview.current_origin_x;
@@ -1890,22 +1905,50 @@ fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, prev
     let img_data = &preview.image.data;
     let img_stride = preview.image.stride as usize;
 
+    // Buffer pixel -> stitched pixel, in one step.
+    //
+    // The buffer is at the content's own density (`overlay_buffer_size`), so
+    // this is an identity whenever the capture's pixel grid is the buffer's.
+    // Mapping through global logical coordinates instead — buffer to logical,
+    // logical to capture — quantises the phase to logical pixels and then
+    // re-expands it, which samples the canvas at 1x and draws it at the
+    // buffer's density: a 1.5x upscale of a 1x sample, i.e. a visibly soft
+    // preview on any fractionally scaled output.
+    let buffer_x = |logical: i32| -> i64 {
+        (i64::from(logical - output_logical.x) * i64::from(overlay_w)) / i64::from(logical_w)
+    };
+    let buffer_y = |logical: i32| -> i64 {
+        (i64::from(logical - output_logical.y) * i64::from(overlay_h)) / i64::from(logical_h)
+    };
+    let vp_buffer_x = buffer_x(vp.x);
+    let vp_buffer_y = buffer_y(vp.y);
+    let vp_buffer_w = (buffer_x(vp.right()) - vp_buffer_x).max(1);
+    let vp_buffer_h = (buffer_y(vp.bottom()) - vp_buffer_y).max(1);
+    // Canvas pixels per buffer pixel: the capture's density over the buffer's.
+    // One when they agree, which is the normal case and needs no resampling.
+    let canvas_x = |bx: i32| -> i64 {
+        i64::from(origin_x)
+            + (i64::from(bx) - vp_buffer_x) * i64::from(cw) / vp_buffer_w
+    };
+    let canvas_y = |by: i32| -> i64 {
+        i64::from(origin_y)
+            + (i64::from(by) - vp_buffer_y) * i64::from(ch) / vp_buffer_h
+    };
+
     // Buffer-major: every buffer pixel of the dimmed area picks the stitched
     // pixel it covers. Iterating the stitched image instead would leave gaps
     // as soon as the buffer is denser than the logical grid (fractional scale),
     // and the live screen would show through them.
     let columns: Vec<Option<usize>> = (0..overlay_w)
         .map(|bx| {
-            let global_x = output_logical.x + (i64::from(bx) * i64::from(logical_w) / i64::from(overlay_w)) as i32;
-            let sx = origin_x + ((i64::from(global_x - vp.x) * i64::from(cw)) / i64::from(vp_w)) as i32;
-            (sx >= 0 && sx < pw).then(|| sx as usize * 4)
+            let sx = canvas_x(bx);
+            (sx >= 0 && sx < i64::from(pw)).then(|| sx as usize * 4)
         })
         .collect();
     for by in 0..overlay_h {
         let in_hole_row = by >= hole.y && by < hole.y + hole.height;
-        let global_y = output_logical.y + (i64::from(by) * i64::from(logical_h) / i64::from(overlay_h)) as i32;
-        let sy = origin_y + ((i64::from(global_y - vp.y) * i64::from(ch)) / i64::from(vp_h)) as i32;
-        if sy < 0 || sy >= ph {
+        let sy = canvas_y(by);
+        if sy < 0 || sy >= i64::from(ph) {
             continue;
         }
         let src_row = sy as usize * img_stride;
@@ -2258,10 +2301,10 @@ impl Dispatch<WlPointer, ()> for UiState {
                 };
                 if let Some(drag_mode) = state.edit_drag {
                     if let Some(rect) = state.drag.selected_rect() {
-                        let bounds = selection_output_bounds(state, rect);
+                        let bounds = selection_drag_bounds(&state.output_infos()).unwrap_or(rect);
                         let updated = match drag_mode {
-                            EditDrag::Edge(edge) => apply_edge_drag(rect, edge, x, y, bounds),
-                            EditDrag::Move { offset_x, offset_y } => {
+                            EditDrag::Edge { edge, .. } => apply_edge_drag(rect, edge, x, y, bounds),
+                            EditDrag::Move { offset_x, offset_y, .. } => {
                                 apply_box_move(rect, offset_x, offset_y, x, y, bounds)
                             }
                         };
@@ -2302,10 +2345,14 @@ impl Dispatch<WlPointer, ()> for UiState {
                                 .selected_rect()
                                 .and_then(|rect| {
                                     hit_test_edge(rect, x, y, EDGE_SNAP_RANGE)
-                                        .map(EditDrag::Edge)
+                                        .map(|edge| EditDrag::Edge { edge, origin: rect })
                                         .or_else(|| rect
                                             .intersection(LogicalRect { x, y, width: 1, height: 1 })
-                                            .map(|_| EditDrag::Move { offset_x: x - rect.x, offset_y: y - rect.y }))
+                                            .map(|_| EditDrag::Move {
+                                                offset_x: x - rect.x,
+                                                offset_y: y - rect.y,
+                                                origin: rect,
+                                            }))
                                 });
                         } else if !state.editing {
                             state.drag.begin(x, y);
@@ -2313,10 +2360,31 @@ impl Dispatch<WlPointer, ()> for UiState {
                         }
                     }
                     wl_pointer::ButtonState::Released => {
-                        if state.edit_drag.take().is_some() {
+                        if let Some(drag_mode) = state.edit_drag.take() {
                             // Finished one edit drag; stay in edit mode.
                             // capture_pending retains the old hole until the
                             // worker completes.
+                            if let Some(rect) = state.drag.selected_rect() {
+                                let settled = settled_edit_rect(
+                                    state.long_mode,
+                                    rect,
+                                    drag_mode.origin(),
+                                    &state.output_infos(),
+                                );
+                                if settled != rect {
+                                    // The box went back where it started, so
+                                    // nothing is captured from the box the
+                                    // drag produced. The frame prepared while
+                                    // it moved was already invalidated.
+                                    crate::trace_log!(
+                                        "edit: drag across outputs reverted to {:?}",
+                                        settled
+                                    );
+                                    if let Some(current) = state.drag.finished_rect_mut() {
+                                        *current = settled;
+                                    }
+                                }
+                            }
                             invalidate_overlay_bases(state);
                         } else if !state.editing {
                             state.drag.finish(x, y);
@@ -2621,6 +2689,58 @@ mod tests {
         assert_eq!(pixel_at(&data, 6, 4, 4), frozen);
         // buffer (5,5) is global (3,3) - outside again.
         assert_ne!(pixel_at(&data, 6, 5, 5), frozen);
+    }
+
+    /// At fractional scale the buffer and the canvas are at the same density,
+    /// so the preview must show each stitched pixel exactly once. Mapping
+    /// through global logical coordinates samples the canvas at 1x and draws it
+    /// at the buffer's density, which is the soft preview this pins against.
+    #[test]
+    fn a_fractional_buffer_maps_the_preview_one_to_one_with_the_canvas() {
+        // 4x4 logical output, 6x6 buffer (1.5x). The selection is (1,1)-(3,3)
+        // logical and was captured at 3x3 pixels — the buffer's own grid.
+        let output_logical = LogicalRect { x: 0, y: 0, width: 4, height: 4 };
+        let mut image = Image {
+            width: 3,
+            height: 3,
+            stride: 12,
+            format: Format::Argb8888,
+            data: vec![0; 3 * 3 * 4],
+        };
+        for y in 0..3usize {
+            for x in 0..3usize {
+                let offset = (y * 3 + x) * 4;
+                image.data[offset] = (x * 40) as u8;
+                image.data[offset + 1] = (y * 40) as u8;
+                image.data[offset + 2] = 128;
+                image.data[offset + 3] = 255;
+            }
+        }
+        let preview = LongPreviewSnapshot {
+            image,
+            current_origin_x: 0,
+            current_origin_y: 0,
+            viewport_rect: LogicalRect { x: 1, y: 1, width: 2, height: 2 },
+            capture_width: 3,
+            capture_height: 3,
+        };
+        let mut data = vec![7u8; 6 * 6 * 4];
+        draw_preview_on_overlay(&mut data, 6, 6, &preview, output_logical, None);
+
+        for y in 0..3usize {
+            for x in 0..3usize {
+                assert_eq!(
+                    pixel_at(&data, 6, 1 + x, 1 + y),
+                    [(x * 40) as u8, (y * 40) as u8, 128, 255],
+                    "buffer ({},{}) must show canvas ({x},{y})",
+                    1 + x,
+                    1 + y
+                );
+            }
+        }
+        // Nothing is drawn outside the selection's buffer extent.
+        assert_eq!(pixel_at(&data, 6, 0, 0), [7, 7, 7, 7]);
+        assert_eq!(pixel_at(&data, 6, 4, 4), [7, 7, 7, 7]);
     }
 
     #[test]
@@ -2956,7 +3076,7 @@ mod tests {
         // During an edit drag the hole is the *current* box, never a union of
         // the trajectory: shrinking must move the dim edge immediately, or the
         // border slides while the dim stays behind (the reported stutter).
-        state.edit_drag = Some(EditDrag::Move { offset_x: 1, offset_y: 1 });
+        state.edit_drag = Some(EditDrag::Move { offset_x: 1, offset_y: 1, origin: SELECTED });
         let shrunk = LogicalRect { x: 20, y: 20, width: 30, height: 30 };
         state.drag = DragState::Finished(shrunk);
         assert_eq!(ui_render_selection(&state), Some(shrunk));
@@ -2980,7 +3100,7 @@ mod tests {
         let wide = LogicalRect { x: 10, y: 10, width: 80, height: 80 };
         let narrow = LogicalRect { x: 40, y: 40, width: 20, height: 20 };
         state.drag = DragState::Finished(wide);
-        state.edit_drag = Some(EditDrag::Edge(SelectionEdge::Right));
+        state.edit_drag = Some(EditDrag::Edge { edge: SelectionEdge::Right, origin: SELECTED });
         // Widest point, then shrunk: the rendered hole must be the narrow box.
         state.drag = DragState::Finished(narrow);
         assert_eq!(ui_render_selection(&state), Some(narrow));
@@ -2996,7 +3116,7 @@ mod tests {
         let wide = LogicalRect { x: 10, y: 10, width: 80, height: 80 };
         let narrow = LogicalRect { x: 40, y: 40, width: 20, height: 20 };
         state.drag = DragState::Finished(narrow);
-        state.edit_drag = Some(EditDrag::Edge(SelectionEdge::Left));
+        state.edit_drag = Some(EditDrag::Edge { edge: SelectionEdge::Left, origin: SELECTED });
         state.capture_pending = Some(wide);
 
         invalidate_changed_capture(&mut state);
@@ -3014,7 +3134,7 @@ mod tests {
         let mut state = ui_state();
         let rect = LogicalRect { x: 20, y: 20, width: 40, height: 40 };
         state.drag = DragState::Finished(rect);
-        state.edit_drag = Some(EditDrag::Move { offset_x: 1, offset_y: 1 });
+        state.edit_drag = Some(EditDrag::Move { offset_x: 1, offset_y: 1, origin: SELECTED });
         state.capture_pending = Some(rect);
 
         invalidate_changed_capture(&mut state);
@@ -3029,7 +3149,7 @@ mod tests {
     fn edit_drag_active_reflects_edit_state() {
         let mut state = ui_state();
         assert!(!state.edit_drag.is_some());
-        state.edit_drag = Some(EditDrag::Edge(SelectionEdge::Left));
+        state.edit_drag = Some(EditDrag::Edge { edge: SelectionEdge::Left, origin: SELECTED });
         assert!(state.edit_drag.is_some());
     }
 
@@ -3174,6 +3294,33 @@ mod tests {
         assert!(!long_selection_must_be_discarded(true, None, &infos));
     }
 
+    /// An edit drag may cross outputs (that is how the red warning becomes
+    /// visible), and a long-mode drag that ends up spanning is undone.
+    #[test]
+    fn an_edit_drag_across_outputs_is_undone_on_release() {
+        let infos = [
+            OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 0, width: 100, height: 80 }, scale: 1 },
+            OutputInfo { global_name: 2, logical: LogicalRect { x: 100, y: 0, width: 100, height: 80 }, scale: 1 },
+        ];
+        let origin = LogicalRect { x: 10, y: 10, width: 40, height: 30 };
+        let across = LogicalRect { x: 90, y: 10, width: 40, height: 30 };
+        let inside = LogicalRect { x: 20, y: 10, width: 40, height: 30 };
+
+        // Long mode: the box goes back where it was, as if nothing was dragged.
+        assert_eq!(settled_edit_rect(true, across, origin, &infos), origin);
+        // A drag that stays on one output is kept.
+        assert_eq!(settled_edit_rect(true, inside, origin, &infos), inside);
+        // Normal mode composites a spanning selection, so it is never undone.
+        assert_eq!(settled_edit_rect(false, across, origin, &infos), across);
+
+        // The drag bounds are the whole desktop, so the box really can be
+        // dragged over the seam (where the border turns red).
+        let bounds = selection_drag_bounds(&infos).unwrap();
+        assert_eq!(bounds, LogicalRect { x: 0, y: 0, width: 200, height: 80 });
+        let dragged = apply_box_move(inside, 0, 0, 90, 30, bounds);
+        assert!(crate::geometry::rect_spans_outputs(dragged, &infos));
+    }
+
     #[test]
     fn discarding_a_selection_returns_to_the_empty_selection_state() {
         let mut state = ui_state();
@@ -3310,7 +3457,7 @@ mod tests {
         let mut state = ui_state();
         state.drag = DragState::Finished(SELECTED);
         state.editing = true;
-        state.edit_drag = Some(EditDrag::Edge(SelectionEdge::Left));
+        state.edit_drag = Some(EditDrag::Edge { edge: SelectionEdge::Left, origin: SELECTED });
         assert_eq!(resolve_key_action(&state, KEY_ESC), KeyAction::Cancel);
         apply_key_action(&mut state, KeyAction::Cancel);
         assert!(!state.editing);

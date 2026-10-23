@@ -79,6 +79,12 @@ Everything downstream works in **buffer pixels** and converts once:
   buffer pixel of the dimmed area picks the stitched pixel it covers. Iterating
   the stitched image instead would leave gaps as soon as the buffer is denser
   than the logical grid, and the live screen would show through them.
+  The buffer→canvas mapping must be **direct** (selection's buffer extent plus
+  the capture density). Mapping buffer → global logical → capture instead
+  quantises the phase to logical pixels and re-expands it, which samples the
+  canvas at 1x and draws it at the buffer's density: the preview then looks
+  soft at 1.5x even though both grids are identical. That was the long-capture
+  blur this document's first version missed.
 - `frozen_pixel` is a pure ratio (`buffer -> capture`); the old
   `wl_output.scale` shortcut is gone, since it is wrong whenever the buffer is
   the capture size on an integer-scaled output.
