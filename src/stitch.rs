@@ -50,6 +50,10 @@ use perceptual::perceptual_frame_match;
 use perceptual::{PerceptualFrame, PerceptualMotionEstimate, PERCEPTUAL_MOTION_ADJACENT_DELTA};
 #[cfg(feature = "stitch-legacy")]
 use placement::{canvas_search_axis, find_canvas_placement_match};
+// `WindowedEdgeMatcher` is the engine in a production build and a test subject
+// in a `stitch-legacy` one, where `new_placement_engine` returns `LegacyPipeline`
+// instead.
+#[cfg_attr(feature = "stitch-legacy", allow(unused_imports))]
 use engine::{EngineDecision, PlacementEngine, PlacementRequest, WindowedEdgeMatcher};
 use rgb::{
     average_difference_same_source, average_luminance_difference_source, crop_rgb_frame,
@@ -82,8 +86,11 @@ const MATCH_LINE_SAMPLE_STEP: u32 = 4;
 const MATCH_PREFILTER_MAX_AVERAGE_DIFF: f64 = 12.0;
 const MATCH_PREFILTER_SAMPLE_STEP: u32 = 2;
 const MATCH_MIN_OVERLAP_PIXELS: u32 = 16;
-/// Score ceiling for the fast-motion scan (legacy pipeline only).
-#[cfg(any(test, feature = "stitch-legacy"))]
+/// Score ceiling for the fast-motion scan.
+///
+/// Only the legacy pipeline (and the tests of its scan) score deltas this way;
+/// the shipped matcher gates on its own constants.
+#[cfg_attr(not(any(test, feature = "stitch-legacy")), allow(dead_code))]
 const FAST_MOTION_MAX_SCORE: f64 = 8.0;
 const DUPLICATE_ANALYSIS_ROW_DIFF_THRESHOLD: f64 = 3.0;
 /// Rows of *proven* overlap the stale-edge recovery needs before it may place a
@@ -219,7 +226,9 @@ where
 }
 
 #[cfg(any(test, feature = "stitch-legacy"))]
-use motion::{compare_fast_motion_candidates, scan_fast_vertical_motion, score_fast_motion_delta};
+use motion::scan_fast_vertical_motion;
+#[cfg(test)]
+use motion::{compare_fast_motion_candidates, score_fast_motion_delta};
 
 #[cfg(feature = "stitch-legacy")]
 #[derive(Debug, Default, Clone)]
@@ -1424,13 +1433,17 @@ impl RawStitcher {
     }
 
     /// Canvas row of the most recent accepted placement, in logical coordinates.
-    #[cfg_attr(not(any(test, feature = "trace-logs")), allow(dead_code))]
+    /// The canvas row the engine last asked for.
+    ///
+    /// Read by `replay-frames` (a separate binary crate, so this is invisible to
+    /// the lib build) and by tests.
+    #[allow(dead_code)]
     pub fn last_engine_top(&self) -> Option<i32> {
         self.last_engine_top
     }
 
     /// Logical row that pixel-canvas row 0 corresponds to.
-    #[cfg_attr(not(any(test, feature = "trace-logs")), allow(dead_code))]
+    #[allow(dead_code)]
     pub fn canvas_origin(&self) -> i32 {
         self.canvas_origin
     }

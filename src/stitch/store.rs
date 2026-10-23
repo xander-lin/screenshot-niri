@@ -35,6 +35,14 @@ use std::cell::{Cell, RefCell};
 
 use super::types::CANVAS_TILE_ROWS;
 
+/// Touches between eviction sweeps.
+///
+/// Eviction sorts the resident set, so running it on every row read would cost
+/// more than the unpacking it saves. One sweep per this many touches amortises
+/// the sort, and sweeping back to three quarters of the budget leaves headroom
+/// so the next sweep is not immediate.
+const EVICT_INTERVAL: u32 = 32;
+
 /// One row band of the canvas, in one of three states.
 ///
 /// `Empty` allocates nothing: a ragged canvas (the leg of an L, the space
@@ -396,12 +404,9 @@ impl CanvasStore {
     }
 
     /// Packs the least-recently-used resident tiles until the working set fits
-    /// the budget. `keep` is never evicted (it is the tile being used now).
-    /// Packs the least-recently-used resident tiles until the working set fits
     /// the budget. `keep` is never evicted (it is the tile the caller is about
     /// to read).
     fn evict_if_needed(&self, keep: Option<usize>) {
-        const EVICT_INTERVAL: u32 = 32;
         if self.budget == 0 || !self.compressor.packs() {
             return;
         }
@@ -648,6 +653,33 @@ mod tests {
             store.write_spans(row, &[(0, width)], &source, stride, 0, row as u32);
         }
         (store, source)
+    }
+
+    /// `with_row`'s accessors must not call back into the store.
+    ///
+    /// The rule is documented on `with_row` and every accessor respects it, but
+    /// nothing made it executable: `touch_tile` mutates a packed tile through a
+    /// `RefCell` while the caller holds a borrow of that same tile, so a future
+    /// accessor that nested a read inside a `with_row` closure would panic with
+    /// `already borrowed` — or, worse, silently do the wrong thing if the
+    /// borrows ever stopped overlapping. This pins the contract at the point
+    /// that would change.
+    #[test]
+    fn a_nested_store_read_is_rejected_rather_than_silently_wrong() {
+        let (store, _) = store_with(0, 8, CANVAS_TILE_ROWS);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.with_row(0, |_row| {
+                // The forbidden shape: reading the store from inside the
+                // closure that is already borrowing a row of it.
+                store.with_row(1, |_| ())
+            });
+        }));
+        assert!(
+            outcome.is_err(),
+            "a nested read must fail loudly; if this starts passing, `with_row`'s          \
+             borrow must have been widened to cover both calls, and the closure          \
+             contract needs rewriting"
+        );
     }
 
     #[test]

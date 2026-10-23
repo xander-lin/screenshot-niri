@@ -1016,7 +1016,7 @@ impl SelectionSession {
         self.state.long_direction
     }
 
-    #[cfg_attr(not(any(test, feature = "trace-logs")), allow(dead_code))]
+    #[allow(dead_code)] // part of the session's read-only surface
     pub fn screenshot_cursor_hidden(&self) -> bool {
         self.state.screenshot_cursor_hidden
     }
@@ -1059,7 +1059,7 @@ impl SelectionSession {
         Ok(())
     }
 
-    #[cfg_attr(not(any(test, feature = "trace-logs")), allow(dead_code))]
+    #[allow(dead_code)] // part of the session's read-only surface
     pub fn stitch_warning(&self) -> bool {
         self.state.stitch_warning
     }
@@ -1105,25 +1105,6 @@ impl SelectionSession {
             }
         }
         guard.read()?;
-        self.event_queue.dispatch_pending(&mut self.state)?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn dispatch_blocking(&mut self) -> Result<(), Box<dyn Error>> {
-        self.event_queue.blocking_dispatch(&mut self.state)?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn dispatch_pending(&mut self) -> Result<(), Box<dyn Error>> {
-        self.event_queue.dispatch_pending(&mut self.state)?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn wait_configured(&mut self) -> Result<(), Box<dyn Error>> {
-        self.event_queue.blocking_dispatch(&mut self.state)?;
         self.event_queue.dispatch_pending(&mut self.state)?;
         Ok(())
     }
@@ -1328,7 +1309,23 @@ fn render_live_overlays(state: &mut UiState, output_name: Option<u32>) -> usize 
         draw_live_foreground(data, overlay.width, overlay.height, output.info.logical,
             selection_local, border_local, state.long_preview.as_ref(), border_width, border_color);
         overlay.surface.attach(Some(&buffer.buffer), 0, 0);
-        overlay.surface.damage_buffer(0, 0, overlay.width, overlay.height);
+        // The damage is what was actually rewritten, not the whole buffer: the
+        // mask/hole layer was either rebuilt (`rebuild`, which writes every
+        // pixel) or copied back from the cache, and only the foreground was
+        // redrawn over it. Reporting the full buffer while rebuilding nothing is
+        // a lie the compositor is entitled to act on.
+        if rebuild {
+            overlay.surface.damage_buffer(0, 0, overlay.width, overlay.height);
+        } else {
+            let full = LogicalRect { x: 0, y: 0, width: overlay.width, height: overlay.height };
+            let damage = foreground_damage(
+                state.long_preview.is_some(),
+                border_local,
+                buffer_length(border_width, overlay.width, output.info.logical.width),
+                full,
+            );
+            overlay.surface.damage_buffer(damage.x, damage.y, damage.width, damage.height);
+        }
         overlay.surface.commit();
         crate::trace_log!("render: committed canvas output={} (buffer freed the previous one on niri side)", overlay.output_name);
         buffer.available = false;
@@ -1338,6 +1335,34 @@ fn render_live_overlays(state: &mut UiState, output_name: Option<u32>) -> usize 
         satisfied += 1;
     }
     satisfied
+}
+
+/// The region `draw_live_foreground` can have touched.
+///
+/// With a stitched preview that is the whole buffer: the preview paints the
+/// dimmed area *outside* the hole — that is the point of it, it shows the rows
+/// the box has already scrolled past — so there is no rectangle smaller than the
+/// buffer that bounds it. Without a preview only the border ring is drawn, and
+/// the ring is the box grown by the configured thickness.
+///
+/// Falls back to the whole buffer whenever the geometry is unknown, which is the
+/// safe direction: over-reporting damage costs a repaint, under-reporting leaves
+/// stale pixels on screen.
+fn foreground_damage(
+    has_preview: bool,
+    border: Option<LogicalRect>,
+    border_width: i32,
+    full: LogicalRect,
+) -> LogicalRect {
+    if has_preview {
+        return full;
+    }
+    match border {
+        Some(border) => border_bounds(border, border_width)
+            .intersection(full)
+            .unwrap_or(full),
+        None => full,
+    }
 }
 
 fn draw_selection_border(data: &mut [u8], _width: i32, _height: i32, x: i32, y: i32, w: i32, h: i32, thickness: i32, border: [u8; 4]) {
@@ -2312,6 +2337,21 @@ fn overlay_buffer_size(
     )
 }
 
+/// Whether an output may still be drawn on, and therefore still needs buffers.
+///
+/// Long capture is scoped to one output: `render_scope` is set at the `L`
+/// handover and the other outputs' buffers are released there (8.1 MB per screen
+/// at 1920x1080) because those surfaces are never committed to again. An empty
+/// `buffers` vec reads as "needs buffers" to the resize test, so a late
+/// `configure` or `preferred_scale` on such an output would silently allocate
+/// them back and undo the saving. This predicate is what stops it.
+fn output_is_render_scoped(render_scope: Option<u32>, output_name: u32) -> bool {
+    match render_scope {
+        Some(scope) => scope == output_name,
+        None => true,
+    }
+}
+
 /// Recomputes one overlay's buffer size, render cache and viewport.
 ///
 /// Both inputs change independently and either may arrive first: the logical
@@ -2336,6 +2376,15 @@ fn refresh_overlay_surface(state: &mut UiState, output_name: u32, qh: &QueueHand
     let Some(index) = state.overlays.iter().position(|overlay| overlay.output_name == output_name) else {
         return;
     };
+    // Long capture is scoped to one output, and the `L` handover released the
+    // others' buffers (8.1 MB each at 1920x1080) because those surfaces are
+    // never committed to again. A late `configure` or `preferred_scale` on one
+    // of them must not allocate them back: an empty `buffers` reads as "needs
+    // buffers" to the `resized` test below, so without this guard the saving is
+    // silently undone.
+    if !output_is_render_scoped(state.render_scope, output_name) {
+        return;
+    }
     // A `preferred_scale` that beats the layer configure is recorded in the
     // field and applied here once the configure supplies the logical size; it
     // must not create buffers, because a buffer attached before the first
@@ -2471,7 +2520,11 @@ fn create_overlay_buffer(
     if data == libc::MAP_FAILED {
         return Err(std::io::Error::last_os_error().into());
     }
-    let pool = shm.create_pool(fd.as_fd(), size as i32, qh, ());
+    // `wl_shm.create_pool` takes an i32 byte count. Above 2 GiB (~537
+    // megapixels) the cast would wrap to a negative length, so refuse
+    // rather than hand the compositor a bogus size.
+    let pool_size = i32::try_from(size).map_err(|_| "shm buffer exceeds 2 GiB")?;
+    let pool = shm.create_pool(fd.as_fd(), pool_size, qh, ());
     let buffer = pool.create_buffer(0, width, height, stride, Format::Argb8888, qh, id);
     Ok(OverlayBuffer { size, data: data.cast(), _fd: fd, pool, buffer, available: true, initialized: false, last_selected: None, live_seq: 0 })
 }
@@ -3627,6 +3680,18 @@ mod tests {
 
     fn ui_state() -> UiState {
         UiState::unbound(Vec::new(), false, crate::config::DEFAULT_BORDER_WIDTH)
+    }
+
+    /// The `L` handover releases the unselected outputs' buffers; a later
+    /// `configure`/`preferred_scale` must not allocate them back.
+    #[test]
+    fn an_out_of_scope_output_keeps_its_buffers_released() {
+        // Before `L` every output is renderable.
+        assert!(output_is_render_scoped(None, 1));
+        assert!(output_is_render_scoped(None, 2));
+        // After `L` only the captured output is.
+        assert!(output_is_render_scoped(Some(2), 2));
+        assert!(!output_is_render_scoped(Some(2), 1));
     }
 
     /// `zxdg_output_v1` is the layout authority; `wl_output.geometry` only

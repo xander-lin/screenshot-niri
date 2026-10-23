@@ -112,7 +112,7 @@ impl RowCoverage {
     }
 
     /// Number of captured pixels in this row, capped at `width`.
-    #[cfg_attr(not(any(test, feature = "stitch-legacy")), allow(dead_code))]
+    #[allow(dead_code)] // used by replay-frames and the legacy path
     pub fn captured_width(&self, width: u32) -> u32 {
         match self {
             RowCoverage::Empty => 0,
@@ -209,7 +209,7 @@ impl StitchedFrame {
     }
 
     /// Copies a rectangle out, row by row, into `out` at `out_stride`.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // the accessor a whole-region caller would use; nothing does yet
     pub fn copy_region(
         &self,
         x: u32,
@@ -251,7 +251,7 @@ impl StitchedFrame {
     }
 
     /// What the canvas costs right now, in bytes.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // the tile budget is documented against this report
     pub fn memory_report(&self) -> CanvasMemoryReport {
         self.store.report()
     }

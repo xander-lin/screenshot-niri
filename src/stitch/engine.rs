@@ -2267,7 +2267,7 @@ mod tests {
         let rect = ViewportRect { x: 0, y: 0, width: W, height: 60 };
         let committed_crop = crop(&page, 0, 60);
         let committed: Vec<(i32, &RgbFrame)> = vec![(0, &committed_crop)];
-        let mut req = request_on_canvas(&frame, rect, &committed);
+        let req = request_on_canvas(&frame, rect, &committed);
         match engine.place(&req) {
             EngineDecision::Place { rect: placed, .. } => {
                 // Nearest to the zero prediction: 0 is one period closer than
@@ -2327,7 +2327,7 @@ mod tests {
         // pixel row 0 while the engine asked for -17.
         let upward = frame_from_signed(83, height);
         let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first)];
-        let mut req =
+        let req =
             request_on_canvas(&upward, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
         let EngineDecision::Place { match_info, .. } = engine.place(&req) else {
             panic!("expected the upward frame to be placed");
@@ -2364,7 +2364,7 @@ mod tests {
 
         let upward = frame_from_signed(83, height);
         let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first)];
-        let mut req =
+        let req =
             request_on_canvas(&upward, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
         assert!(matches!(engine.place(&req), EngineDecision::Place { .. }));
         engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, -17, &upward);

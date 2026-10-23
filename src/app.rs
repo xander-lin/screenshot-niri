@@ -328,14 +328,16 @@ fn run_long_capture(
                     Some((_, image)) => image,
                     None => continue,
                 };
-                let compose = match ImageRgbView::new(current_frame) {
-                    Ok(v) => v,
+                // One view, borrowed twice: `ImageRgbView` is `{ &Image, crop }`,
+                // so the compose and analysis halves of the push read the same
+                // pixels without a copy. Validating the image once is enough.
+                let view = match ImageRgbView::new(current_frame) {
+                    Ok(view) => view,
                     Err(_) => continue,
                 };
-                let analysis = match ImageRgbView::new(current_frame) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
+                // `ImageRgbView` is `Copy` and holds no pixels of its own, so this is two
+                // views over one validated image, not a second copy.
+                let (compose, analysis) = (view, view);
                 let offset = crate::geometry::frame_screen_offset(region, current_frame);
                 let outcome = match stitcher.push_frame_with_offset(&compose, &analysis, direction, offset) {
                     Ok(o) => {
@@ -524,7 +526,6 @@ fn preview_window(
     .unwrap_or_else(|| crate::stitch::CanvasWindow::full(canvas))
 }
 
-/// Convert logical screen offsets into the returned frame's pixel space.
 /// Fast raw-frame similarity check. Samples every 8th pixel, 4px per row.
 /// Returns true if the frames are so similar they can be treated as duplicate.
 fn raw_frame_nearly_identical(a: &crate::image::Image, b: &crate::image::Image) -> bool {

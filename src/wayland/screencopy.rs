@@ -462,7 +462,11 @@ fn create_shm_image(
     if data == libc::MAP_FAILED {
         return Err(std::io::Error::last_os_error().into());
     }
-    let pool = shm.create_pool(fd.as_fd(), size as i32, qh, ());
+    // `wl_shm.create_pool` takes an i32 byte count. Above 2 GiB (~537
+    // megapixels) the cast would wrap to a negative length, so refuse
+    // rather than hand the compositor a bogus size.
+    let pool_size = i32::try_from(size).map_err(|_| "shm buffer exceeds 2 GiB")?;
+    let pool = shm.create_pool(fd.as_fd(), pool_size, qh, ());
     let buffer = pool.create_buffer(0, width as i32, height as i32, stride as i32, format, qh, ());
     Ok(ShmImage { width, height, stride, format, size, data: data.cast(), _fd: fd, pool, buffer })
 }
