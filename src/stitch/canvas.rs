@@ -47,6 +47,7 @@ impl StitchedFrame {
     /// The coverage map is `Full` on every row of a rectangular canvas, so this
     /// is the cheap common case. On a ragged one it is what separates content
     /// from the zero bytes of a region that was never captured.
+    #[cfg_attr(not(any(test, feature = "stitch-legacy")), allow(dead_code))]
     pub fn captured(&self, x: u32, y: u32) -> bool {
         match self.row_coverage.get(y as usize) {
             Some(row) => row.contains(x),

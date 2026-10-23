@@ -344,6 +344,8 @@ fn run_long_capture(
                     }
                     Err(err) => {
                         crate::trace_log!("ui: push_frame_with_offset errored: {}", err);
+                        #[cfg(not(feature = "trace-logs"))]
+                        let _ = &err;
                         continue;
                     }
                 };

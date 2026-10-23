@@ -1,3 +1,15 @@
+//! The pre-window legacy canvas scan, kept only for A/B against the shipped
+//! `WindowedEdgeMatcher`.
+//!
+//! Gated whole by `stitch-legacy`, because its only caller is: the
+//! `DefaultPlacementPipeline`. It used to sit in `placement.rs` with no gate of
+//! its own while the shipped matcher's `SearchAxis` lived there too, so all
+//! 680 lines were compiled into every release build and never executed — which
+//! is how a pile of "never used" warnings about genuinely dead code came to
+//! hide among warnings about code that was merely unreachable by configuration.
+//! `SearchAxis` and `canvas_search_axis` moved to `types.rs` so production code
+//! no longer imports from here.
+
 use std::collections::HashMap;
 
 use super::canvas::{canvas_overlap_rect, validate_stitched_frame};
@@ -6,6 +18,19 @@ use super::{
     line_average_difference, minimum_overlap, AppendDirection, FrameMatch, SearchDirection,
     StitchedFrame, ViewportRect, MATCH_PREFILTER_MAX_AVERAGE_DIFF,
 };
+use super::types::SearchAxis;
+
+/// The axis a search runs along, from the user's arrow-key hint.
+///
+/// The hint only ever *seeds* a search: the impulse (the last accepted step)
+/// decides the axis afterwards, and a horizontal fallback additionally
+/// requires the user to have indicated a horizontal direction.
+pub(super) fn canvas_search_axis(search_direction: Option<SearchDirection>) -> SearchAxis {
+    match search_direction {
+        Some(SearchDirection::Right | SearchDirection::Left) => SearchAxis::Horizontal,
+        Some(SearchDirection::Down | SearchDirection::Up) | None => SearchAxis::Vertical,
+    }
+}
 
 const CANVAS_PLACEMENT_TOP_CANDIDATES: usize = 12;
 const CANVAS_PLACEMENT_FAST_SAMPLE_STEP: u32 = 12;
@@ -16,22 +41,6 @@ const CANVAS_PLACEMENT_LOCAL_MIN_MARGIN: f64 = 1.0;
 const CANVAS_PLACEMENT_LOCAL_RADII: [i32; 4] = [32, 64, 128, CANVAS_PLACEMENT_LOCAL_RADIUS];
 const CANVAS_PLACEMENT_GLOBAL_COARSE_STEP: u32 = 24;
 const CANVAS_PLACEMENT_GLOBAL_REFINE_RADIUS: i32 = CANVAS_PLACEMENT_GLOBAL_COARSE_STEP as i32;
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) enum SearchAxis {
-    #[default]
-    Vertical,
-    Horizontal,
-}
-
-impl SearchAxis {
-    pub(super) fn other(self) -> Self {
-        match self {
-            Self::Vertical => Self::Horizontal,
-            Self::Horizontal => Self::Vertical,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct CanvasPlacementCandidate {
     frame_x: i32,
@@ -86,13 +95,6 @@ impl CanvasScoreCache {
         );
         self.scores.insert(key, score);
         score
-    }
-}
-
-pub(super) fn canvas_search_axis(search_direction: Option<SearchDirection>) -> SearchAxis {
-    match search_direction {
-        Some(SearchDirection::Right | SearchDirection::Left) => SearchAxis::Horizontal,
-        Some(SearchDirection::Down | SearchDirection::Up) | None => SearchAxis::Vertical,
     }
 }
 

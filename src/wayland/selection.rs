@@ -184,6 +184,56 @@ struct OutputRuntime {
     /// a 1280x720 logical size. Long capture starts without a frozen frame, so
     /// this is the only density source it has before the first capture arrives.
     mode_pixels: Option<(i32, i32)>,
+    /// Where the compositor placed this output, from both sources that report
+    /// it. Kept as a field so the resolution can be tested without standing up
+    /// Wayland proxies.
+    position: OutputPositionSource,
+}
+
+impl OutputRuntime {
+    /// Copies whatever position is currently known into `info.logical`.
+    fn resolve_logical_position(&mut self) {
+        if let Some((x, y)) = self.position.resolve() {
+            self.info.logical.x = x;
+            self.info.logical.y = y;
+        }
+    }
+}
+
+/// Where an output sits, from the two events that can say so.
+///
+/// `logical_position` (`zxdg_output_v1`) wins: it is the layout coordinate the
+/// session's rectangles are expressed in. `geometry` (`wl_output`) is the
+/// fallback for a compositor without the xdg output manager; without it every
+/// output would keep the `(0, 0)` placeholder it was seeded with, collapsing a
+/// multi-screen desktop into one rectangle at the origin — and any selection
+/// there would then look like it spans outputs. The protocol calls `geometry`
+/// "partial information" and steers clients to `logical_position` instead,
+/// which is why it is only ever the fallback: on a compositor that scales
+/// outputs it may report pixels where the layout is in logical units.
+///
+/// Both arrive as independent events in no fixed order, so neither handler
+/// decides on its own — each records what it saw and the position is resolved
+/// from both. That is what stops a `geometry` landing *after* a
+/// `logical_position` from overwriting it.
+#[derive(Debug, Clone, Copy, Default)]
+struct OutputPositionSource {
+    logical: Option<(i32, i32)>,
+    geometry: Option<(i32, i32)>,
+}
+
+impl OutputPositionSource {
+    fn resolve(self) -> Option<(i32, i32)> {
+        self.logical.or(self.geometry)
+    }
+
+    fn set_logical(&mut self, x: i32, y: i32) {
+        self.logical = Some((x, y));
+    }
+
+    fn set_geometry(&mut self, x: i32, y: i32) {
+        self.geometry = Some((x, y));
+    }
 }
 
 struct OverlaySurface {
@@ -191,6 +241,9 @@ struct OverlaySurface {
     /// Declared before the surface so these are destroyed first: both are
     /// bound to the wl_surface they were created from.
     viewport: Option<WpViewport>,
+    /// Kept alive for the surface's lifetime so `preferred_scale` events keep
+    /// arriving; nothing reads the proxy itself after construction.
+    #[cfg_attr(not(feature = "trace-logs"), allow(dead_code))]
     fractional_scale: Option<WpFractionalScaleV1>,
     /// Output's preferred scale in 120ths (wp_fractional_scale_v1); 120 until
     /// the compositor says otherwise.
@@ -418,6 +471,54 @@ struct UiState {
 }
 
 impl UiState {
+    /// A session with no compositor objects bound and no overlays yet.
+    ///
+    /// Every field that is *not* a parameter starts at its "nothing has
+    /// happened yet" value, and the list lives here once. It used to be spelled
+    /// out at each construction site — the real one, a second copy in a
+    /// now-deleted entry point, and the test helper — so adding a field meant
+    /// remembering all three, and a missed one silently meant a different
+    /// initial state in tests than in the product.
+    fn unbound(frozen_outputs: Vec<FrozenOutput>, long_mode: bool, border_width: i32) -> Self {
+        Self {
+            compositor: None,
+            shm: None,
+            layer_shell: None,
+            xdg_output_manager: None,
+            viewporter: None,
+            fractional_scale_manager: None,
+            seat: None,
+            pointer: None,
+            keyboard: None,
+            outputs: Vec::new(),
+            frozen_outputs,
+            overlays: Vec::new(),
+            pointer_output_name: None,
+            long_mode,
+            screenshot_cursor_hidden: true,
+            pointer_x: 0,
+            pointer_y: 0,
+            drag: DragState::Idle,
+            long_requested: false,
+            long_finish_requested: false,
+            long_direction: None,
+            long_preview: None,
+            stitch_warning: false,
+            pending_render: None,
+            editing: false,
+            edit_drag: None,
+            capture_pending: None,
+            capture_invalid: false,
+            selection_anchor: None,
+            border_width: border_width.clamp(
+                crate::config::BORDER_WIDTH_MIN,
+                crate::config::BORDER_WIDTH_MAX,
+            ),
+            live_state_seq: 1,
+            render_scope: None,
+        }
+    }
+
     fn output_infos(&self) -> Vec<OutputInfo> {
         self.outputs.iter().map(|output| output.info).collect()
     }
@@ -431,81 +532,6 @@ impl UiState {
         let output_name = self.pointer_output_name?;
         let output = self.outputs.iter().find(|output| output.info.global_name == output_name)?;
         Some((output.info.logical.x + self.pointer_x, output.info.logical.y + self.pointer_y))
-    }
-}
-
-#[allow(dead_code)]
-pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOutcome, Box<dyn Error>> {
-    let conn = Connection::connect_to_env()?;
-    let mut event_queue = conn.new_event_queue::<UiState>();
-    let qh = event_queue.handle();
-    let mut state = UiState {
-        compositor: None,
-        shm: None,
-        layer_shell: None,
-        xdg_output_manager: None,
-        viewporter: None,
-        fractional_scale_manager: None,
-        seat: None,
-        pointer: None,
-        keyboard: None,
-        outputs: Vec::new(),
-        frozen_outputs: frozen_outputs_from_captures(frozen_outputs, &[])?,
-        overlays: Vec::new(),
-        pointer_output_name: None,
-        long_mode: false,
-        screenshot_cursor_hidden: true,
-        pointer_x: 0,
-        pointer_y: 0,
-        drag: DragState::Idle,
-            long_requested: false,
-        long_finish_requested: false,
-        long_direction: None,
-            long_preview: None,
-            stitch_warning: false,
-            pending_render: None,
-        editing: false,
-        edit_drag: None,
-        capture_pending: None,
-        capture_invalid: false,
-        selection_anchor: None,
-        border_width: crate::config::DEFAULT_BORDER_WIDTH,
-        live_state_seq: 1,
-        render_scope: None,
-    };
-
-    conn.display().get_registry(&qh, ());
-    event_queue.roundtrip(&mut state)?;
-    bind_xdg_outputs(&mut state, &qh);
-    event_queue.roundtrip(&mut state)?;
-    if state.compositor.is_none() {
-        return Err("compositor does not expose wl_compositor required by zwlr_layer_shell_v1".into());
-    }
-    if state.shm.is_none() {
-        return Err("compositor does not expose wl_shm required by zwlr_layer_shell_v1 overlay buffers".into());
-    }
-    if state.layer_shell.is_none() {
-        return Err("compositor does not expose zwlr_layer_shell_v1 required for selection overlay".into());
-    }
-    if state.outputs.is_empty() {
-        return Err("compositor did not advertise any wl_output".into());
-    }
-    if state.pointer.is_none() {
-        return Err("no wl_pointer from wl_seat is available for selection".into());
-    }
-    validate_frozen_outputs(&state.outputs, &state.frozen_outputs)?;
-    create_overlays(&mut state, &qh)?;
-    conn.flush()?;
-
-    while selection_loop_active(&state) {
-        event_queue.blocking_dispatch(&mut state)?;
-    }
-    if state.drag == DragState::Cancelled {
-        Ok(SelectionOutcome::Cancelled)
-    } else if state.long_requested {
-        Ok(SelectionOutcome::LongModeRequested(state.selected_viewport()?))
-    } else {
-        Ok(SelectionOutcome::Selected(state.selected_viewport()?))
     }
 }
 
@@ -834,40 +860,11 @@ impl SelectionSession {
                 None => Vec::new(),
             },
         };
-        let mut state = UiState {
-            compositor: None,
-            shm: None,
-            layer_shell: None,
-            xdg_output_manager: None,
-            viewporter: None,
-            fractional_scale_manager: None,
-            seat: None,
-            pointer: None,
-            keyboard: None,
-            outputs: Vec::new(),
+        let mut state = UiState::unbound(
             frozen_outputs,
-            overlays: Vec::new(),
-            pointer_output_name: None,
             long_mode,
-            screenshot_cursor_hidden: true,
-            pointer_x: 0,
-            pointer_y: 0,
-            drag: DragState::Idle,
-            long_requested: false,
-            long_finish_requested: false,
-            long_direction: None,
-            long_preview: None,
-            stitch_warning: false,
-            pending_render: None,
-            editing: false,
-            edit_drag: None,
-            capture_pending: None,
-            capture_invalid: false,
-            selection_anchor: None,
-            border_width: border_width.clamp(crate::config::BORDER_WIDTH_MIN, crate::config::BORDER_WIDTH_MAX),
-            live_state_seq: 1,
-        render_scope: None,
-        };
+            border_width,
+        );
 
         conn.display().get_registry(&qh, ());
         event_queue.roundtrip(&mut state)?;
@@ -1019,6 +1016,7 @@ impl SelectionSession {
         self.state.long_direction
     }
 
+    #[cfg_attr(not(any(test, feature = "trace-logs")), allow(dead_code))]
     pub fn screenshot_cursor_hidden(&self) -> bool {
         self.state.screenshot_cursor_hidden
     }
@@ -1061,6 +1059,7 @@ impl SelectionSession {
         Ok(())
     }
 
+    #[cfg_attr(not(any(test, feature = "trace-logs")), allow(dead_code))]
     pub fn stitch_warning(&self) -> bool {
         self.state.stitch_warning
     }
@@ -1134,6 +1133,8 @@ impl SelectionSession {
     /// Return the exact selection used. Subsequent edits invalidate that frame.
     pub fn prepare_capture_clean(&mut self) -> Result<Option<LogicalRect>, Box<dyn Error>> {
         for attempt in 0..6 {
+            #[cfg(not(feature = "trace-logs"))]
+            let _ = attempt;
             self.event_queue.dispatch_pending(&mut self.state)?;
             if self.state.edit_drag.is_some() {
                 crate::trace_log!("prepare: skip edit_drag active");
@@ -1161,6 +1162,9 @@ impl SelectionSession {
             self.state.capture_pending = Some(rect);
             self.state.capture_invalid = false;
             {
+                #[cfg(not(feature = "trace-logs"))]
+                let _ = output_name;
+                #[cfg(feature = "trace-logs")]
                 let target = self.state.overlays.iter().find(|o| o.output_name == output_name);
                 crate::trace_log!(
                     "prepare: target output={} cache={} buffers={} available={}",
@@ -1673,16 +1677,19 @@ fn toggle_frozen_frame(state: &mut UiState) {
     queue_render(state, false);
 }
 
-fn queue_render(state: &mut UiState, full: bool) {
-    // Long capture is single-screen: scope the render (and the pending debt)
-    // to the selected output. The other outputs' overlays are static frozen
-    // images; counting them here would make the debt clearable only when
-    // every output's canvas turns over in one pass, which per-output release
-    // timing never guarantees.
-    let (committed, expected) = match state.render_scope {
+/// Renders what it can and records a debt when some overlay had no buffer.
+///
+/// Returns `(committed, expected)` so the caller can decide what to do with the
+/// shortfall. Long capture is single-screen: while `render_scope` is set the
+/// render — and the debt — cover only the selected output. The other outputs'
+/// overlays are static frozen images, and counting them would make the debt
+/// clearable only when every output's canvas turns over in one pass, which
+/// per-output release timing never guarantees.
+fn render_scoped(state: &mut UiState, full: bool) -> (usize, usize) {
+    match state.render_scope {
         Some(name) => (
             render_live_overlays(state, Some(name)),
-            state.overlays.iter().filter(|o| o.output_name == name).count(),
+            state.overlays.iter().filter(|overlay| overlay.output_name == name).count(),
         ),
         None => {
             let committed = if full {
@@ -1692,26 +1699,25 @@ fn queue_render(state: &mut UiState, full: bool) {
             };
             (committed, state.overlays.len())
         }
-    };
-    state.pending_render = if committed < expected { Some(full) } else { None };
+    }
 }
 
+/// Renders now, and remembers the request when an overlay had no free buffer.
+///
+/// The debt is what makes a redraw survive a busy buffer set: it is retried
+/// from `wl_buffer.release` (`flush_pending_render`), which is the next moment
+/// a redraw can succeed.
+fn queue_render(state: &mut UiState, full: bool) {
+    let (committed, expected) = render_scoped(state, full);
+    state.pending_render = (committed < expected).then_some(full);
+}
+
+/// Retries a queued render. Called on every buffer release so a render that
+/// could not commit — every buffer of that output still held by the
+/// compositor — goes out as soon as one comes back.
 fn flush_pending_render(state: &mut UiState) {
     let Some(full) = state.pending_render else { return; };
-    let (committed, expected) = match state.render_scope {
-        Some(name) => (
-            render_live_overlays(state, Some(name)),
-            state.overlays.iter().filter(|o| o.output_name == name).count(),
-        ),
-        None => {
-            let committed = if full {
-                render_overlays_full_dim(state)
-            } else {
-                render_overlays(state)
-            };
-            (committed, state.overlays.len())
-        }
-    };
+    let (committed, expected) = render_scoped(state, full);
     crate::trace_log!(
         "flush_pending: full={} committed={}/{} (scope={:?}) -> pending={}",
         full,
@@ -1835,7 +1841,7 @@ fn frozen_output_from_image(output_name: u32, image: &Image) -> Result<FrozenOut
     if !matches!(image.format, Format::Xrgb8888 | Format::Argb8888) {
         return Err(format!("unsupported frozen output format for output {output_name}: {:?}", image.format).into());
     }
-    if image.width <= 0 || image.height <= 0 {
+    if image.width == 0 || image.height == 0 {
         return Err(format!("frozen output {output_name} dimensions must be positive").into());
     }
     let minimum_stride = image.width.checked_mul(4).ok_or("frozen output stride overflow")?;
@@ -2375,6 +2381,8 @@ fn refresh_overlay_surface(state: &mut UiState, output_name: u32, qh: &QueueHand
             }
             Err(err) => {
                 crate::trace_log!("overlay: buffers FAILED output={} err={}", output_name, err);
+                #[cfg(not(feature = "trace-logs"))]
+                let _ = &err;
                 state.drag = DragState::Cancelled;
                 return;
             }
@@ -2497,6 +2505,7 @@ impl Dispatch<WlRegistry, ()> for UiState {
                     output,
                     xdg_output: None,
                     mode_pixels: None,
+                    position: OutputPositionSource::default(),
                 });
             }
             _ => {}
@@ -2721,6 +2730,10 @@ impl Dispatch<WlOutput, u32> for UiState {
         };
         match event {
             wl_output::Event::Scale { factor } => output.info.scale = factor.max(1),
+            wl_output::Event::Geometry { x, y, .. } => {
+                output.position.set_geometry(x, y);
+                output.resolve_logical_position();
+            }
             wl_output::Event::Mode { flags, width, height, .. } => {
                 if matches!(flags, WEnum::Value(flags) if flags.contains(wl_output::Mode::Current)) {
                     output.mode_pixels = Some((width.max(1), height.max(1)));
@@ -2744,8 +2757,8 @@ impl Dispatch<ZxdgOutputV1, u32> for UiState {
         };
         match event {
             zxdg_output_v1::Event::LogicalPosition { x, y } => {
-                output.info.logical.x = x;
-                output.info.logical.y = y;
+                output.position.set_logical(x, y);
+                output.resolve_logical_position();
             }
             zxdg_output_v1::Event::LogicalSize { width, height } => {
                 output.info.logical.width = width.max(1);
@@ -3613,40 +3626,44 @@ mod tests {
     }
 
     fn ui_state() -> UiState {
-        UiState {
-            compositor: None,
-            shm: None,
-            layer_shell: None,
-            xdg_output_manager: None,
-            viewporter: None,
-            fractional_scale_manager: None,
-            seat: None,
-            pointer: None,
-            keyboard: None,
-            outputs: Vec::new(),
-            frozen_outputs: Vec::new(),
-            overlays: Vec::new(),
-            pointer_output_name: None,
-            long_mode: false,
-            screenshot_cursor_hidden: true,
-            pointer_x: 0,
-            pointer_y: 0,
-            drag: DragState::Idle,
-            long_requested: false,
-            long_finish_requested: false,
-            long_direction: None,
-            long_preview: None,
-            stitch_warning: false,
-            pending_render: None,
-            editing: false,
-            edit_drag: None,
-            capture_pending: None,
-            capture_invalid: false,
-            selection_anchor: None,
-            border_width: crate::config::DEFAULT_BORDER_WIDTH,
-            live_state_seq: 1,
-        render_scope: None,
-        }
+        UiState::unbound(Vec::new(), false, crate::config::DEFAULT_BORDER_WIDTH)
+    }
+
+    /// `zxdg_output_v1` is the layout authority; `wl_output.geometry` only
+    /// covers a compositor that does not speak it.
+    #[test]
+    fn an_output_falls_back_to_geometry_position_without_xdg_output() {
+        // niri and anything else with the xdg output manager: logical wins.
+        let mut position = OutputPositionSource::default();
+        position.set_logical(1920, 0);
+        position.set_geometry(3840, 0);
+        assert_eq!(position.resolve(), Some((1920, 0)));
+
+        // Without xdg_output, geometry is all there is — and the alternative is
+        // leaving every output at the (0, 0) placeholder, which makes a
+        // two-screen desktop one rectangle and every selection look spanning.
+        let mut position = OutputPositionSource::default();
+        position.set_geometry(1920, 0);
+        assert_eq!(position.resolve(), Some((1920, 0)));
+
+        // Neither has arrived yet: leave the seeded placeholder alone.
+        assert_eq!(OutputPositionSource::default().resolve(), None);
+    }
+
+    /// The order the two events arrive in must not decide the answer: a
+    /// `geometry` landing *after* a `logical_position` must not overwrite it.
+    #[test]
+    fn a_later_geometry_event_does_not_override_the_logical_position() {
+        let mut position = OutputPositionSource::default();
+        position.set_logical(1920, 0);
+        assert_eq!(position.resolve(), Some((1920, 0)));
+        // …then wl_output.geometry, reporting a different (pixel) origin.
+        position.set_geometry(3840, 0);
+        assert_eq!(
+            position.resolve(),
+            Some((1920, 0)),
+            "geometry must stay the fallback, not become a second authority"
+        );
     }
 
     #[test]

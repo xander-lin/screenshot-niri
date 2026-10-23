@@ -41,10 +41,6 @@ pub struct ClipboardProviderArgs {
     pub mode: ClipboardMode,
 }
 
-/// Hardcoded default long-capture frame-rate cap (fps).
-pub use crate::config::DEFAULT_MAX_FRAME_RATE;
-/// Hardcoded default selection-border thickness in logical pixels.
-pub use crate::config::DEFAULT_BORDER_WIDTH;
 /// Upper bound accepted for `--fps`.
 pub use crate::config::MAX_FRAME_RATE_LIMIT;
 

@@ -22,7 +22,7 @@
 #[cfg(test)]
 use std::collections::VecDeque;
 
-use super::placement::SearchAxis;
+use super::types::SearchAxis;
 use super::rgb::RgbSource;
 use super::{
     minimum_overlap, AppendDirection, FrameMatch, SearchDirection, StitchedFrame, ViewportRect,
@@ -577,6 +577,8 @@ pub enum RejectReason {
 }
 
 impl RejectReason {
+    /// Human-readable reason, for trace logs and failure messages.
+    #[cfg_attr(not(feature = "trace-logs"), allow(dead_code))]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Uninitialised => "uninitialised",
@@ -633,6 +635,9 @@ pub(super) struct PlacementRequest<'a> {
     pub stitched: &'a StitchedFrame,
     pub previous_rect: ViewportRect,
     pub frame: &'a dyn RgbSource,
+    /// The user's arrow-key hint; only the legacy scan consumes it (the
+    /// shipped matcher derives the axis from the capture's own impulse).
+    #[cfg_attr(not(feature = "stitch-legacy"), allow(dead_code))]
     pub search_direction: Option<SearchDirection>,
     /// Consecutive refusals before this frame. The anchor stage is gated on
     /// this: it exists to recover from a red border, not to run on every frame
@@ -640,10 +645,12 @@ pub(super) struct PlacementRequest<'a> {
     pub refusals: u32,
 }
 
-/// Object-safe facade over `RgbSource`, so a boxed engine can still hand the
-/// frame to generic code.
+/// Wraps a borrowed frame as an `RgbSource` for the legacy canvas scan, which
+/// takes `&impl RgbSource` where the engine has `&dyn RgbSource`.
+#[cfg(feature = "stitch-legacy")]
 pub(super) struct DynRgbSource<'a>(pub &'a dyn RgbSource);
 
+#[cfg(feature = "stitch-legacy")]
 impl RgbSource for DynRgbSource<'_> {
     fn width(&self) -> u32 {
         self.0.width()
@@ -665,6 +672,8 @@ impl RgbSource for DynRgbSource<'_> {
 /// the canvas it describes. `reset` returns the engine to its just-constructed
 /// state (selection-box edits do this).
 pub(super) trait PlacementEngine {
+    /// Identifies the engine in traces and in tests that pick one.
+    #[cfg_attr(not(any(test, feature = "trace-logs")), allow(dead_code))]
     fn name(&self) -> &'static str;
     fn place(&mut self, request: &PlacementRequest<'_>) -> EngineDecision;
     /// Records an accepted frame. `top` is the canvas row the engine asked for
@@ -1695,7 +1704,7 @@ impl PlacementEngine for LegacyPipeline {
     }
 
     fn place(&mut self, request: &PlacementRequest<'_>) -> EngineDecision {
-        let axis = super::canvas_search_axis(request.search_direction);
+        let axis = super::placement::canvas_search_axis(request.search_direction);
         let Some(match_info) = super::find_canvas_placement_match(
             request.stitched,
             request.previous_rect,

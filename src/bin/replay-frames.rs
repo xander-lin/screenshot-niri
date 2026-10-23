@@ -83,7 +83,6 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut ambiguous_pairs = 0u32;
     let mut delta_mismatch = 0u32;
     let mut canvas_top = 0i32;
-    let mut worst: Vec<(u32, i32)> = Vec::new();
     let mut placements: Vec<(usize, i32)> = Vec::new();
     let mut blended_pair_costs: Vec<(usize, f64)> = Vec::new();
     let mut pair_costs: Vec<f64> = Vec::new();
@@ -91,7 +90,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     // every step, and the largest gap between that chain and the engine's.
     let mut expected_top = 0i32;
     let mut max_drift: (usize, i32) = (0, 0);
-    let mut final_drift: Option<i32> = None;
+    // The drift of the last accepted frame; only its final value is reported.
+    let final_drift: Option<i32>;
     // Per-frame stitcher wall time (production caliber: the whole push call,
     // excluding PNG decode and the exhaustive oracle).
     let mut push_total_ns = 0u64;
@@ -527,16 +527,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         final_drift = Some(top - expected_top);
         println!(
             "  chain drift vs truth: max {} px at frame {}, final {} px",
-            max_drift.1, max_drift.0, final_drift.unwrap_or(0)
+            max_drift.1,
+            max_drift.0,
+            final_drift.unwrap_or(0)
         );
     }
     println!("  delta differs from the pairwise truth {delta_mismatch}  (a recovery gap, not a misplacement)");
     println!("  ambiguous pairs {ambiguous_pairs}  (content matched at several offsets)");
     if oracle_failed > 0 {
         println!("  oracle could not decide {oracle_failed} pairs (no overlap)");
-    }
-    if !worst.is_empty() {
-        println!("  worst misplacements: {worst:?}");
     }
     println!("  canvas height reached: {canvas_top}");
     if push_count > 0 {
@@ -1063,7 +1062,7 @@ fn write_descriptor_dump(
     let scale: u32 = 4;
     let dw = width * scale;
     let dh = height;
-    let mut desc = Vec::with_capacity((dw as usize * dh as usize * 4));
+    let mut desc = Vec::with_capacity(dw as usize * dh as usize * 4);
     for y in 0..height {
         for x in 0..dw {
             let cell = data[(y * width + x / scale) as usize];
@@ -1088,7 +1087,7 @@ fn write_descriptor_dump(
     let fh = frame.height.max(1);
     let target_h = height;
     let target_w = (fw * target_h / fh).max(1);
-    let mut orig = Vec::with_capacity((target_w as usize * target_h as usize * 4));
+    let mut orig = Vec::with_capacity(target_w as usize * target_h as usize * 4);
     for y in 0..target_h {
         let sy = (y as u64 * fh as u64 / target_h as u64) as u32;
         for x in 0..target_w {

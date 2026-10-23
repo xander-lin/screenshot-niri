@@ -33,6 +33,11 @@ pub fn edge_gate_trace_enabled() -> bool {
     std::env::var_os("SCREENSHOT_TRACE_EDGE_GATE").is_some()
 }
 
+/// Whether to accept placements from the fast-motion scan.
+///
+/// Only the legacy pipeline consults it, so the stub is marked rather than
+/// reported as dead code in a build that has no legacy pipeline.
+#[cfg_attr(not(feature = "stitch-legacy"), allow(dead_code))]
 pub fn fast_motion_accept_enabled() -> bool {
     std::env::var_os("SCREENSHOT_FAST_MOTION_ACCEPT").is_some()
 }
@@ -61,6 +66,7 @@ pub fn trace_deep_profile_enabled() -> bool {
 }
 
 #[cfg(not(feature = "trace-logs"))]
+#[cfg_attr(not(feature = "stitch-legacy"), allow(dead_code))]
 pub fn trace_fast_motion_enabled() -> bool {
     false
 }

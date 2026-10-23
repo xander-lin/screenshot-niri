@@ -112,6 +112,7 @@ impl RowCoverage {
     }
 
     /// Number of captured pixels in this row, capped at `width`.
+    #[cfg_attr(not(any(test, feature = "stitch-legacy")), allow(dead_code))]
     pub fn captured_width(&self, width: u32) -> u32 {
         match self {
             RowCoverage::Empty => 0,
@@ -153,9 +154,13 @@ pub struct StitchedFrame {
     pub current_origin_y: i32,
     pub anchor_origin_x: i32,
     pub anchor_origin_y: i32,
+    #[cfg_attr(not(feature = "stitch-legacy"), allow(dead_code))]
     pub compose_width: u32,
+    #[cfg_attr(not(feature = "stitch-legacy"), allow(dead_code))]
     pub compose_height: u32,
+    #[cfg_attr(not(feature = "stitch-legacy"), allow(dead_code))]
     pub active_crop: ComposeCrop,
+    #[cfg_attr(not(feature = "stitch-legacy"), allow(dead_code))]
     pub fixed_bands: FixedBands,
     /// Captured horizontal extent of each canvas row.
     ///
@@ -181,18 +186,30 @@ impl std::fmt::Debug for StitchedFrame {
     }
 }
 
+/// The canvas accessors the stitcher and the tests read it through.
+///
+/// A `StitchedFrame` is deliberately `!Clone`, so these are the only way to
+/// look at its pixels: the canvas lives in tiles that may be packed, and every
+/// read has to go through the store. Two of them (`copy_region`,
+/// `memory_report`) have no caller in the shipped binary — they exist because
+/// they are the accessors a caller would reach for, and because the memory
+/// report is what the tile budget is documented against — so they are marked
+/// rather than deleted.
 impl StitchedFrame {
     /// One canvas pixel, or `None` where the canvas never captured anything.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn pixel(&self, x: u32, y: u32) -> Option<[u8; 3]> {
         self.store.pixel(x, y as i32)
     }
 
     /// Copies one row's RGB bytes into `out` (`stride` bytes).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn copy_row(&self, y: u32, out: &mut [u8]) -> bool {
         self.store.row_into(0, y as i32, out)
     }
 
     /// Copies a rectangle out, row by row, into `out` at `out_stride`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn copy_region(
         &self,
         x: u32,
@@ -210,6 +227,7 @@ impl StitchedFrame {
     /// For consumers that need every pixel at once — the final PNG encode, the
     /// offline replay tool — and only there: it materialises the canvas that the
     /// store exists to avoid materialising.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn to_rgb_buffer(&self) -> Vec<u8> {
         let mut out = vec![0u8; self.stride as usize * self.height as usize];
         for y in 0..self.height {
@@ -225,6 +243,7 @@ impl StitchedFrame {
     /// Two frames with the same digest hold the same pixels whether one of them
     /// has its bands packed and the other does not, which is what makes it
     /// usable as a "nothing was written" assertion across the store.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn pixel_digest(&self) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
         let _ = self.store.with_row_digest(&mut hash);
@@ -232,6 +251,7 @@ impl StitchedFrame {
     }
 
     /// What the canvas costs right now, in bytes.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn memory_report(&self) -> CanvasMemoryReport {
         self.store.report()
     }
@@ -350,7 +370,9 @@ pub enum StitchDecisionPath {
     Initialized,
     Duplicate,
     CanvasAccepted,
+    #[cfg_attr(not(feature = "stitch-legacy"), allow(dead_code))]
     PerceptualAccepted,
+    #[cfg_attr(not(feature = "stitch-legacy"), allow(dead_code))]
     FallbackAccepted,
     NoMatch,
 }
@@ -375,6 +397,29 @@ pub enum SearchDirection {
     Right,
     Left,
 }
+
+/// The axis a placement search runs along.
+///
+/// Lives beside `SearchDirection` because both belong to the shipped matcher:
+/// the direction is what the user hinted, the axis is what that hint *seeds*.
+/// The old whole-canvas scan (which used to define this) is feature-gated, and
+/// production code must not have to import from a module it does not build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchAxis {
+    #[default]
+    Vertical,
+    Horizontal,
+}
+
+impl SearchAxis {
+    pub fn other(self) -> Self {
+        match self {
+            Self::Vertical => Self::Horizontal,
+            Self::Horizontal => Self::Vertical,
+        }
+    }
+}
+
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]

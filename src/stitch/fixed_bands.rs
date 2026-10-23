@@ -37,6 +37,11 @@ impl Default for FixedBandDetector {
 }
 
 impl FixedBandDetector {
+    /// Records one frame pair for the trace-only fixed-band diagnostics.
+    ///
+    /// Deliberately unused outside `trace-logs` and tests: fixed bands are
+    /// reported, never applied (see AGENTS.md, "trace only, never applied").
+    #[cfg_attr(not(any(feature = "trace-logs", test)), allow(dead_code))]
     pub(super) fn observe(
         &mut self,
         previous: &RgbFrame,

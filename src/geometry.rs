@@ -348,6 +348,64 @@ mod tests {
         assert!(!rect_spans_outputs(outside, &outputs));
     }
 
+    /// A single screen is the layout the two-screen rig never exercised, and
+    /// every rule that counts intersections must still hold there: one region,
+    /// no span, and a long-capture region available.
+    #[test]
+    fn a_single_output_is_one_region_and_never_spans() {
+        let outputs = [OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 0, width: 1920, height: 1080 }, scale: 1 }];
+        let inside = LogicalRect { x: 100, y: 100, width: 200, height: 200 };
+        let viewport = SelectedViewport::from_outputs(inside, &outputs).unwrap();
+        assert_eq!(viewport.regions.len(), 1);
+        assert!(!rect_spans_outputs(inside, &outputs));
+        assert!(prepare_capture_region(inside, &outputs).is_some());
+    }
+
+    /// Three screens in a row: the offsets are accumulated across *every*
+    /// covered output, not just the first two. Nothing may be written twice or
+    /// skipped when the selection crosses two seams.
+    #[test]
+    fn a_selection_across_three_outputs_stays_contiguous() {
+        let outputs = [
+            OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 0, width: 100, height: 80 }, scale: 1 },
+            OutputInfo { global_name: 2, logical: LogicalRect { x: 100, y: 0, width: 100, height: 80 }, scale: 1 },
+            OutputInfo { global_name: 3, logical: LogicalRect { x: 200, y: 0, width: 100, height: 80 }, scale: 1 },
+        ];
+        let captures = [captured(1, 100, 80), captured(2, 100, 80), captured(3, 100, 80)];
+        let viewport = SelectedViewport::from_outputs(LogicalRect { x: 90, y: 10, width: 120, height: 20 }, &outputs).unwrap();
+        assert_eq!(viewport.regions.len(), 3);
+        let regions = viewport.capture_regions(&captures);
+        let mut placed = 0u32;
+        for region in &regions {
+            assert_eq!(region.dst_x, placed, "output {} starts at the wrong column", region.output_name);
+            placed += u32::try_from(region.region.width).unwrap();
+        }
+        assert_eq!(viewport.capture_size(&captures).unwrap(), (120, 20));
+    }
+
+    /// Screens stacked vertically, and a screen placed at a negative origin
+    /// (to the left of / above the primary). Both are ordinary desktop layouts
+    /// that a side-by-side rig never reaches.
+    #[test]
+    fn stacked_and_negative_origin_layouts_map_into_local_coordinates() {
+        let stacked = [
+            OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 0, width: 100, height: 80 }, scale: 1 },
+            OutputInfo { global_name: 2, logical: LogicalRect { x: 0, y: 80, width: 100, height: 80 }, scale: 1 },
+        ];
+        let viewport = SelectedViewport::from_outputs(LogicalRect { x: 10, y: 70, width: 20, height: 20 }, &stacked).unwrap();
+        assert_eq!(viewport.regions.len(), 2);
+        assert_eq!((viewport.regions[0].local_region.y, viewport.regions[0].local_region.height), (70, 10));
+        assert_eq!((viewport.regions[1].local_region.y, viewport.regions[1].local_region.height), (0, 10));
+
+        let negative = [
+            OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 0, width: 100, height: 80 }, scale: 1 },
+            OutputInfo { global_name: 2, logical: LogicalRect { x: -100, y: 0, width: 100, height: 80 }, scale: 1 },
+        ];
+        let viewport = SelectedViewport::from_outputs(LogicalRect { x: -50, y: 10, width: 20, height: 20 }, &negative).unwrap();
+        assert_eq!(viewport.regions.len(), 1);
+        assert_eq!(viewport.regions[0].local_region.x, 50);
+    }
+
     #[test]
     fn clamp_to_largest_output_keeps_dominant_piece() {
         let outputs = [

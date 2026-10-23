@@ -132,6 +132,12 @@ fn estimate_vertical_fuzzy_hash_motion_with_max_average_diff(
     None
 }
 
+/// Motion estimate from the perceptual row hashes.
+///
+/// Only the legacy pipeline consumes it (`DefaultPlacementPipeline`); the
+/// shipped matcher reads boundary descriptors instead. Kept for A/B, gated
+/// with its caller.
+#[cfg(feature = "stitch-legacy")]
 pub(super) fn estimate_vertical_perceptual_hash_motion_from_frame(
     previous: &PerceptualFrame,
     current: &PerceptualFrame,
@@ -150,6 +156,7 @@ pub(super) fn estimate_vertical_perceptual_hash_motion_from_frame(
     })
 }
 
+#[cfg(feature = "stitch-legacy")]
 fn estimate_vertical_perceptual_hash_motion_from_frame_with_max_average_diff(
     previous: &PerceptualFrame,
     current: &PerceptualFrame,

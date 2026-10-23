@@ -14,8 +14,10 @@ mod canvas;
 mod engine;
 mod fixed_bands;
 mod hash;
+#[cfg(any(test, feature = "stitch-legacy"))]
 mod motion;
 mod perceptual;
+#[cfg(feature = "stitch-legacy")]
 mod placement;
 mod rgb;
 mod store;
@@ -30,11 +32,10 @@ use canvas::{
 use fixed_bands::detect_fixed_bands;
 use fixed_bands::{FixedBandDetector, FixedBandObservation};
 #[cfg(any(test, feature = "stitch-legacy"))]
+#[cfg(feature = "stitch-legacy")]
 use hash::estimate_vertical_perceptual_hash_motion_from_frame;
 #[cfg(any(test, feature = "stitch-legacy"))]
-use motion::scan_fast_vertical_motion;
 #[cfg(test)]
-use motion::{compare_fast_motion_candidates, score_fast_motion_delta};
 #[cfg(test)]
 use perceptual::estimate_vertical_perceptual_motion_from_frame;
 #[cfg(test)]
@@ -48,10 +49,7 @@ use perceptual::{
 use perceptual::perceptual_frame_match;
 use perceptual::{PerceptualFrame, PerceptualMotionEstimate, PERCEPTUAL_MOTION_ADJACENT_DELTA};
 #[cfg(feature = "stitch-legacy")]
-use placement::canvas_search_axis;
-#[cfg(any(test, feature = "stitch-legacy"))]
-use placement::find_canvas_placement_match;
-use placement::SearchAxis;
+use placement::{canvas_search_axis, find_canvas_placement_match};
 use engine::{EngineDecision, PlacementEngine, PlacementRequest, WindowedEdgeMatcher};
 use rgb::{
     average_difference_same_source, average_luminance_difference_source, crop_rgb_frame,
@@ -74,7 +72,8 @@ pub use engine::RejectReason;
 pub use types::{
     AppendDirection, ComposeCrop, DuplicateAnalysisMotion, FastMotionAgreement,
     FastMotionCandidate, FastMotionTrace, FastMotionVerifyPass, FixedBands, FrameMatch,
-    FrameScreenOffset, MotionEstimate, PushResult, RgbFrame, RowCoverage, SearchDirection,
+    FrameScreenOffset, MotionEstimate, PushResult, RgbFrame, RowCoverage, SearchAxis,
+    SearchDirection,
     StitchDecisionPath, StitchProfileBreakdown, StitchedFrame, ViewportRect,
 };
 
@@ -83,6 +82,8 @@ const MATCH_LINE_SAMPLE_STEP: u32 = 4;
 const MATCH_PREFILTER_MAX_AVERAGE_DIFF: f64 = 12.0;
 const MATCH_PREFILTER_SAMPLE_STEP: u32 = 2;
 const MATCH_MIN_OVERLAP_PIXELS: u32 = 16;
+/// Score ceiling for the fast-motion scan (legacy pipeline only).
+#[cfg(any(test, feature = "stitch-legacy"))]
 const FAST_MOTION_MAX_SCORE: f64 = 8.0;
 const DUPLICATE_ANALYSIS_ROW_DIFF_THRESHOLD: f64 = 3.0;
 /// Rows of *proven* overlap the stale-edge recovery needs before it may place a
@@ -216,6 +217,9 @@ where
     search_direction: Option<SearchDirection>,
     profile_enabled: bool,
 }
+
+#[cfg(any(test, feature = "stitch-legacy"))]
+use motion::{compare_fast_motion_candidates, scan_fast_vertical_motion, score_fast_motion_delta};
 
 #[cfg(feature = "stitch-legacy")]
 #[derive(Debug, Default, Clone)]
@@ -1341,6 +1345,8 @@ impl RawStitcher {
         Ok(true)
     }
 
+    /// Trace-only: logs when the perceptual motion estimate changes.
+    #[cfg_attr(not(feature = "trace-logs"), allow(dead_code))]
     fn trace_perceptual_motion_if_changed(&mut self, estimate: Option<PerceptualMotionEstimate>) {
         #[cfg(feature = "trace-logs")]
         {
@@ -1382,6 +1388,7 @@ impl RawStitcher {
         }
     }
 
+    #[cfg_attr(not(feature = "trace-logs"), allow(dead_code))]
     fn trace_fixed_bands_if_changed(&mut self, observation: FixedBandObservation) {
         #[cfg(feature = "trace-logs")]
         {
@@ -1417,11 +1424,13 @@ impl RawStitcher {
     }
 
     /// Canvas row of the most recent accepted placement, in logical coordinates.
+    #[cfg_attr(not(any(test, feature = "trace-logs")), allow(dead_code))]
     pub fn last_engine_top(&self) -> Option<i32> {
         self.last_engine_top
     }
 
     /// Logical row that pixel-canvas row 0 corresponds to.
+    #[cfg_attr(not(any(test, feature = "trace-logs")), allow(dead_code))]
     pub fn canvas_origin(&self) -> i32 {
         self.canvas_origin
     }
@@ -1641,6 +1650,8 @@ fn scan_fast_vertical_motion_candidate(
     scan_fast_vertical_motion(previous, current, search_direction)?.candidate
 }
 
+/// Trace-only: describes how the fast-motion candidate compares with the eventual placement.
+#[cfg_attr(not(any(feature = "stitch-legacy", feature = "trace-logs")), allow(dead_code))]
 fn compare_fast_motion_candidate(
     candidate: Option<FastMotionCandidate>,
     match_info: Option<FrameMatch>,
@@ -1668,6 +1679,8 @@ fn compare_fast_motion_candidate(
     }
 }
 
+/// Trace-only: describes the candidate's delta against the reference.
+#[cfg_attr(not(any(feature = "stitch-legacy", feature = "trace-logs")), allow(dead_code))]
 fn compare_fast_motion_delta(
     candidate_delta_y: i32,
     reference_delta_y: i32,
@@ -1697,6 +1710,8 @@ fn compare_fast_motion_delta(
     }
 }
 
+/// Trace-only: the reference delta a fast-motion candidate is checked against.
+#[cfg_attr(not(any(feature = "stitch-legacy", feature = "trace-logs")), allow(dead_code))]
 fn fast_motion_reference_delta_y(match_info: FrameMatch) -> Option<i32> {
     match match_info.direction {
         AppendDirection::Bottom | AppendDirection::Top => Some(-match_info.delta_y),
@@ -4012,6 +4027,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "stitch-legacy")]
     fn canvas_placement_finds_far_vertical_match_via_coarse_refine_search() {
         let world = textured_frame(32, 420);
         let stitched = StitchedFrame::from_first_frame(&world);
@@ -4039,6 +4055,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "stitch-legacy")]
     fn canvas_placement_rejects_opposite_vertical_direction() {
         let world = textured_frame(32, 120);
         let stitched = StitchedFrame::from_first_frame(&crop_frame(&world, 0, 24, 32, 48));
@@ -4071,6 +4088,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "stitch-legacy")]
     fn canvas_placement_rejects_opposite_horizontal_direction() {
         let world = textured_frame(120, 32);
         let stitched = StitchedFrame::from_first_frame(&crop_frame(&world, 24, 0, 48, 32));
@@ -4657,7 +4675,7 @@ mod tests {
         // Uncovered top-right corner of the L stays transparent on output;
         // the bottom row is covered only where the old canvas sits (x 3..7).
         let image = image_from_stitched_frame(stitched).unwrap();
-        assert_eq!(image.data[(0 * 7 + 6) * 4 + 3], 0);
+        assert_eq!(image.data[6 * 4 + 3], 0);
         assert_eq!(image.data[(5 * 7 + 0) * 4 + 3], 0);
         assert_eq!(image.data[(5 * 7 + 3) * 4 + 3], 255);
     }
