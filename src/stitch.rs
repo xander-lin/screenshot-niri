@@ -796,24 +796,22 @@ impl RawStitcher {
             EngineDecision::Reject { .. } => false,
         };
         if primary_reason.is_some() || primary_is_zero {
-            if self.second_axis_can_help(previous_rect, &active_compose) {
-                let attempt = self.place_on_axis(
-                    primary_axis.other(),
-                    previous_rect,
-                    &active_compose,
-                    search_direction,
-                    false,
-                );
-                let improved = match &attempt {
-                    EngineDecision::Place { match_info, .. } => {
-                        !primary_is_zero || match_info.delta_x != 0 || match_info.delta_y != 0
-                    }
-                    EngineDecision::Reject { .. } => false,
-                };
-                if improved {
-                    placed_axis = primary_axis.other();
-                    decision = attempt;
+            let attempt = self.place_on_axis(
+                primary_axis.other(),
+                previous_rect,
+                &active_compose,
+                search_direction,
+                false,
+            );
+            let improved = match &attempt {
+                EngineDecision::Place { match_info, .. } => {
+                    !primary_is_zero || match_info.delta_x != 0 || match_info.delta_y != 0
                 }
+                EngineDecision::Reject { .. } => false,
+            };
+            if improved {
+                placed_axis = primary_axis.other();
+                decision = attempt;
             }
         }
         let horizontal = placed_axis == SearchAxis::Horizontal;
@@ -826,7 +824,7 @@ impl RawStitcher {
         let (candidate_rect, match_info) = match decision {
             EngineDecision::Place { rect, match_info } => (rect, match_info),
             EngineDecision::Reject { reason } => {
-                self.last_reject_reason = Some(primary_reason.unwrap_or(reason));
+                self.last_reject_reason = Some(reason);
                 if crate::trace::trace_verbose_enabled() {
                     crate::trace_log!("stitch: engine refused reason={}", reason.as_str());
                 }
@@ -995,26 +993,6 @@ impl RawStitcher {
         }
     }
 
-    /// Whether asking the other axis is worth anything.
-    ///
-    /// A frame that does not overlap the canvas where it was captured shares no
-    /// content with anything already placed, so no axis can verify it. That
-    /// happens when the selection box was moved to a region nothing has
-    /// captured yet, and it is knowable from geometry alone — before paying for
-    /// a second search.
-    fn second_axis_can_help(&self, previous_rect: ViewportRect, frame: &impl RgbSource) -> bool {
-        let Some(stitched) = self.stitched.as_ref() else {
-            return false;
-        };
-        crate::stitch::canvas::canvas_overlap_rect(
-            stitched,
-            frame,
-            previous_rect.x,
-            previous_rect.y,
-        )
-        .is_some()
-    }
-
     /// Asks one axis for a placement.
     ///
     /// `primary` separates the two roles an axis can play. The impulse axis is
@@ -1085,7 +1063,11 @@ impl RawStitcher {
                 }
                 #[cfg(feature = "stitch-legacy")]
                 {
-                    self.legacy_horizontal_placement(previous_rect, frame, hint, None)
+                    // The axis and the direction are the caller's, not the
+                    // hint's: after a horizontal edit the hint can still say
+                    // "down" while the capture is moving sideways, and the
+                    // primary axis searches both ways.
+                    self.legacy_horizontal_placement(stitched, previous_rect, frame, direction)
                 }
             }
         }
@@ -1093,23 +1075,14 @@ impl RawStitcher {
 
     #[cfg(feature = "stitch-legacy")]
     fn legacy_horizontal_placement(
-        &mut self,
+        &self,
+        stitched: &StitchedFrame,
         previous_rect: ViewportRect,
         frame: &impl RgbSource,
         search_direction: Option<SearchDirection>,
-        _window: Option<(i32, i32)>,
     ) -> EngineDecision {
-        // The axis is the caller's, not the hint's: after a horizontal edit the
-        // hint can still say "down" while the capture is moving sideways.
         match find_canvas_placement_match(
-            match self.stitched.as_ref() {
-                Some(stitched) => stitched,
-                None => {
-                    return EngineDecision::Reject {
-                        reason: RejectReason::Uninitialised,
-                    };
-                }
-            },
+            stitched,
             previous_rect,
             frame,
             SearchAxis::Horizontal,
@@ -1127,37 +1100,6 @@ impl RawStitcher {
             None => EngineDecision::Reject {
                 reason: RejectReason::NoCandidate,
             },
-        }
-    }
-
-    #[cfg(feature = "stitch-legacy")]
-    fn legacy_placement(
-        &mut self,
-        previous_rect: ViewportRect,
-        frame: &impl RgbSource,
-        search_direction: Option<SearchDirection>,
-    ) -> EngineDecision {
-        let axis = canvas_search_axis(search_direction);
-        match find_canvas_placement_match(
-            match self.stitched.as_ref() {
-                Some(stitched) => stitched,
-                None => return EngineDecision::Reject { reason: RejectReason::Uninitialised },
-            },
-            previous_rect,
-            frame,
-            axis,
-            search_direction,
-        ) {
-            Some(match_info) => EngineDecision::Place {
-                rect: ViewportRect {
-                    x: previous_rect.x + match_info.delta_x,
-                    y: previous_rect.y + match_info.delta_y,
-                    width: previous_rect.width,
-                    height: previous_rect.height,
-                },
-                match_info,
-            },
-            None => EngineDecision::Reject { reason: RejectReason::NoCandidate },
         }
     }
 
@@ -3927,6 +3869,30 @@ mod tests {
         assert_eq!(stitched.width, 35);
         assert_eq!(stitched.current_origin_x, 0);
         assert_eq!(stitched.anchor_origin_x, 3);
+    }
+
+    /// A sideways move needs a sideways hint.
+    ///
+    /// The hint names the direction of a fallback attempt, and nothing in the
+    /// frame says which side it moved to. With the impulse and the hint both
+    /// vertical there is no horizontal question to ask, so the frame is refused
+    /// rather than guessed at — the same frame with a Right hint is
+    /// `append_expands_right`. This is the rule the old
+    /// `vertical_mode_rejects_horizontal_motion` protected; the mechanism is now
+    /// the axis routing, so the reason it refuses is worth stating.
+    #[test]
+    fn a_sideways_move_under_a_vertical_hint_is_refused() {
+        let previous = textured_frame(160, 48);
+        let current = shifted_right(&previous, 12);
+        let mut stitcher = RawStitcher::new();
+        stitcher
+            .push_frame(previous, Some(LongDirection::Down))
+            .unwrap();
+
+        assert_eq!(
+            push_until_refused(&mut stitcher, &current, Some(LongDirection::Down)),
+            PushResult::NoMatch
+        );
     }
 
     #[test]

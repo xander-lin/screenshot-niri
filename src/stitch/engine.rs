@@ -1085,15 +1085,6 @@ impl WindowedEdgeMatcher {
     ) -> Option<f64> {
         let stitched = request.stitched;
         let frame = request.frame;
-        // The engine works in logical rows; `stitched` is a pixel buffer. The
-        // mapping is the previous frame's pixel row plus the row difference the
-        // engine decided on — both halves come from the same `commit`, so the
-        // pair is consistent by construction. `pos` is that frame's logical
-        // row and `previous_rect.y` its pixel row; using their difference keeps
-        // the formula independent of how either coordinate space is anchored
-        // (a geometry change re-seeds the engine's logical space, a prepend
-        // re-bases the pixel buffer, and neither disturbs the difference).
-        let engine_pos = self.pos?;
         // Everything below is expressed along the engine's own axis. The
         // anchor is the previous frame's pixel coordinate on that axis plus the
         // difference the engine decided on — both halves come from the same
@@ -1102,6 +1093,7 @@ impl WindowedEdgeMatcher {
         // space is anchored (a geometry change re-seeds the engine's logical
         // space, a prepend re-bases the pixel buffer, and neither disturbs the
         // difference).
+        let engine_pos = self.pos?;
         let (previous_along, previous_across) = match self.axis {
             SearchAxis::Vertical => (request.previous_rect.y, request.previous_rect.x),
             SearchAxis::Horizontal => (request.previous_rect.x, request.previous_rect.y),
@@ -1648,7 +1640,9 @@ pub(super) fn place_horizontally(
     let mut matcher = WindowedEdgeMatcher::new(SearchAxis::Horizontal);
     matcher.canvas = Some(canvas);
     matcher.pos = Some(previous_x);
-    matcher.anchor = Some(previous_x);
+    // No `anchor`: `decide` is the only stage this matcher runs, and the anchor
+    // window is not part of the horizontal axis (recovery belongs to the axis
+    // the capture is on).
     matcher.frame_rows = width;
     let request = PlacementRequest {
         stitched,
