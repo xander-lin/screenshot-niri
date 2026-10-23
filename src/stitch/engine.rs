@@ -431,11 +431,21 @@ impl EdgeCanvas {
 
     /// Writes `ladder` with its top at canvas row `top`, preserving rows that
     /// were already verified by an earlier frame.
+    ///
+    /// The canvas is indexed in *logical* rows and only ever grows, so a frame
+    /// that sits above everything stored so far grows the front here. Nothing
+    /// outside the engine has to tell it about a prepend: the pixel canvas
+    /// re-basing itself and the engine's logical space are two different
+    /// coordinate systems, and the shift between them is not the engine's
+    /// business.
     fn write(&mut self, top: i32, ladder: &EdgeLadder) {
         if ladder.bins != self.bins {
             return;
         }
         let bins = self.bins as usize;
+        if top < self.origin_row {
+            self.shift_forward(self.origin_row - top);
+        }
         let start = top - self.origin_row;
         let needed = (start + ladder.rows as i32).max(self.filled.len() as i32).max(0) as usize;
         if needed > self.filled.len() {
@@ -1457,7 +1467,7 @@ impl PlacementEngine for WindowedEdgeMatcher {
         EngineDecision::Reject { reason: RejectReason::NoCandidate }
     }
 
-    fn commit(&mut self, rect: ViewportRect, requested_top: i32, frame: &dyn RgbSource) {
+    fn commit(&mut self, _rect: ViewportRect, requested_top: i32, frame: &dyn RgbSource) {
         // The session's one gain is decided by the frame that initialises the
         // canvas, before that frame's own ladder is built: every ladder —
         // including the first — must share the scale the canvas is written
@@ -1485,19 +1495,16 @@ impl PlacementEngine for WindowedEdgeMatcher {
         if ladder.bins != canvas.bins {
             return;
         }
-        // A prepend shifts every stored row down by `rect.y - requested_top`.
-        //
-        // `rect.y` is the frame's row in the *pixel canvas*, which grows
-        // upward; `requested_top` is where the engine decided the frame
-        // belongs in logical canvas coordinates. Everything the engine stores
-        // (`pos`, `anchor`, the ladder) lives in logical coordinates, so the
-        // ladder must be written at `requested_top` and the prepend only
-        // re-bases the buffer.
-        let shift = rect.y - requested_top;
-        if shift > 0 {
-            canvas.shift_forward(shift);
-        }
-
+        // `rect` is the frame's rectangle in the *pixel* canvas, which re-bases
+        // itself when it grows upward. Nothing here reads it: every position
+        // this engine stores (`pos`, `anchor`, the ladder) is a logical canvas
+        // row, and `write` grows the front when a frame lands above what is
+        // stored. Treating the pixel canvas's re-based row as a per-frame shift
+        // is what made this canvas grow quadratically — `rect.y - requested_top`
+        // is the *cumulative* offset between the two coordinate systems, not
+        // this frame's prepend, so it re-shifted every stored row on every
+        // commit (measured: 589 080 rows of descriptor for an 8 534-row
+        // capture, 29.9 MB where 0.45 MB is the true extent).
         let previous = self.pos;
         canvas.write(requested_top, &ladder);
         self.frame_rows = ladder.rows();
@@ -2374,6 +2381,74 @@ mod tests {
             "the original content must survive the prepend, got {}",
             cost.cost
         );
+    }
+
+    /// The engine's canvas holds one descriptor row per *logical* canvas row.
+    ///
+    /// The pixel canvas re-bases itself whenever a frame extends it upward, and
+    /// that re-based row used to be handed to `commit` as a per-frame prepend.
+    /// It is not one: it is the cumulative distance between two coordinate
+    /// systems, so re-applying it every frame shifted every stored row again
+    /// and again. On real-1 the 8 534-row capture ended up carrying 589 080
+    /// rows of descriptor — 29.9 MB where the content needs 0.45 MB — most of
+    /// them `false` in `filled`. Every delta was still right (the search reads
+    /// logical rows), so only a memory measurement found it.
+    #[test]
+    fn the_engine_canvas_tracks_logical_rows_not_the_rebased_pixel_canvas() {
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
+        let height = 60;
+        let first = frame_from_signed(100, height);
+        engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, 0, &first);
+
+        // Three upward steps, each one prepending in the pixel canvas exactly
+        // as the stitcher reports it: the pixel row stays 0 while the logical
+        // row goes 0 → -20 → -40 → -60.
+        let mut committed: Vec<(i32, &RgbFrame)> = vec![(0, &first)];
+        let frames: Vec<RgbFrame> = (1..=3).map(|step| frame_from_signed(100 - 20 * step, height)).collect();
+        for (step, frame) in frames.iter().enumerate() {
+            let logical = -20 * (step as i32 + 1);
+            let request = request_on_canvas(frame, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
+            assert!(
+                matches!(engine.place(&request), EngineDecision::Place { .. }),
+                "step {step} must be placeable"
+            );
+            // rect.y is where the *pixel* canvas put it: at the top, as after
+            // a prepend.
+            engine.commit(ViewportRect { x: 0, y: 0, width: W, height }, logical, frame);
+            committed.push((logical, frame));
+        }
+
+        let canvas = engine.canvas.as_ref().expect("canvas exists");
+        assert_eq!(
+            canvas.filled.len(),
+            (3 * 20 + height) as usize,
+            "the descriptor canvas must hold exactly the rows the capture covered"
+        );
+        // Every frame is still readable at its own logical row, and no other
+        // row fits it better. (The frame's own top and bottom rows read
+        // differently from the same content written by another frame's
+        // interior — the descriptor is a vertical derivative — so this compares
+        // rows against each other rather than against zero.) One gain for the
+        // whole session, as the engine does it: ladders built with a per-frame
+        // gain are quantised on a different scale.
+        let gain = EdgeLadder::session_gain(&first);
+        for (logical, frame) in committed.iter() {
+            let frame: &RgbFrame = frame;
+            let ladder = EdgeLadder::from_source(frame, gain).unwrap();
+            let candidates: Vec<(f64, i32)> = (logical - 60..=*logical + 60)
+                .filter_map(|top| canvas.cost_at(&ladder, top, 1).map(|score| (score.cost, top)))
+                .collect();
+            let best = candidates
+                .iter()
+                .copied()
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+                .unwrap_or_else(|| panic!("no evidence anywhere near {logical}"));
+            assert_eq!(
+                best.1, *logical,
+                "row {logical} must hold its own frame, but row {} fits it better ({})",
+                best.1, best.0
+            );
+        }
     }
 
     /// A frame that matches nothing is refused without moving anything, and
