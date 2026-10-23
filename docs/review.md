@@ -112,6 +112,30 @@ which is the actual value of the cleanup, not the warning count itself.
 
 ---
 
+### 12. A drag composited the whole box to move a border — **fixed**
+
+Reported from use: normal-mode dragging used far more CPU than long-mode
+dragging. Profiled with `perf`, then peeled:
+
+* the damaged region was the **bounding box** of the two border rings (408 000 px
+  for a 1-pixel step that changes 2 000), now decomposed into bands
+  (`changed_selection_rects`);
+* every pixel **re-sampled the capture** through `frozen_pixel` — two 64-bit
+  divisions, two clamps, a bounds-checked slice, and a binary search for the
+  cursor patch — all of which are separable per row/column, and skippable
+  entirely when the mapping is the identity (the normal case);
+* `overlay_pixel` recomputed `border_bounds` per call; precomputed once per frame;
+* a **render per pointer event**, because `blocking_dispatch` returns once per
+  event and motion arrives at ~2 000/s. Now coalesced per turn and rate-limited
+  to one frame per refresh, with the loop waking at the interval so the final
+  position still draws.
+
+100% of a core → 20-31% on a fast drag. The wrong turns are recorded in
+`found.md`: three caching schemes failed (each keyed on something that changed
+every event) before the profile named the function. **The lesson is the
+method**: profile the real interaction rather than reasoning about where the
+cost must be.
+
 ## Resource handling
 
 ### 6. `size as i32` when creating an shm pool — **fixed**

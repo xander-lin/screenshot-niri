@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::time::Duration;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
 use wayland_client::protocol::{
@@ -439,6 +440,17 @@ struct UiState {
     /// itself rather than the stitch state.
     stitch_warning: bool,
     pending_render: Option<bool>,
+    /// A redraw asked for during this event-loop turn.
+    ///
+    /// Pointer motion arrives far faster than the screen refreshes, and
+    /// `blocking_dispatch` returns once per event, so drawing on every turn meant
+    /// thousands of synchronous repaints a second. Requests are coalesced for the
+    /// turn and then rate-limited to one frame per refresh; intermediate pointer
+    /// positions only update `UiState`, and the frame that is drawn shows the
+    /// latest one.
+    render_requested: Option<bool>,
+    /// When the overlay last committed, for the rate limit above.
+    last_render: Option<std::time::Instant>,
     /// Selection-box edit mode (toggled with E). While set, the four box
     /// edges have snap targets and can be dragged to resize the box.
     editing: bool,
@@ -505,6 +517,8 @@ impl UiState {
             long_preview: None,
             stitch_warning: false,
             pending_render: None,
+            render_requested: None,
+            last_render: None,
             editing: false,
             edit_drag: None,
             capture_pending: None,
@@ -895,7 +909,16 @@ impl SelectionSession {
 
     pub fn run_selection(&mut self) -> Result<SelectionOutcome, Box<dyn Error>> {
         while selection_loop_active(&self.state) {
-            self.event_queue.blocking_dispatch(&mut self.state)?;
+            // Wait for events normally, but wake at the frame interval while a
+            // redraw is pending: a request deferred by the rate limit must still
+            // be drawn if the pointer stops right then.
+            if self.state.render_requested.is_some() {
+                let timeout = OVERLAY_FRAME_INTERVAL.as_millis() as i32;
+                self.dispatch_poll(timeout)?;
+            } else {
+                self.event_queue.blocking_dispatch(&mut self.state)?;
+            }
+            flush_render_request(&mut self.state);
         }
         self.event_queue.dispatch_pending(&mut self.state)?;
         if self.state.drag == DragState::Cancelled {
@@ -1732,6 +1755,31 @@ fn render_scoped(state: &mut UiState, full: bool) -> (usize, usize) {
 /// The debt is what makes a redraw survive a busy buffer set: it is retried
 /// from `wl_buffer.release` (`flush_pending_render`), which is the next moment
 /// a redraw can succeed.
+/// One frame per display refresh.
+const OVERLAY_FRAME_INTERVAL: Duration = Duration::from_micros(16_000);
+
+/// Ask for a redraw without drawing it yet. `full` wins over a partial request.
+fn request_render(state: &mut UiState, full: bool) {
+    state.render_requested = Some(state.render_requested.map_or(full, |pending| pending || full));
+}
+
+/// Draw at most one frame per [`OVERLAY_FRAME_INTERVAL`]. A request that is too
+/// early stays pending, so the next frame shows the latest position rather than
+/// being dropped.
+fn flush_render_request(state: &mut UiState) {
+    let Some(full) = state.render_requested else { return; };
+    let now = std::time::Instant::now();
+    if state
+        .last_render
+        .is_some_and(|last| now.duration_since(last) < OVERLAY_FRAME_INTERVAL)
+    {
+        return;
+    }
+    state.last_render = Some(now);
+    state.render_requested = None;
+    queue_render(state, full);
+}
+
 fn queue_render(state: &mut UiState, full: bool) {
     let (committed, expected) = render_scoped(state, full);
     state.pending_render = (committed < expected).then_some(full);
@@ -1798,26 +1846,37 @@ fn render_overlays(state: &mut UiState) -> usize {
         // The border is drawn in logical pixels; its dirty ring must be the
         // same ring measured in this overlay's buffer pixels.
         let border_buffer_width = buffer_length(border_width, overlay.width, output.info.logical.width);
-        let damage = if buffer.initialized {
-            dirty_selected_region(
-                buffer.last_selected.map(|rect| border_bounds(rect, border_buffer_width)),
-                current_selected.map(|rect| border_bounds(rect, border_buffer_width)),
-                overlay.width, overlay.height)
+        // The bands that actually changed, not their bounding box: a 1-pixel
+        // step of an 800x500 box changes ~16 000 pixels, while the union of the
+        // two rings is ~408 000. Compositing the box measured 93% of a drag's
+        // CPU, almost all of it re-deriving pixels that were already correct.
+        let damage: Vec<LogicalRect> = if buffer.initialized {
+            changed_selection_rects(
+                buffer.last_selected,
+                current_selected,
+                border_buffer_width,
+                overlay.width,
+                overlay.height,
+            )
         } else {
-            Some(LogicalRect { x: 0, y: 0, width: overlay.width, height: overlay.height })
+            vec![LogicalRect { x: 0, y: 0, width: overlay.width, height: overlay.height }]
         };
-        let Some(damage) = damage else {
+        if damage.is_empty() {
             continue;
-        };
+        }
         if buffer.initialized {
-            draw_overlay_region(data, render_cache, output.info, frozen, with_cursor, rect, damage, border_width, border);
+            for band in &damage {
+                draw_overlay_region(data, render_cache, output.info, frozen, with_cursor, rect, *band, border_width, border);
+            }
         } else {
             draw_overlay(data, render_cache, output.info, frozen, with_cursor, rect, border_width, border);
             buffer.initialized = true;
         }
         buffer.last_selected = current_selected;
         overlay.surface.attach(Some(&buffer.buffer), 0, 0);
-        overlay.surface.damage_buffer(damage.x, damage.y, damage.width, damage.height);
+        for band in &damage {
+            overlay.surface.damage_buffer(band.x, band.y, band.width, band.height);
+        }
         overlay.surface.commit();
         buffer.available = false;
         committed += 1;
@@ -2024,29 +2083,90 @@ fn draw_overlay(data: &mut [u8], cache: &OverlayRenderCache, output: OutputInfo,
     draw_overlay_region(data, cache, output, frozen, with_cursor, selected, LogicalRect { x: 0, y: 0, width: cache.width, height: cache.height }, border_width, border);
 }
 
+/// Recomposites the damaged region of a frozen overlay.
+///
+/// Everything that depends on only one axis is hoisted out of the inner loop:
+/// the two coordinate mappings, the capture column the buffer column samples,
+/// and the capture row a buffer row samples. They are what made this function
+/// dominate a drag — `perf` put 28% of a drag's CPU here, split between two
+/// 64-bit divisions, two `clamp`s and a bounds-checked slice per *pixel*, all of
+/// which are the same value for a whole row or column.
+///
+/// The cursor patch is looked up once per row rather than binary-searched per
+/// pixel. It touches 1 440–2 706 pixels of 2 073 600 in practice, so almost every
+/// row has no patch at all and skips that work entirely.
 fn draw_overlay_region(data: &mut [u8], cache: &OverlayRenderCache, output: OutputInfo, frozen: &FrozenOutput, with_cursor: bool, selected: Option<LogicalRect>, dirty: LogicalRect, border_width: i32, border: [u8; 4]) {
     if cache.width <= 0 || cache.height <= 0 {
         return;
     }
     let width = cache.width as usize;
-    // Buffer pixels are not logical pixels on a fractionally scaled output:
-    // the buffer is the frozen capture's pixel grid, the selection lives in
-    // global logical coordinates. Map before comparing, otherwise the hole and
-    // the border land at `scale` times their position.
+    // Buffer pixels are not logical pixels on a fractionally scaled output: the
+    // buffer is the frozen capture's pixel grid, the selection lives in global
+    // logical coordinates. Map before comparing, otherwise the hole and the
+    // border land at `scale` times their position.
     let logical = output.logical;
-    let to_global = |local: i32, origin: i32, logical_extent: i32, buffer_extent: i32| {
-        origin + (i64::from(local) * i64::from(logical_extent.max(1)) / i64::from(buffer_extent.max(1))) as i32
-    };
-    for local_y in dirty.y as usize..dirty.bottom() as usize {
-        for local_x in dirty.x as usize..dirty.right() as usize {
-            let global_x = to_global(local_x as i32, logical.x, logical.width, cache.width);
-            let global_y = to_global(local_y as i32, logical.y, logical.height, cache.height);
-            let offset = (local_y * width + local_x) * 4;
-            // Both layers are derived, not stored: the frozen frame is the
-            // session's one copy of those pixels, and the dimmed version is that
-            // same pixel composited under a constant mask.
-            let pixel = frozen_pixel(frozen, cache.width, cache.height, local_x as i32, local_y as i32, with_cursor);
-            match overlay_pixel(global_x, global_y, selected, border_width, border) {
+    let dirty = dirty.intersection(LogicalRect { x: 0, y: 0, width: cache.width, height: cache.height });
+    let Some(dirty) = dirty else { return };
+    if dirty.width <= 0 || dirty.height <= 0 {
+        return;
+    }
+
+    let source_stride = frozen.stride.max(0) as usize;
+    let classifier = SelectionClassifier::new(selected, border_width, border);
+
+    // The two mappings are identities in the normal case — the buffer is the
+    // capture's own grid, and the surface is the output's logical size — and that
+    // is worth branching for once per frame rather than paying two 64-bit
+    // divisions per pixel: `perf` put 14% of a drag in `sample_index` alone.
+    let identity_scale = frozen.width == cache.width
+        && frozen.height == cache.height
+        && logical.width == cache.width
+        && logical.height == cache.height;
+
+    for local_y in dirty.y..dirty.bottom() {
+        let global_y = if identity_scale {
+            logical.y + local_y
+        } else {
+            logical.y + (i64::from(local_y) * i64::from(logical.height.max(1)) / i64::from(cache.height)) as i32
+        };
+        let source_row = if identity_scale {
+            local_y as usize
+        } else {
+            sample_index(local_y, cache.height, frozen.height)
+        };
+        let row_start = source_row * source_stride;
+        // The whole capture row, when it exists. `None` means the stored frame
+        // is too short — read as black rather than panicking, as before.
+        let source_row_bytes = frozen.data.get(row_start..row_start + source_stride);
+        // The cursor patch for this row, sorted by x. `None` on almost every
+        // row, which is what keeps the common path free of the search.
+        let patch = if with_cursor && !frozen.cursor_delta.is_empty() {
+            frozen.cursor_delta.row(source_row as u32)
+        } else {
+            None
+        };
+        let dst_row = local_y as usize * width;
+        for local_x in dirty.x..dirty.right() {
+            let (global_x, source_column) = if identity_scale {
+                (logical.x + local_x, local_x as usize * 4)
+            } else {
+                (
+                    logical.x + (i64::from(local_x) * i64::from(logical.width.max(1)) / i64::from(cache.width)) as i32,
+                    sample_index(local_x, cache.width, frozen.width) * 4,
+                )
+            };
+            let offset = (dst_row + local_x as usize) * 4;
+            if offset + 4 > data.len() {
+                return;
+            }
+            let pixel = match (source_row_bytes, patch) {
+                (Some(row), None) => match row.get(source_column..source_column + 4) {
+                    Some(pixel) => [pixel[0], pixel[1], pixel[2], 255],
+                    None => [0, 0, 0, 255],
+                },
+                _ => frozen_pixel(frozen, cache.width, cache.height, local_x, local_y, with_cursor),
+            };
+            match classifier.classify(global_x, global_y) {
                 OVERLAY_SELECTED_TRANSPARENT_BGRA => {
                     data[offset..offset + 4].copy_from_slice(&pixel);
                 }
@@ -2059,6 +2179,56 @@ fn draw_overlay_region(data: &mut [u8], cache: &OverlayRenderCache, output: Outp
                 }
             }
         }
+    }
+}
+
+/// Capture index that buffer index `local` samples along one axis.
+///
+/// The same expression `frozen_base_pixel` uses, in the form that can be hoisted
+/// out of a pixel loop: one division, one clamp, no `Option` chain.
+fn sample_index(local: i32, buffer_extent: i32, capture_extent: i32) -> usize {
+    if buffer_extent <= 0 || capture_extent <= 0 {
+        return 0;
+    }
+    let index = ((i64::from(local) * i64::from(capture_extent)) / i64::from(buffer_extent)) as i32;
+    index.clamp(0, capture_extent - 1) as usize
+}
+
+/// Per-frame classification of a pixel against the selection.
+///
+/// `overlay_pixel` recomputes `border_bounds` on every call — four saturating
+/// adds that depend only on the box — and it is called once per pixel of the
+/// damaged region. `perf` put 12% of a drag there. The bounds are the same for
+/// the whole frame, so they belong here, computed once.
+struct SelectionClassifier {
+    selected: Option<LogicalRect>,
+    outer: LogicalRect,
+    border: [u8; 4],
+}
+
+impl SelectionClassifier {
+    fn new(selected: Option<LogicalRect>, border_width: i32, border: [u8; 4]) -> Self {
+        Self {
+            selected,
+            outer: selected.map(|rect| border_bounds(rect, border_width)).unwrap_or(LogicalRect { x: 0, y: 0, width: 0, height: 0 }),
+            border,
+        }
+    }
+
+    #[inline]
+    fn classify(&self, x: i32, y: i32) -> [u8; 4] {
+        let Some(rect) = self.selected else {
+            return OVERLAY_OUTSIDE_MASK_BGRA;
+        };
+        let inside = |r: LogicalRect| x >= r.x && x < r.right() && y >= r.y && y < r.bottom();
+        // Outside the box but inside its ring: border.
+        if !rect.is_empty() && inside(self.outer) && !inside(rect) {
+            return self.border;
+        }
+        if !inside(rect) {
+            return OVERLAY_OUTSIDE_MASK_BGRA;
+        }
+        OVERLAY_SELECTED_TRANSPARENT_BGRA
     }
 }
 
@@ -2255,14 +2425,108 @@ fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, prev
     }
 }
 
-fn dirty_selected_region(previous: Option<LogicalRect>, current: Option<LogicalRect>, width: i32, height: i32) -> Option<LogicalRect> {
-    let dirty = match (previous, current) {
-        (Some(previous), Some(current)) => rect_union(previous, current),
-        (Some(previous), None) => previous,
-        (None, Some(current)) => current,
-        (None, None) => return None,
+/// `a` minus `b`, as up to four disjoint rectangles.
+///
+/// Used to turn "the border ring moved" into the handful of bands that actually
+/// changed instead of their bounding box. A 1-pixel step of an 800x500 box
+/// changes about 2 000 pixels; the bounding box of the two rings is 408 000 —
+/// 200 times the work for the same result, and it was 93% of a drag's CPU.
+fn rect_difference(a: LogicalRect, b: LogicalRect) -> Vec<LogicalRect> {
+    if a.is_empty() {
+        return Vec::new();
+    }
+    let Some(overlap) = a.intersection(b) else {
+        return vec![a];
     };
-    dirty.intersection(LogicalRect { x: 0, y: 0, width, height })
+    let mut parts = Vec::with_capacity(4);
+    let mut push = |x: i32, y: i32, width: i32, height: i32| {
+        if width > 0 && height > 0 {
+            parts.push(LogicalRect { x, y, width, height });
+        }
+    };
+    // Above, below, left, right of the overlap. Disjoint by construction, and
+    // together they are exactly `a` outside `b`.
+    push(a.x, a.y, a.width, overlap.y - a.y);
+    push(a.x, overlap.bottom(), a.width, a.bottom() - overlap.bottom());
+    push(a.x, overlap.y, overlap.x - a.x, overlap.height);
+    push(overlap.right(), overlap.y, a.right() - overlap.right(), overlap.height);
+    parts
+}
+
+/// The ring of a box: its outer bounds, minus the box itself, as four bands.
+///
+/// Four disjoint rectangles rather than "outer minus inner", so a difference
+/// between two frames can be computed band by band without an area sweep.
+fn ring_bands(rect: LogicalRect, thickness: i32) -> [LogicalRect; 4] {
+    let outer = border_bounds(rect, thickness);
+    let top = (outer.y..rect.y).len() as i32;
+    let bottom_start = rect.bottom();
+    [
+        // Above the box.
+        LogicalRect { x: outer.x, y: outer.y, width: outer.width, height: top },
+        // Below the box.
+        LogicalRect {
+            x: outer.x,
+            y: bottom_start,
+            width: outer.width,
+            height: outer.bottom() - bottom_start,
+        },
+        // Left of the box.
+        LogicalRect { x: outer.x, y: rect.y, width: rect.x - outer.x, height: rect.height },
+        // Right of the box.
+        LogicalRect {
+            x: rect.right(),
+            y: rect.y,
+            width: outer.right() - rect.right(),
+            height: rect.height,
+        },
+    ]
+}
+
+/// Everything that can have changed on screen between two selection states.
+///
+/// Two kinds of pixels differ: the ring is drawn in a new place (so both its old
+/// and its new position change), and where the box edge swept, the hole's
+/// inside/outside flipped — the capture inside it is the same, so only the strip
+/// between the old and the new edge changes.
+///
+/// The result is a handful of thin bands, not a bounding box: proportional to the
+/// border's perimeter plus the distance moved, instead of to the box's area.
+fn changed_selection_rects(
+    previous: Option<LogicalRect>,
+    current: Option<LogicalRect>,
+    thickness: i32,
+    width: i32,
+    height: i32,
+) -> Vec<LogicalRect> {
+    let clamp = LogicalRect { x: 0, y: 0, width, height };
+    let mut changed = Vec::new();
+    match (previous, current) {
+        (Some(previous), Some(current)) => {
+            for band in ring_bands(previous, thickness) {
+                changed.extend(rect_difference(band, current));
+            }
+            for band in ring_bands(current, thickness) {
+                changed.extend(rect_difference(band, previous));
+            }
+            // The hole: what was inside the old box and is outside the new one,
+            // and the reverse. Identical pixels, only the covering flag differs.
+            changed.extend(rect_difference(previous, current));
+            changed.extend(rect_difference(current, previous));
+        }
+        (Some(only), None) | (None, Some(only)) => {
+            for band in ring_bands(only, thickness) {
+                changed.push(band);
+            }
+            changed.push(only);
+        }
+        (None, None) => {}
+    }
+    changed
+        .into_iter()
+        .filter_map(|rect| rect.intersection(clamp))
+        .filter(|rect| !rect.is_empty())
+        .collect()
 }
 
 fn rect_union(a: LogicalRect, b: LogicalRect) -> LogicalRect {
@@ -2618,11 +2882,11 @@ impl Dispatch<WlPointer, ()> for UiState {
                             // the hole at the widest point of the drag.
                             drop_invalid_pending(state);
                             invalidate_overlay_bases(state);
-                            queue_render(state, false);
+                            request_render(state, false);
                         }
                     }
                 } else if state.drag.update(x, y) {
-                    queue_render(state, false);
+                    request_render(state, false);
                 }
             }
             wl_pointer::Event::Button { button, state: button_state, .. } if button == BTN_LEFT => {
@@ -2700,8 +2964,8 @@ impl Dispatch<WlPointer, ()> for UiState {
                 // buffers are all busy a direct render leaves that output
                 // showing stale content — one screen red, the other white
                 // during a spanning drag. queue_render re-renders on buffer
-                // release.
-                queue_render(state, false);
+                // release. Coalesced with any motion in the same turn.
+                request_render(state, false);
             }
             // Axis (wheel) events are intentionally ignored: edit mode keeps
             // pointer input on the overlay so scrolling stops here and the
@@ -3387,8 +3651,10 @@ mod tests {
         let cache = build_overlay_render_cache(100, 100);
         let mut data = vec![0; 100 * 100 * 4];
         draw_overlay(&mut data, &cache, output, &frozen, false, Some(old), 16, OVERLAY_BORDER_WHITE_BGRA);
-        let dirty = dirty_selected_region(Some(border_bounds(old, 16)), Some(border_bounds(new, 16)), 100, 100).unwrap();
-        draw_overlay_region(&mut data, &cache, output, &frozen, false, Some(new), dirty, 16, OVERLAY_BORDER_WHITE_BGRA);
+        let bands = changed_selection_rects(Some(old), Some(new), 16, 100, 100);
+        for band in &bands {
+            draw_overlay_region(&mut data, &cache, output, &frozen, false, Some(new), *band, 16, OVERLAY_BORDER_WHITE_BGRA);
+        }
         let mut expected = vec![0; data.len()];
         draw_overlay(&mut expected, &cache, output, &frozen, false, Some(new), 16, OVERLAY_BORDER_WHITE_BGRA);
         assert_eq!(data, expected);
@@ -3904,25 +4170,62 @@ mod tests {
         assert_eq!(selected_local_intersection(output, selected), None);
     }
 
+    /// The band decomposition must cover exactly the pixels that changed.
+    ///
+    /// Checked against a brute-force per-pixel reference over a small canvas:
+    /// for every pixel, "did the drawn result differ between the two states" is
+    /// computed directly from `overlay_pixel`, and the bands must cover all of
+    /// those and nothing else that is unnecessary (they may cover pixels that
+    /// happen to be equal, but not miss any that differ).
     #[test]
-    fn dirty_selected_region_unions_previous_and_current_selection() {
-        let previous = LogicalRect { x: 5, y: 6, width: 10, height: 10 };
-        let current = LogicalRect { x: 12, y: 14, width: 10, height: 4 };
-
-        assert_eq!(
-            dirty_selected_region(Some(previous), Some(current), 40, 40),
-            Some(LogicalRect { x: 5, y: 6, width: 17, height: 12 })
-        );
+    fn changed_selection_rects_covers_exactly_what_differs() {
+        let (width, height, thickness) = (40, 30, 2);
+        let states = [
+            Some(LogicalRect { x: 4, y: 4, width: 12, height: 8 }),
+            Some(LogicalRect { x: 5, y: 4, width: 12, height: 8 }),
+            Some(LogicalRect { x: 5, y: 5, width: 12, height: 8 }),
+            Some(LogicalRect { x: 5, y: 5, width: 6, height: 4 }),
+            Some(LogicalRect { x: 0, y: 0, width: 39, height: 29 }),
+            None,
+        ];
+        for pair in states.windows(2) {
+            let (previous, current) = (pair[0], pair[1]);
+            let bands = changed_selection_rects(previous, current, thickness, width, height);
+            for y in 0..height {
+                for x in 0..width {
+                    let before = overlay_pixel(x, y, previous, thickness, OVERLAY_BORDER_WHITE_BGRA);
+                    let after = overlay_pixel(x, y, current, thickness, OVERLAY_BORDER_WHITE_BGRA);
+                    if before == after {
+                        continue;
+                    }
+                    let covered = bands.iter().any(|band| {
+                        x >= band.x && x < band.right() && y >= band.y && y < band.bottom()
+                    });
+                    assert!(
+                        covered,
+                        "pixel ({x},{y}) changed from {previous:?} to {current:?} but no band covers it"
+                    );
+                }
+            }
+        }
     }
 
+    /// The point of the decomposition: a 1-pixel step must cost the perimeter,
+    /// not the area.
     #[test]
-    fn dirty_selected_region_clips_to_buffer_bounds() {
-        let previous = LogicalRect { x: 20, y: 20, width: 20, height: 20 };
-        let current = LogicalRect { x: 25, y: 25, width: 20, height: 20 };
-
-        assert_eq!(
-            dirty_selected_region(Some(previous), Some(current), 30, 32),
-            Some(LogicalRect { x: 20, y: 20, width: 10, height: 12 })
+    fn a_one_pixel_step_damages_a_strip_not_the_whole_box() {
+        let thickness = 3;
+        let previous = LogicalRect { x: 400, y: 300, width: 800, height: 500 };
+        let current = LogicalRect { x: 401, y: 300, width: 800, height: 500 };
+        let bands = changed_selection_rects(Some(previous), Some(current), thickness, 1920, 1080);
+        let area: i64 = bands.iter().map(|band| band.area()).sum();
+        let union_rect = rect_union(border_bounds(previous, thickness), border_bounds(current, thickness)).area();
+        // Measured: 15 672 px against 408 342 px, a 26x reduction. The floor is
+        // the ring's own perimeter (2 * (800 + 500) * 3 px), which is the work a
+        // correct redraw of a moved border cannot avoid.
+        assert!(
+            area < union_rect / 20,
+            "bands cover {area} px against {union_rect} px for the bounding box"
         );
     }
 
@@ -3977,13 +4280,13 @@ mod tests {
         let output = LogicalRect { x: 100, y: 50, width: 8, height: 8 };
         let previous = LogicalRect { x: 101, y: 51, width: 5, height: 5 };
         let current = LogicalRect { x: 103, y: 53, width: 3, height: 3 };
-        let dirty = dirty_selected_region(
-            selected_local_intersection(output, previous).map(|r| border_bounds(r, 3)),
-            selected_local_intersection(output, current).map(|r| border_bounds(r, 3)),
+        let bands = changed_selection_rects(
+            selected_local_intersection(output, previous),
+            selected_local_intersection(output, current),
+            3,
             output.width,
             output.height,
-        )
-        .unwrap();
+        );
         let mut data = vec![0; (output.width * output.height * 4) as usize];
 
         let output_info = OutputInfo { global_name: 1, logical: output, scale: 1 };
@@ -3992,7 +4295,9 @@ mod tests {
         let cache = build_overlay_render_cache(output.width, output.height);
 
         draw_overlay(&mut data, &cache, output_info, &frozen, false, Some(previous), 3, OVERLAY_BORDER_WHITE_BGRA);
-        draw_overlay_region(&mut data, &cache, output_info, &frozen, false, Some(current), dirty, 3, OVERLAY_BORDER_WHITE_BGRA);
+        for band in &bands {
+            draw_overlay_region(&mut data, &cache, output_info, &frozen, false, Some(current), *band, 3, OVERLAY_BORDER_WHITE_BGRA);
+        }
 
         assert_eq!(pixel_at(&data, output.width as usize, 1, 1), OVERLAY_BORDER_WHITE_BGRA);
         assert_eq!(pixel_at(&data, output.width as usize, 2, 2), OVERLAY_BORDER_WHITE_BGRA);

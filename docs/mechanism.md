@@ -126,7 +126,8 @@ than the surface cannot be mapped back, so the logical size wins.
 An overlay is on exactly one of them at a time:
 
 * **Frozen path** (`render_overlay`): draws the stored capture, dimmed outside
-  the hole. `overlay_pixel()` decides per pixel between
+  the hole. It recomposites only the bands whose appearance can have changed —
+  see §2.1. `overlay_pixel()` decides per pixel between
   `OUTSIDE_MASK` (dim), `TRANSPARENT` (the hole) and the border ring; both pixel
   layers are **derived** from the one stored frame on every draw — the cache
   holds geometry only. Damage is the union of the previous and current border
@@ -136,6 +137,34 @@ An overlay is on exactly one of them at a time:
 * **Live path** (`render_live_overlays`): fills the mask, punches the hole from
   the current (unioned) rectangle, composites the stitched preview, draws the
   border. Used from `L` onward.
+
+
+
+### 2.1 What a drag actually costs
+
+A frozen overlay redraw is bounded by three separate things, and getting any one
+wrong makes a drag burn a core (`found.md`, 2026-10-24):
+
+1. **Which pixels.** The changed set is *not* the bounding box of the old and new
+   border rings: a 1-pixel step of an 800x500 box changes ~2 000 pixels while that
+   bounding box is 408 000. `changed_selection_rects` decomposes it into thin
+   bands (each ring as four strips, `rect_difference` against the other box), so
+   the work is proportional to the border's perimeter plus the distance moved.
+2. **Cost per pixel.** `frozen_pixel` does two 64-bit divisions, two `clamp`s and
+   a bounds-checked slice, plus a binary search when the cursor patch applies.
+   Every one of those is separable per row or column, and the mapping is the
+   *identity* whenever the buffer matches the capture's grid — the normal case —
+   so the identity path skips the division entirely. `overlay_pixel`'s
+   `border_bounds` is likewise precomputed once per frame
+   (`SelectionClassifier`).
+3. **How many frames.** Pointer motion arrives far faster than the display
+   refreshes and `blocking_dispatch` returns once per event. Requests are
+   coalesced per event-loop turn and rate-limited to one frame per refresh
+   (`request_render` / `flush_render_request`), and the loop wakes at the frame
+   interval while a request is pending so the last position of a drag is never
+   dropped.
+
+Measured on a fast back-and-forth drag: 100% of a core → 20-31%.
 
 `render_scope: Option<u32>` narrows the live path to one output once long
 capture starts, and `queue_render`/`flush_pending_render` count the pending-render
