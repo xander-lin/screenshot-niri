@@ -5025,11 +5025,17 @@ mod tests {
     /// vertical step would then match a column it never captured. Real pages
     /// carry text and images whose row boundaries differ across columns.
     fn snake_page(page_w: u32, page_h: u32) -> (Vec<u8>, Vec<u8>) {
+        snake_page_seeded(page_w, page_h, 0x5eed_1234)
+    }
+
+    /// The same page from an explicit seed, so the randomised sessions can walk
+    /// over content the hand-written shapes never see.
+    fn snake_page_seeded(page_w: u32, page_h: u32, seed: u32) -> (Vec<u8>, Vec<u8>) {
         fn lcg(state: &mut u32) -> u32 {
             *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             *state >> 16
         }
-        let mut state = 0x5eed_1234u32;
+        let mut state = seed;
         let mut row_band = Vec::with_capacity(page_h as usize);
         while (row_band.len() as u32) < page_h {
             let run = 3 + lcg(&mut state) % 10;
@@ -5047,6 +5053,25 @@ mod tests {
             }
         }
         (row_band, col_band)
+    }
+
+    /// One pixel of the synthetic page both the serpentine and the randomised
+    /// groups walk over: a large-scale brightness band on each axis plus a
+    /// hashed 8x8 block texture.
+    ///
+    /// The bands give a walk its structure; the texture is what makes one
+    /// column's vertical descriptor unlike another's. A page that is merely the
+    /// *sum* of a row term and a column term has the same `|dL/dy|` in every
+    /// column, and a vertical step would then match a column it never captured —
+    /// real pages carry text and images, whose row boundaries differ across
+    /// columns.
+    fn banded_page_pixel(row_band: &[u8], col_band: &[u8], x: u32, y: u32) -> u8 {
+        let band = (u16::from(row_band[y as usize]) + u16::from(col_band[x as usize])) / 2;
+        let mut hash = (x / 8).wrapping_mul(0x9E37_79B1) ^ (y / 8).wrapping_mul(0x85EB_CA77);
+        hash ^= hash >> 15;
+        hash = hash.wrapping_mul(0x2545_F491);
+        hash ^= hash >> 13;
+        (band + (hash & 63) as u16).min(255) as u8
     }
 
     /// Start positions of a serpentine walk: uniform steps, plus the page edge
@@ -5073,21 +5098,7 @@ mod tests {
         step_y: u32,
     ) {
         let (row_band, col_band) = snake_page(page_w, page_h);
-        let page = |x: u32, y: u32| -> u8 {
-            // Large-scale brightness bands on both axes, plus a hashed 8x8 block
-            // texture. The bands give the walk its structure; the texture is
-            // what makes one column's vertical descriptor unlike another's. A
-            // page that is merely the *sum* of a row term and a column term has
-            // the same `|dL/dy|` in every column, and a vertical step would then
-            // match a column it never captured — real pages carry text and
-            // images, whose row boundaries differ across columns.
-            let band = (u16::from(row_band[y as usize]) + u16::from(col_band[x as usize])) / 2;
-            let mut hash = (x / 8).wrapping_mul(0x9E37_79B1) ^ (y / 8).wrapping_mul(0x85EB_CA77);
-            hash ^= hash >> 15;
-            hash = hash.wrapping_mul(0x2545_F491);
-            hash ^= hash >> 13;
-            (band + (hash & 63) as u16).min(255) as u8
-        };
+        let page = |x: u32, y: u32| -> u8 { banded_page_pixel(&row_band, &col_band, x, y) };
         let frame_at = |frame_x: u32, frame_y: u32| -> RgbFrame {
             let stride = view_w * 3;
             let mut data = Vec::with_capacity((stride * view_h) as usize);
@@ -5202,5 +5213,508 @@ mod tests {
     #[test]
     fn a_snake_path_works_on_a_wider_page_with_quarter_overlap() {
         assert_snake_path("quarter overlap", 1920, 1200, 640, 480, 480, 240);
+    }
+
+    /// Randomised multi-step capture sessions: random initial selections,
+    /// random box drags and resizes, random scrolling on both axes, and walks
+    /// that cross their own path.
+    ///
+    /// Gated off for `LegacyPipeline`: the old canvas scan has no impulse axis,
+    /// no anchor window and no colour verification, so it refuses steps the
+    /// shipped engine places (measured on these very seeds). This group asserts
+    /// the engine the product actually runs.
+    #[cfg(not(feature = "stitch-legacy"))]
+    mod random_sessions {
+        use super::*;
+
+        // The serpentine and arch cases above are hand-written shapes: one path
+        // down, one across, one notch. A real capture is not that tidy — the user
+        // scrolls up and down, wanders sideways, drags the box around and reshapes
+        // it, and the path crosses itself over content the canvas already holds.
+        //
+        // These sessions generate that shape from a seed: every step is a random
+        // operation (scroll, box drag, resize), every frame is checked against the
+        // delta its true position implies, and the finished canvas is compared to
+        // the page pixel for pixel — including the rows and columns the walk never
+        // visited, which must stay transparent.
+
+        /// Deterministic xorshift32: a random case must stay reproducible from its
+        /// seed alone, so a failure is always a failure.
+        struct WalkRng(u32);
+
+        impl WalkRng {
+            fn new(seed: u32) -> Self {
+                // Mix the seed so neighbouring seeds do not start in adjacent
+                // states, and keep the state non-zero: xorshift is a fixed point
+                // at zero.
+                let mixed = seed.wrapping_mul(0x9e37_79b9);
+                Self(if mixed == 0 { 1 } else { mixed })
+            }
+
+            fn next(&mut self) -> u32 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                self.0 = x;
+                x
+            }
+
+            /// Inclusive `low..=high`.
+            fn between(&mut self, low: i32, high: i32) -> i32 {
+                debug_assert!(low <= high, "empty range {low}..={high}");
+                low + (self.next() % (high - low + 1) as u32) as i32
+            }
+
+            fn below(&mut self, bound: usize) -> usize {
+                (self.next() as usize) % bound.max(1)
+            }
+
+            fn percent(&mut self, percent: u32) -> bool {
+                self.next() % 100 < percent
+            }
+        }
+
+        fn rectangles_overlap(a: (i32, i32, u32, u32), b: (i32, i32, u32, u32)) -> bool {
+            let (ax, ay, aw, ah) = a;
+            let (bx, by, bw, bh) = b;
+            ax < bx + bw as i32 && bx < ax + aw as i32 && ay < by + bh as i32 && by < ay + ah as i32
+        }
+
+        /// How far a box's origin may move when the box is `width` wide on a
+        /// `page`-wide axis: a small nudge while it fits, widened as much as the new
+        /// size needs when it no longer does.
+        fn origin_range(position: i32, width: u32, page: u32) -> (i32, i32) {
+            let room = page as i32 - width as i32 - position;
+            let low = (-position).max(-60).min(room);
+            let high = room.min(60).max(low);
+            (low, high)
+        }
+
+        /// One simulated interactive capture.
+        ///
+        /// `x`/`y` is the page rectangle the selection box currently shows, and
+        /// `screen_*` is the offset that rectangle reports to the stitcher. They
+        /// move together when the box is dragged or reshaped (a known geometry
+        /// step) and only the page position moves when the content scrolls.
+        struct RandomSession {
+            stitcher: RawStitcher,
+            row_band: Vec<u8>,
+            col_band: Vec<u8>,
+            page_w: u32,
+            page_h: u32,
+            x: i32,
+            y: i32,
+            width: u32,
+            height: u32,
+            screen_x: i32,
+            screen_y: i32,
+            visited: Vec<(i32, i32, u32, u32)>,
+            /// Steps that landed on content captured more than one step earlier:
+            /// the crossings this group exists to exercise.
+            crossings: usize,
+            horizontal_steps: usize,
+            vertical_steps: usize,
+            edits: usize,
+        }
+
+        impl RandomSession {
+            /// A session with a randomly chosen selection: its size, its position on
+            /// the page and the screen offset it reports are all drawn from the
+            /// seed, so no two seeds even start from the same box.
+            fn new(seed: u32, page_w: u32, page_h: u32) -> Self {
+                let mut rng = WalkRng::new(seed ^ 0x9e37_79b9);
+                let width = rng.between((page_w / 4) as i32, (page_w / 3) as i32) as u32;
+                let height = rng.between((page_h / 5) as i32, (page_h / 4) as i32) as u32;
+                let x = rng.between(0, (page_w - width) as i32);
+                let y = rng.between(0, (page_h - height) as i32);
+                let screen_x = rng.between(0, 800);
+                let screen_y = rng.between(0, 800);
+                let (row_band, col_band) =
+                    snake_page_seeded(page_w, page_h, seed.wrapping_mul(2_654_435_761));
+                Self {
+                    stitcher: RawStitcher::new(),
+                    row_band,
+                    col_band,
+                    page_w,
+                    page_h,
+                    x,
+                    y,
+                    width,
+                    height,
+                    screen_x,
+                    screen_y,
+                    visited: Vec::new(),
+                    crossings: 0,
+                    horizontal_steps: 0,
+                    vertical_steps: 0,
+                    edits: 0,
+                }
+            }
+
+            fn pixel(&self, x: u32, y: u32) -> u8 {
+                banded_page_pixel(&self.row_band, &self.col_band, x, y)
+            }
+
+            fn frame(&self) -> RgbFrame {
+                let stride = self.width * 3;
+                let mut data = Vec::with_capacity((stride * self.height) as usize);
+                for row in 0..self.height {
+                    for column in 0..self.width {
+                        let value =
+                            self.pixel((self.x + column as i32) as u32, (self.y + row as i32) as u32);
+                        data.extend_from_slice(&[value, value, value]);
+                    }
+                }
+                RgbFrame { width: self.width, height: self.height, stride, data }
+            }
+
+            /// Feeds the current rectangle to the stitcher and checks the delta.
+            fn push(&mut self, direction: Option<LongDirection>, label: &str) {
+                let frame = self.frame();
+                let offset = FrameScreenOffset { x: self.screen_x, y: self.screen_y };
+                let result = self
+                    .stitcher
+                    .push_frame_with_offset(&frame, &frame, direction, offset)
+                    .unwrap_or_else(|error| panic!("{label}: push failed: {error}"));
+                let current = (self.x, self.y, self.width, self.height);
+                match (self.visited.last().copied(), result) {
+                    (None, PushResult::Initialized) => {}
+                    (None, other) => {
+                        panic!("{label}: the first frame must initialise, got {other:?}")
+                    }
+                    (Some((previous_x, previous_y, _, _)), PushResult::Accepted { match_info }) => {
+                        let expected = (self.x - previous_x, self.y - previous_y);
+                        assert_eq!(
+                            (match_info.delta_x, match_info.delta_y),
+                            expected,
+                            "{label}: the page moved by {expected:?} but the frame was placed at {:?}",
+                            (match_info.delta_x, match_info.delta_y)
+                        );
+                    }
+                    (Some(previous), other) => panic!(
+                        "{label}: step {} from {previous:?} to {current:?} must be placed, got {other:?}",
+                        self.visited.len()
+                    ),
+                }
+                self.note_crossing();
+                self.visited.push(current);
+            }
+
+            fn note_crossing(&mut self) {
+                let current = (self.x, self.y, self.width, self.height);
+                // Consecutive frames always overlap, so they say nothing; a frame
+                // that overlaps anything older is a crossing.
+                let revisited = self
+                    .visited
+                    .iter()
+                    .rev()
+                    .skip(1)
+                    .any(|&earlier| rectangles_overlap(current, earlier));
+                if revisited {
+                    self.crossings += 1;
+                }
+            }
+
+            /// Scrolls the content inside the box: the box stays put on screen, the
+            /// page moves under it.
+            fn scroll(&mut self, dx: i32, dy: i32) {
+                if dx != 0 {
+                    self.horizontal_steps += 1;
+                } else {
+                    self.vertical_steps += 1;
+                }
+                self.x += dx;
+                self.y += dy;
+            }
+
+            /// Drags the box over the page without scrolling (edit mode): the
+            /// content moves with the box, so the reported offset moves too.
+            fn move_box(&mut self, dx: i32, dy: i32) {
+                self.edits += 1;
+                self.x += dx;
+                self.y += dy;
+                self.screen_x += dx;
+                self.screen_y += dy;
+            }
+
+            /// Reshapes the box, optionally moving its origin as an edge drag does.
+            fn resize(&mut self, dx: i32, dy: i32, width: u32, height: u32) {
+                self.edits += 1;
+                self.x += dx;
+                self.y += dy;
+                self.screen_x += dx;
+                self.screen_y += dy;
+                self.width = width;
+                self.height = height;
+            }
+
+            /// A random scroll step along one axis: always at least `min` pixels,
+            /// never longer than `max`, always inside the page. The direction comes
+            /// from the room available, so the walk never stalls against an edge.
+            fn scroll_step(&self, rng: &mut WalkRng, horizontal: bool, min: i32, max: i32) -> i32 {
+                let (position, extent, page) = if horizontal {
+                    (self.x, self.width as i32, self.page_w as i32)
+                } else {
+                    (self.y, self.height as i32, self.page_h as i32)
+                };
+                let forward = page - extent - position;
+                let back = position;
+                let magnitude = rng.between(min, max.min(forward.max(back)));
+                if rng.percent(50) && forward >= magnitude {
+                    magnitude
+                } else if back >= magnitude {
+                    -magnitude
+                } else {
+                    magnitude
+                }
+            }
+
+            /// A scroll step that heads back toward a rectangle captured earlier:
+            /// the capture doubles back over content it already holds, which is what
+            /// makes the path cross itself. One axis only — the matcher places a
+            /// single-axis step, and a diagonal one is a different (unsupported)
+            /// question.
+            fn return_step(&self, rng: &mut WalkRng) -> (i32, i32) {
+                let (target_x, target_y, _, _) = self.visited[rng.below(self.visited.len())];
+                let distance_x = (target_x - self.x).abs();
+                let distance_y = (target_y - self.y).abs();
+                let max_x = (self.width / 3) as i32;
+                let max_y = (self.height / 3) as i32;
+                if distance_x > 0 && distance_x >= distance_y {
+                    ((target_x - self.x).clamp(-max_x, max_x), 0)
+                } else if distance_y > 0 {
+                    (0, (target_y - self.y).clamp(-max_y, max_y))
+                } else {
+                    // The target is where the box already is: step aside instead.
+                    (self.scroll_step(rng, true, 8, max_x), 0)
+                }
+            }
+
+            /// A random box drag that stays on the page. A drag is a known geometry
+            /// step, so it may move both axes at once.
+            fn drag_step(&self, rng: &mut WalkRng) -> (i32, i32) {
+                let room_right = self.page_w as i32 - self.width as i32 - self.x;
+                let room_down = self.page_h as i32 - self.height as i32 - self.y;
+                loop {
+                    let dx = rng.between(-self.x.min(120), room_right.min(120));
+                    let dy = rng.between(-self.y.min(120), room_down.min(120));
+                    if dx != 0 || dy != 0 {
+                        return (dx, dy);
+                    }
+                }
+            }
+
+            /// A random reshape: the size always changes, and the origin may move as
+            /// an edge drag does. Both stay on the page.
+            fn resize_step(&self, rng: &mut WalkRng) -> (i32, i32, u32, u32) {
+                let min_width = 140u32;
+                let min_height = 110u32;
+                let max_width = self.page_w / 3;
+                let max_height = self.page_h / 4;
+                let mut width = rng.between(min_width as i32, max_width as i32) as u32;
+                let height = rng.between(min_height as i32, max_height as i32) as u32;
+                if width == self.width && height == self.height {
+                    // Guarantee a geometry change so this really is an edit step.
+                    width = if width + 16 <= max_width { width + 16 } else { width - 16 };
+                }
+                let (dx_lo, dx_hi) = origin_range(self.x, width, self.page_w);
+                let (dy_lo, dy_hi) = origin_range(self.y, height, self.page_h);
+                (rng.between(dx_lo, dx_hi), rng.between(dy_lo, dy_hi), width, height)
+            }
+
+            /// Compares the finished canvas to the page: every captured pixel must
+            /// be the page's, every never-captured pixel must be empty, and the
+            /// canvas must be exactly the bounding box of what the walk visited.
+            fn assert_canvas(&self, label: &str, min_crossings: usize, min_edits: usize) {
+                assert!(
+                    self.crossings >= min_crossings,
+                    "{label}: the walk must cross its own path at least {min_crossings} times, \
+                     got {} — the shape is too simple to be the case this group exists for",
+                    self.crossings
+                );
+                assert!(
+                    self.edits >= min_edits,
+                    "{label}: the session must contain at least {min_edits} box edits, got {}",
+                    self.edits
+                );
+                let left = self.visited.iter().map(|&(x, _, _, _)| x).min().unwrap();
+                let top = self.visited.iter().map(|&(_, y, _, _)| y).min().unwrap();
+                let right = self.visited.iter().map(|&(x, _, w, _)| x + w as i32).max().unwrap();
+                let bottom = self.visited.iter().map(|&(_, y, _, h)| y + h as i32).max().unwrap();
+                let stitched = self.stitcher.stitched().expect("a stitched canvas");
+                // The canvas is anchored on the first frame; `anchor_origin` is the
+                // distance the canvas grew left/up of it, so the page coordinate of
+                // canvas column 0 is the first frame's page x minus that growth.
+                let anchor_x = self.visited[0].0 - stitched.anchor_origin_x;
+                let anchor_y = self.visited[0].1 - stitched.anchor_origin_y;
+                assert_eq!(
+                    (anchor_x, anchor_y),
+                    (left, top),
+                    "{label}: the canvas must start at the top-left of everything captured"
+                );
+                assert_eq!(
+                    (stitched.width, stitched.height),
+                    ((right - anchor_x) as u32, (bottom - anchor_y) as u32),
+                    "{label}: the canvas must be the bounding box of everything captured"
+                );
+                for canvas_y in 0..stitched.height {
+                    let page_y = anchor_y + canvas_y as i32;
+                    let expected = self.expected_spans(anchor_x, page_y, stitched.width);
+                    let coverage = if stitched.row_coverage.is_empty() {
+                        RowCoverage::Full
+                    } else {
+                        stitched.row_coverage[canvas_y as usize].clone()
+                    };
+                    for canvas_x in 0..stitched.width {
+                        let covered = coverage.contains(canvas_x);
+                        let expected_covered =
+                            expected.iter().any(|&(lo, hi)| canvas_x >= lo && canvas_x < hi);
+                        assert_eq!(
+                            covered, expected_covered,
+                            "{label}: coverage at canvas ({canvas_x},{canvas_y})"
+                        );
+                        let pixel = stitched_pixel_rgb(stitched, canvas_x, canvas_y);
+                        if covered {
+                            let value = self.pixel(
+                                (anchor_x + canvas_x as i32) as u32,
+                                page_y as u32,
+                            );
+                            assert_eq!(
+                                pixel,
+                                [value, value, value],
+                                "{label}: content at canvas ({canvas_x},{canvas_y})"
+                            );
+                        } else {
+                            assert_eq!(
+                                pixel,
+                                [0, 0, 0],
+                                "{label}: never-captured canvas ({canvas_x},{canvas_y}) must stay empty"
+                            );
+                        }
+                    }
+                }
+            }
+
+            /// Captured x-extents of one page row, in canvas coordinates.
+            fn expected_spans(&self, anchor_x: i32, page_y: i32, width: u32) -> Vec<(u32, u32)> {
+                let mut spans: Vec<(u32, u32)> = Vec::new();
+                for &(x, y, frame_width, frame_height) in &self.visited {
+                    if page_y < y || page_y >= y + frame_height as i32 {
+                        continue;
+                    }
+                    let lo = (x - anchor_x).max(0) as u32;
+                    let hi = ((x - anchor_x) + frame_width as i32).min(width as i32) as u32;
+                    if lo < hi {
+                        spans.push((lo, hi));
+                    }
+                }
+                spans.sort_unstable();
+                let mut merged: Vec<(u32, u32)> = Vec::new();
+                for (lo, hi) in spans {
+                    match merged.last_mut() {
+                        Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+                        _ => merged.push((lo, hi)),
+                    }
+                }
+                merged
+            }
+        }
+
+        /// A long random scroll walk on a page larger than the box: both axes,
+        /// arbitrary directions, steps up to a third of the box, and a bias toward
+        /// doubling back over captured content so the path crosses itself.
+        #[test]
+        fn a_random_scroll_walk_reconstructs_the_page() {
+            for seed in [0x5eed_0001u32, 0x5eed_0002, 0x5eed_0003] {
+                let label = format!("scroll walk seed {seed:#x}");
+                let mut rng = WalkRng::new(seed);
+                let mut session = RandomSession::new(seed, 840, 1260);
+                session.push(Some(LongDirection::Down), &format!("{label}: first frame"));
+                let mut hint = Some(LongDirection::Down);
+                for step in 1..=40 {
+                    let label = format!("{label}: step {step}");
+                    let horizontal = rng.percent(40);
+                    let (dx, dy) = if step > 3 && rng.percent(25) {
+                        session.return_step(&mut rng)
+                    } else if horizontal {
+                        (session.scroll_step(&mut rng, true, 8, 90), 0)
+                    } else {
+                        (0, session.scroll_step(&mut rng, false, 8, 70))
+                    };
+                    if dx != 0 {
+                        // A horizontal step needs a horizontal hint: nothing in the
+                        // frame says which side it moved to.
+                        hint = Some(if dx > 0 { LongDirection::Right } else { LongDirection::Left });
+                    } else if rng.percent(30) {
+                        hint = Some(if dy > 0 { LongDirection::Down } else { LongDirection::Up });
+                    }
+                    session.scroll(dx, dy);
+                    session.push(hint, &label);
+                }
+                assert!(
+                    session.horizontal_steps >= 5 && session.vertical_steps >= 5,
+                    "{label}: both axes must be exercised, got {} horizontal and {} vertical steps",
+                    session.horizontal_steps,
+                    session.vertical_steps
+                );
+                session.assert_canvas(&label, 6, 0);
+            }
+        }
+
+        /// The same idea with edit mode mixed in: between scrolls the box is dragged
+        /// over the page and reshaped, so the selection (not just the content) moves
+        /// and the canvas becomes a ragged, self-crossing shape.
+        #[test]
+        fn a_random_edit_box_session_reconstructs_the_page() {
+            for seed in [0xed17_0001u32, 0xed17_0002, 0xed17_0003] {
+                let label = format!("edit session seed {seed:#x}");
+                let mut rng = WalkRng::new(seed);
+                let mut session = RandomSession::new(seed, 960, 1320);
+                session.push(Some(LongDirection::Down), &format!("{label}: first frame"));
+                let mut hint = Some(LongDirection::Down);
+                for step in 1..=36 {
+                    let label = format!("{label}: step {step}");
+                    match rng.next() % 10 {
+                        // Drag the box over the page: a known geometry step.
+                        0..=2 => {
+                            let (dx, dy) = session.drag_step(&mut rng);
+                            session.move_box(dx, dy);
+                        }
+                        // Reshape it, sometimes moving its origin.
+                        3..=4 => {
+                            let (dx, dy, width, height) = session.resize_step(&mut rng);
+                            session.resize(dx, dy, width, height);
+                        }
+                        // Scroll the content inside it.
+                        _ => {
+                            let (dx, dy) = if rng.percent(40) {
+                                (session.scroll_step(&mut rng, true, 8, 100), 0)
+                            } else {
+                                (0, session.scroll_step(&mut rng, false, 8, 80))
+                            };
+                            if dx != 0 {
+                                hint = Some(if dx > 0 {
+                                    LongDirection::Right
+                                } else {
+                                    LongDirection::Left
+                                });
+                            } else if rng.percent(30) {
+                                hint = Some(if dy > 0 { LongDirection::Down } else { LongDirection::Up });
+                            }
+                            session.scroll(dx, dy);
+                        }
+                    }
+                    session.push(hint, &label);
+                }
+                assert!(
+                    session.horizontal_steps >= 3 && session.vertical_steps >= 3,
+                    "{label}: both axes must be exercised, got {} horizontal and {} vertical steps",
+                    session.horizontal_steps,
+                    session.vertical_steps
+                );
+                session.assert_canvas(&label, 4, 8);
+            }
+        }
     }
 }
