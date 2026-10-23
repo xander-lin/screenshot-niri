@@ -196,6 +196,14 @@ struct OverlaySurface {
     /// Surface size in logical pixels, as configured by the compositor.
     logical_width: i32,
     logical_height: i32,
+    /// Set once the layer surface has been configured.
+    ///
+    /// Before that there is no agreed surface size and the client must not
+    /// attach a buffer. `wp_fractional_scale_v1.preferred_scale` arrives on the
+    /// surface's first commit, so it can be dispatched *before* the layer
+    /// configure — buffer creation and rendering therefore wait for the
+    /// configure, which is also where the logical size comes from.
+    configured: bool,
     base_pixels: Option<Vec<u8>>,
     /// Only the dim mask and transparent hole are cached. Preview and border
     /// are composited afterwards, in that order, on every live redraw.
@@ -1084,6 +1092,7 @@ fn create_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Result<(),
             height: output.info.logical.height.max(1),
             logical_width: output.info.logical.width.max(1),
             logical_height: output.info.logical.height.max(1),
+            configured: false,
         });
     }
     Ok(())
@@ -1806,7 +1815,6 @@ fn draw_live_foreground(
     }
 }
 
-
 fn selected_local_intersection(output: LogicalRect, selected: LogicalRect) -> Option<LogicalRect> {
     selected.intersection(output).map(|intersection| LogicalRect {
         x: intersection.x - output.x,
@@ -1959,6 +1967,13 @@ fn refresh_overlay_surface(state: &mut UiState, output_name: u32, qh: &QueueHand
     let Some(index) = state.overlays.iter().position(|overlay| overlay.output_name == output_name) else {
         return;
     };
+    // A `preferred_scale` that beats the layer configure is recorded in the
+    // field and applied here once the configure supplies the logical size; it
+    // must not create buffers, because a buffer attached before the first
+    // configure is a protocol-order violation.
+    if !state.overlays[index].configured {
+        return;
+    }
     let logical_width = state.overlays[index].logical_width.max(1);
     let logical_height = state.overlays[index].logical_height.max(1);
     let preferred_scale = state.overlays[index].preferred_scale;
@@ -2309,6 +2324,7 @@ impl Dispatch<ZwlrLayerSurfaceV1, u32> for UiState {
             };
             overlay.logical_width = (width as i32).max(1);
             overlay.logical_height = (height as i32).max(1);
+            overlay.configured = true;
             refresh_overlay_surface(state, *name, qh);
             render_overlays(state);
         }

@@ -1,7 +1,6 @@
 # Overlay resolution and fractional scaling
 
-Status: implemented in the `fractional-scale-overlay` worktree; hardware
-verification pending.
+Status: merged into `niri` (`c16711f`); hardware verification pending.
 
 ## Two symptoms, one root cause
 
@@ -90,9 +89,13 @@ Edges, not widths, are mapped, so adjacent pieces share one boundary even when
 the ratio is fractional:
 
 ```
-x      = round(local.x * image.width / logical.width)
-width  = round(local.right() * ...) - x
+x      = floor(local.x * image.width / logical.width)
+width  = floor(local.right() * ...) - x
 ```
+
+The division truncates rather than rounds, and both edges go through it, so a
+piece's width is exactly the distance between the pixels its edges map to —
+rounding each width independently would leave a one-pixel seam.
 
 Destination offsets in a mixed-scale spanning selection use the same ratios, so
 pieces stay contiguous.
