@@ -19,6 +19,14 @@ use wayland_protocols::xdg::xdg_output::zv1::client::{
     zxdg_output_manager_v1::ZxdgOutputManagerV1,
     zxdg_output_v1::{self, ZxdgOutputV1},
 };
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+    wp_fractional_scale_v1::{self, WpFractionalScaleV1},
+};
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport::WpViewport,
+    wp_viewporter::WpViewporter,
+};
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{Layer, ZwlrLayerShellV1},
     zwlr_layer_surface_v1::{self, Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1},
@@ -168,12 +176,26 @@ struct OutputRuntime {
 
 struct OverlaySurface {
     output_name: u32,
+    /// Declared before the surface so these are destroyed first: both are
+    /// bound to the wl_surface they were created from.
+    viewport: Option<WpViewport>,
+    fractional_scale: Option<WpFractionalScaleV1>,
+    /// Output's preferred scale in 120ths (wp_fractional_scale_v1); 120 until
+    /// the compositor says otherwise.
+    preferred_scale: i32,
     surface: WlSurface,
     layer_surface: ZwlrLayerSurfaceV1,
     buffers: Vec<OverlayBuffer>,
     render_cache: Option<OverlayRenderCache>,
+    /// Buffer size in pixels. On a fractionally scaled output this is the
+    /// frozen capture's pixel size (larger than the logical size), so the
+    /// frozen image is displayed one buffer pixel per output pixel; a
+    /// wp_viewport maps it back onto the logical surface.
     width: i32,
     height: i32,
+    /// Surface size in logical pixels, as configured by the compositor.
+    logical_width: i32,
+    logical_height: i32,
     base_pixels: Option<Vec<u8>>,
     /// Only the dim mask and transparent hole are cached. Preview and border
     /// are composited afterwards, in that order, on every live redraw.
@@ -207,6 +229,13 @@ struct UiState {
     shm: Option<WlShm>,
     layer_shell: Option<ZwlrLayerShellV1>,
     xdg_output_manager: Option<ZxdgOutputManagerV1>,
+    /// Optional: without it the overlays keep a logical-sized buffer (the
+    /// pre-viewport behaviour) and simply accept the compositor's upscale.
+    viewporter: Option<WpViewporter>,
+    /// Optional: reports the output's preferred scale as 120ths (180 = 1.5).
+    /// Without it the frozen capture still sizes the frozen overlay correctly;
+    /// only the live overlay stays at the logical density.
+    fractional_scale_manager: Option<WpFractionalScaleManagerV1>,
     seat: Option<WlSeat>,
     pointer: Option<WlPointer>,
     keyboard: Option<WlKeyboard>,
@@ -287,6 +316,8 @@ pub fn select_viewport(frozen_outputs: &[CapturedOutput]) -> Result<SelectionOut
         shm: None,
         layer_shell: None,
         xdg_output_manager: None,
+        viewporter: None,
+        fractional_scale_manager: None,
         seat: None,
         pointer: None,
         keyboard: None,
@@ -473,6 +504,17 @@ fn border_bounds(rect: LogicalRect, thickness: i32) -> LogicalRect {
     }
 }
 
+/// Converts a length in logical pixels to overlay buffer pixels, rounding up so
+/// a configured border is never thinner than requested.
+fn buffer_length(value: i32, buffer_extent: i32, logical_extent: i32) -> i32 {
+    if buffer_extent <= 0 || logical_extent <= 0 {
+        return value.max(1);
+    }
+    let scaled = (i64::from(value) * i64::from(buffer_extent) + i64::from(logical_extent) - 1)
+        / i64::from(logical_extent);
+    i32::try_from(scaled).unwrap_or(i32::MAX).max(1)
+}
+
 /// One closed, outside-only ring for both frozen selection and live capture.
 fn selection_border_pixel(x: i32, y: i32, rect: LogicalRect, thickness: i32, color: [u8; 4]) -> Option<[u8; 4]> {
     let outer = border_bounds(rect, thickness);
@@ -654,6 +696,8 @@ impl SelectionSession {
             shm: None,
             layer_shell: None,
             xdg_output_manager: None,
+            viewporter: None,
+            fractional_scale_manager: None,
             seat: None,
             pointer: None,
             keyboard: None,
@@ -1018,16 +1062,28 @@ fn create_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Result<(),
         layer_surface.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
         layer_surface.set_size(0, 0);
         surface.commit();
+        let fractional_scale = state
+            .fractional_scale_manager
+            .as_ref()
+            .map(|manager| manager.get_fractional_scale(&surface, qh, output.info.global_name));
         state.overlays.push(OverlaySurface {
             output_name: output.info.global_name,
+            viewport: None,
+            fractional_scale,
+            preferred_scale: 120,
             surface,
             layer_surface,
             buffers: Vec::new(),
             render_cache: None,
             base_pixels: None,
             base_key: None,
+            // Until the first configure both sizes are the logical geometry;
+            // a fractionally scaled output replaces the buffer size with the
+            // frozen capture's pixel size in the configure handler.
             width: output.info.logical.width.max(1),
             height: output.info.logical.height.max(1),
+            logical_width: output.info.logical.width.max(1),
+            logical_height: output.info.logical.height.max(1),
         });
     }
     Ok(())
@@ -1494,10 +1550,13 @@ fn render_overlays(state: &mut UiState) -> usize {
         };
         let data = unsafe { std::slice::from_raw_parts_mut(buffer.data, buffer.size) };
         let current_selected = rect.and_then(|selected| selected_buffer_rect(output.info, selected, overlay.width, overlay.height));
+        // The border is drawn in logical pixels; its dirty ring must be the
+        // same ring measured in this overlay's buffer pixels.
+        let border_buffer_width = buffer_length(border_width, overlay.width, output.info.logical.width);
         let damage = if buffer.initialized {
             dirty_selected_region(
-                buffer.last_selected.map(|rect| border_bounds(rect, border_width)),
-                current_selected.map(|rect| border_bounds(rect, border_width)),
+                buffer.last_selected.map(|rect| border_bounds(rect, border_buffer_width)),
+                current_selected.map(|rect| border_bounds(rect, border_buffer_width)),
                 overlay.width, overlay.height)
         } else {
             Some(LogicalRect { x: 0, y: 0, width: overlay.width, height: overlay.height })
@@ -1567,21 +1626,16 @@ fn validate_frozen_outputs(outputs: &[OutputRuntime], frozen_outputs: &[FrozenOu
     Ok(())
 }
 
-fn frozen_pixel(frozen: &FrozenOutput, output: OutputInfo, overlay_width: i32, overlay_height: i32, local_x: i32, local_y: i32) -> [u8; 4] {
+fn frozen_pixel(frozen: &FrozenOutput, overlay_width: i32, overlay_height: i32, local_x: i32, local_y: i32) -> [u8; 4] {
     if frozen.width <= 0 || frozen.height <= 0 || frozen.stride <= 0 || overlay_width <= 0 || overlay_height <= 0 {
         return [0, 0, 0, 255];
     }
 
-    let scale = output.scale.max(1);
-    let exact_scaled = frozen.width == output.logical.width.saturating_mul(scale) && frozen.height == output.logical.height.saturating_mul(scale);
-    let (source_x, source_y) = if exact_scaled {
-        (local_x.saturating_mul(scale), local_y.saturating_mul(scale))
-    } else {
-        (
-            ((local_x as i64 * frozen.width as i64) / overlay_width as i64) as i32,
-            ((local_y as i64 * frozen.height as i64) / overlay_height as i64) as i32,
-        )
-    };
+    // The overlay buffer is sized to the frozen capture, so this is an identity
+    // whenever the output's scale could be honoured (fractional or integer);
+    // it only resamples on the fallback path, where the buffer is logical.
+    let source_x = ((local_x as i64 * frozen.width as i64) / overlay_width as i64) as i32;
+    let source_y = ((local_y as i64 * frozen.height as i64) / overlay_height as i64) as i32;
     let source_x = source_x.clamp(0, frozen.width - 1);
     let source_y = source_y.clamp(0, frozen.height - 1);
     let Ok(offset) = usize::try_from(source_y)
@@ -1605,9 +1659,11 @@ fn build_overlay_render_cache(width: i32, height: i32, output: OutputInfo, froze
     for local_y in 0..buffer_height {
         for local_x in 0..buffer_width {
             let offset = (local_y * buffer_width + local_x) * 4;
-            let pixel = frozen_pixel(frozen, output, width, height, local_x as i32, local_y as i32);
+            let pixel = frozen_pixel(frozen, width, height, local_x as i32, local_y as i32);
+            let logical_x = (local_x as i64 * output.logical.width as i64 / width.max(1) as i64) as i32;
+            let logical_y = (local_y as i64 * output.logical.height as i64 / height.max(1) as i64) as i32;
             base[offset..offset + 4].copy_from_slice(&pixel);
-            dimmed[offset..offset + 4].copy_from_slice(&composited_overlay_pixel(pixel, output.logical.x + local_x as i32, output.logical.y + local_y as i32, None, border_width));
+            dimmed[offset..offset + 4].copy_from_slice(&composited_overlay_pixel(pixel, output.logical.x + logical_x, output.logical.y + logical_y, None, border_width));
         }
     }
     OverlayRenderCache { width, height, base, dimmed }
@@ -1636,11 +1692,22 @@ fn draw_overlay(data: &mut [u8], cache: &OverlayRenderCache, output: OutputInfo,
 }
 
 fn draw_overlay_region(data: &mut [u8], cache: &OverlayRenderCache, output: OutputInfo, selected: Option<LogicalRect>, dirty: LogicalRect, border_width: i32, border: [u8; 4]) {
-    let width = cache.width.max(0) as usize;
+    if cache.width <= 0 || cache.height <= 0 {
+        return;
+    }
+    let width = cache.width as usize;
+    // Buffer pixels are not logical pixels on a fractionally scaled output:
+    // the buffer is the frozen capture's pixel grid, the selection lives in
+    // global logical coordinates. Map before comparing, otherwise the hole and
+    // the border land at `scale` times their position.
+    let logical = output.logical;
+    let to_global = |local: i32, origin: i32, logical_extent: i32, buffer_extent: i32| {
+        origin + (i64::from(local) * i64::from(logical_extent.max(1)) / i64::from(buffer_extent.max(1))) as i32
+    };
     for local_y in dirty.y as usize..dirty.bottom() as usize {
         for local_x in dirty.x as usize..dirty.right() as usize {
-            let global_x = output.logical.x + local_x as i32;
-            let global_y = output.logical.y + local_y as i32;
+            let global_x = to_global(local_x as i32, logical.x, logical.width, cache.width);
+            let global_y = to_global(local_y as i32, logical.y, logical.height, cache.height);
             let offset = (local_y * width + local_x) * 4;
             let source = match overlay_pixel(global_x, global_y, selected, border_width, border) {
                 OVERLAY_SELECTED_TRANSPARENT_BGRA => &cache.base,
@@ -1732,9 +1799,13 @@ fn draw_live_foreground(
         draw_preview_on_overlay(data, width, height, preview, output, hole);
     }
     if let Some(local) = border_rect {
-        draw_selection_border(data, width, height, local.x, local.y, local.width, local.height, border_width, border);
+        // The box is already in buffer pixels; its thickness is configured in
+        // logical pixels, so it has to be converted the same way.
+        let thickness = buffer_length(border_width, width, output.width);
+        draw_selection_border(data, width, height, local.x, local.y, local.width, local.height, thickness, border);
     }
 }
+
 
 fn selected_local_intersection(output: LogicalRect, selected: LogicalRect) -> Option<LogicalRect> {
     selected.intersection(output).map(|intersection| LogicalRect {
@@ -1751,6 +1822,8 @@ fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, prev
     if pw == 0 || ph == 0 || overlay_w <= 0 || overlay_h <= 0 {
         return;
     }
+    let logical_w = output_logical.width.max(1);
+    let logical_h = output_logical.height.max(1);
     let vp = preview.viewport_rect;
     let vp_w = vp.width.max(1);
     let vp_h = vp.height.max(1);
@@ -1759,58 +1832,47 @@ fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, prev
     let origin_x = preview.current_origin_x;
     let origin_y = preview.current_origin_y;
     let buf_stride = overlay_w as usize * 4;
-    let sel = selection_local.unwrap_or(LogicalRect { x: 0, y: 0, width: 0, height: 0 });
+    let hole = selection_local.unwrap_or(LogicalRect { x: 0, y: 0, width: 0, height: 0 });
     let img_data = &preview.image.data;
-    let img_stride = preview.image.stride as i32;
+    let img_stride = preview.image.stride as usize;
 
-    let global_y0 = output_logical.y;
-    let global_y1 = output_logical.y + overlay_h;
-    let global_x0 = output_logical.x;
-    let global_x1 = output_logical.x + overlay_w;
-    let sy0 = (origin_y + (global_y0 - vp.y) * ch / vp_h).max(0).min(ph);
-    let sy1 = (origin_y + (global_y1 - vp.y) * ch / vp_h + 1).max(0).min(ph);
-    // Precompute visible x-range in stitched coords
-    let sx_min = (origin_x + (global_x0 - vp.x) * cw / vp_w).max(0);
-    let sx_max = (origin_x + (global_x1 - vp.x) * cw / vp_w + 1).min(pw);
-
-    for sy in sy0..sy1 {
-        let global_y = vp.y + (sy - origin_y) * vp_h / ch;
-        if global_y < global_y0 || global_y >= global_y1 {
+    // Buffer-major: every buffer pixel of the dimmed area picks the stitched
+    // pixel it covers. Iterating the stitched image instead would leave gaps
+    // as soon as the buffer is denser than the logical grid (fractional scale),
+    // and the live screen would show through them.
+    let columns: Vec<Option<usize>> = (0..overlay_w)
+        .map(|bx| {
+            let global_x = output_logical.x + (i64::from(bx) * i64::from(logical_w) / i64::from(overlay_w)) as i32;
+            let sx = origin_x + ((i64::from(global_x - vp.x) * i64::from(cw)) / i64::from(vp_w)) as i32;
+            (sx >= 0 && sx < pw).then(|| sx as usize * 4)
+        })
+        .collect();
+    for by in 0..overlay_h {
+        let in_hole_row = by >= hole.y && by < hole.y + hole.height;
+        let global_y = output_logical.y + (i64::from(by) * i64::from(logical_h) / i64::from(overlay_h)) as i32;
+        let sy = origin_y + ((i64::from(global_y - vp.y) * i64::from(ch)) / i64::from(vp_h)) as i32;
+        if sy < 0 || sy >= ph {
             continue;
         }
-        let oy = global_y - global_y0;
-        let in_sel_y = oy >= sel.y && oy < sel.y + sel.height;
-        // For rows fully covered by selection, skip entire row
-        if in_sel_y {
-            let global_sx0 = vp.x + (sx_min - origin_x) * vp_w / cw;
-            let global_sx1 = vp.x + (sx_max - origin_x) * vp_w / cw;
-            let ox0 = global_sx0 - global_x0;
-            let ox1 = global_sx1 - global_x0;
-            if ox0 >= sel.x && ox1 <= sel.x + sel.width {
+        let src_row = sy as usize * img_stride;
+        let dst_row = by as usize * buf_stride;
+        for (bx, column) in columns.iter().enumerate() {
+            let Some(src_column) = column else {
+                continue;
+            };
+            if in_hole_row && (bx as i32) >= hole.x && (bx as i32) < hole.x + hole.width {
                 continue;
             }
-        }
-        let src_row = (sy * img_stride) as usize;
-
-        for sx in sx_min..sx_max {
-            let global_x = vp.x + (sx - origin_x) * vp_w / cw;
-            if global_x < global_x0 || global_x >= global_x1 {
-                continue;
-            }
-            let ox = global_x - global_x0;
-            if in_sel_y && ox >= sel.x && ox < sel.x + sel.width {
-                continue;
-            }
-            let src_off = src_row + (sx * 4) as usize;
+            let src_off = src_row + *src_column;
             if src_off + 3 >= img_data.len() {
                 continue;
             }
-            // Never-captured corners of ragged (T/L-shaped) stitched canvases
-            // stay transparent; leave the dimmed overlay visible beneath them.
+            // Never-captured corners of ragged (T/L/arch) canvases stay
+            // transparent; leave the dimmed overlay visible beneath them.
             if img_data[src_off + 3] == 0 {
                 continue;
             }
-            let dst_off = (oy as usize) * buf_stride + (ox as usize) * 4;
+            let dst_off = dst_row + bx * 4;
             data[dst_off] = img_data[src_off];
             data[dst_off + 1] = img_data[src_off + 1];
             data[dst_off + 2] = img_data[src_off + 2];
@@ -1837,6 +1899,151 @@ fn rect_union(a: LogicalRect, b: LogicalRect) -> LogicalRect {
     LogicalRect { x, y, width: right - x, height: bottom - y }
 }
 
+
+/// Overlay buffer size in pixels.
+///
+/// Two hard lower bounds: the frozen image that is about to be displayed (we
+/// must not resample our own screenshot before the compositor shows it) and the
+/// output's physical density from `wp_fractional_scale_v1` (otherwise the
+/// compositor upscales the overlay). Without `wp_viewporter` a buffer larger
+/// than the surface cannot be mapped back, so the logical size wins.
+fn overlay_buffer_size(
+    logical: (i32, i32),
+    capture: Option<(i32, i32)>,
+    preferred_scale: i32,
+    viewport_available: bool,
+) -> (i32, i32) {
+    let logical_width = logical.0.max(1);
+    let logical_height = logical.1.max(1);
+    if !viewport_available {
+        return (logical_width, logical_height);
+    }
+    let numerator = i64::from(preferred_scale.max(1));
+    let hinted = |extent: i32| (i64::from(extent) * numerator + 119) / 120;
+    let (capture_width, capture_height) = capture.unwrap_or((0, 0));
+    (
+        hinted(logical_width)
+            .max(i64::from(capture_width))
+            .max(i64::from(logical_width)) as i32,
+        hinted(logical_height)
+            .max(i64::from(capture_height))
+            .max(i64::from(logical_height)) as i32,
+    )
+}
+
+/// Recomputes one overlay's buffer size, render cache and viewport.
+///
+/// Both inputs change independently and either may arrive first: the logical
+/// size comes from the layer-surface configure, the pixel density from
+/// `wp_fractional_scale_v1.preferred_scale`, and the frozen capture size from
+/// the screenshot that was taken before the selection started.
+fn refresh_overlay_surface(state: &mut UiState, output_name: u32, qh: &QueueHandle<UiState>) {
+    let Some(output_info) = state
+        .outputs
+        .iter()
+        .find(|output| output.info.global_name == output_name)
+        .map(|output| output.info)
+    else {
+        return;
+    };
+    let frozen = (if state.screenshot_cursor_hidden {
+        &state.frozen_outputs_without_cursor
+    } else {
+        &state.frozen_outputs
+    })
+    .iter()
+    .find(|frozen| frozen.info.global_name == output_name);
+    let shm = state.shm.clone();
+    let viewporter = state.viewporter.clone();
+    let border_width = state.border_width;
+    let Some(index) = state.overlays.iter().position(|overlay| overlay.output_name == output_name) else {
+        return;
+    };
+    let logical_width = state.overlays[index].logical_width.max(1);
+    let logical_height = state.overlays[index].logical_height.max(1);
+    let preferred_scale = state.overlays[index].preferred_scale;
+    let (buffer_width, buffer_height) = overlay_buffer_size(
+        (logical_width, logical_height),
+        frozen.map(|frozen| (frozen.width, frozen.height)),
+        preferred_scale,
+        viewporter.is_some(),
+    );
+    let resized = (buffer_width, buffer_height)
+        != (state.overlays[index].width, state.overlays[index].height)
+        || state.overlays[index].buffers.is_empty();
+    if resized {
+        let Some(shm) = shm else {
+            return;
+        };
+        match create_overlay_buffers(&shm, output_name, buffer_width, buffer_height, qh) {
+            Ok(buffers) => {
+                let overlay = &mut state.overlays[index];
+                overlay.buffers = buffers;
+                overlay.base_pixels = None;
+                overlay.base_key = None;
+                overlay.render_cache = None;
+                overlay.width = buffer_width;
+                overlay.height = buffer_height;
+                crate::trace_log!(
+                    "overlay: buffers {}x{} output={} (logical {}x{}, preferred {})",
+                    buffer_width,
+                    buffer_height,
+                    output_name,
+                    logical_width,
+                    logical_height,
+                    preferred_scale
+                );
+            }
+            Err(err) => {
+                crate::trace_log!("overlay: buffers FAILED output={} err={}", output_name, err);
+                state.drag = DragState::Cancelled;
+                return;
+            }
+        }
+    }
+    if let Some(frozen) = frozen {
+        let cache_matches = state.overlays[index]
+            .render_cache
+            .as_ref()
+            .is_some_and(|cache| cache.width == buffer_width && cache.height == buffer_height);
+        if !cache_matches {
+            state.overlays[index].render_cache = Some(build_overlay_render_cache(
+                buffer_width,
+                buffer_height,
+                output_info,
+                frozen,
+                border_width,
+            ));
+        }
+    }
+    // A viewport destination is surface state: it only takes effect on the next
+    // commit. The frozen renderer commits only when there is damage, so a
+    // reconfigure that changes the logical size without changing the buffer
+    // size (a resolution change mid-selection) would otherwise keep the old
+    // mapping until something else forces a redraw.
+    let mut destination_set = false;
+    match viewporter {
+        Some(viewporter) if (buffer_width, buffer_height) != (logical_width, logical_height) => {
+            let overlay = &mut state.overlays[index];
+            if overlay.viewport.is_none() {
+                overlay.viewport = Some(viewporter.get_viewport(&overlay.surface, qh, ()));
+            }
+            if let Some(viewport) = overlay.viewport.as_ref() {
+                viewport.set_destination(logical_width, logical_height);
+                destination_set = true;
+            }
+        }
+        _ => {
+            if let Some(viewport) = state.overlays[index].viewport.as_ref() {
+                viewport.set_destination(0, 0);
+                destination_set = true;
+            }
+        }
+    }
+    if destination_set {
+        state.overlays[index].surface.commit();
+    }
+}
 
 fn create_overlay_buffers(
     shm: &WlShm,
@@ -1902,6 +2109,10 @@ impl Dispatch<WlRegistry, ()> for UiState {
             "wl_shm" => state.shm = Some(registry.bind::<WlShm, _, _>(name, version.min(1), qh, ())),
             "zwlr_layer_shell_v1" => state.layer_shell = Some(registry.bind::<ZwlrLayerShellV1, _, _>(name, version.min(4), qh, ())),
             "zxdg_output_manager_v1" => state.xdg_output_manager = Some(registry.bind::<ZxdgOutputManagerV1, _, _>(name, version.min(3), qh, ())),
+            "wp_viewporter" => state.viewporter = Some(registry.bind::<WpViewporter, _, _>(name, version.min(1), qh, ())),
+            "wp_fractional_scale_manager_v1" => {
+                state.fractional_scale_manager = Some(registry.bind::<WpFractionalScaleManagerV1, _, _>(name, version.min(1), qh, ()))
+            }
             "wl_seat" => state.seat = Some(registry.bind::<WlSeat, _, _>(name, version.min(7), qh, ())),
             "wl_output" => {
                 let output = registry.bind::<WlOutput, _, _>(name, version.min(4), qh, name);
@@ -2089,39 +2300,16 @@ impl Dispatch<ZwlrLayerSurfaceV1, u32> for UiState {
         if let zwlr_layer_surface_v1::Event::Configure { serial, width, height } = event {
             layer_surface.ack_configure(serial);
             crate::trace_log!("configure: output={} size={}x{}", name, width, height);
-            let Some(shm) = state.shm.clone() else {
+            if state.shm.is_none() {
                 state.drag = DragState::Cancelled;
                 return;
-            };
-            let configured_width = width as i32;
-            let configured_height = height as i32;
+            }
             let Some(overlay) = state.overlays.iter_mut().find(|overlay| overlay.output_name == *name) else {
                 return;
             };
-            overlay.width = configured_width;
-            overlay.height = configured_height;
-            if let (Some(output), Some(frozen)) = (
-                state.outputs.iter().find(|o| o.info.global_name == *name),
-                (if state.screenshot_cursor_hidden {
-                    &state.frozen_outputs_without_cursor
-                } else {
-                    &state.frozen_outputs
-                })
-                .iter()
-                .find(|f| f.info.global_name == *name),
-            ) {
-                overlay.render_cache = Some(build_overlay_render_cache(configured_width, configured_height, output.info, frozen, state.border_width));
-            }
-            match create_overlay_buffers(&shm, *name, overlay.width, overlay.height, qh) {
-                Ok(buffers) => {
-                    crate::trace_log!("configure: buffers created output={} count={}", name, buffers.len());
-                    overlay.buffers = buffers;
-                }
-                Err(err) => {
-                    crate::trace_log!("configure: buffers FAILED output={} err={}", name, err);
-                    state.drag = DragState::Cancelled;
-                }
-            }
+            overlay.logical_width = (width as i32).max(1);
+            overlay.logical_height = (height as i32).max(1);
+            refresh_overlay_surface(state, *name, qh);
             render_overlays(state);
         }
     }
@@ -2194,6 +2382,34 @@ impl Dispatch<ZxdgOutputManagerV1, ()> for UiState {
 }
 
 delegate_noop!(UiState: ignore WlSurface);
+delegate_noop!(UiState: ignore WpViewport);
+delegate_noop!(UiState: ignore WpViewporter);
+delegate_noop!(UiState: ignore WpFractionalScaleManagerV1);
+
+impl Dispatch<WpFractionalScaleV1, u32> for UiState {
+    fn event(
+        state: &mut Self,
+        _: &WpFractionalScaleV1,
+        event: wp_fractional_scale_v1::Event,
+        output_name: &u32,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        let wp_fractional_scale_v1::Event::PreferredScale { scale } = event else {
+            return;
+        };
+        let Some(overlay) = state.overlays.iter_mut().find(|overlay| overlay.output_name == *output_name) else {
+            return;
+        };
+        let scale = scale.max(1) as i32;
+        if overlay.preferred_scale == scale {
+            return;
+        }
+        overlay.preferred_scale = scale;
+        refresh_overlay_surface(state, *output_name, qh);
+        queue_render(state, true);
+    }
+}
 delegate_noop!(UiState: ignore WlRegion);
 delegate_noop!(UiState: ignore WlShmPool);
 
@@ -2256,6 +2472,73 @@ mod tests {
         assert_eq!(pixel(30, 40), [7, 7, 7, 7]);
         // Outside the stitched width nothing is drawn.
         assert_eq!(pixel(5, 10), [7, 7, 7, 7]);
+    }
+
+    #[test]
+    fn overlay_buffer_size_never_shrinks_below_capture_or_density() {
+        // 1920x1080 output at 1.5 reports a 1280x720 logical size; the frozen
+        // capture is 1920x1080 and the hint is 180 (120ths).
+        assert_eq!(overlay_buffer_size((1280, 720), Some((1920, 1080)), 180, true), (1920, 1080));
+        // Same density with no capture yet (the live path): still 1.5x.
+        assert_eq!(overlay_buffer_size((1280, 720), None, 180, true), (1920, 1080));
+        assert_eq!(overlay_buffer_size((1280, 720), None, 150, true), (1600, 900));
+        assert_eq!(overlay_buffer_size((1280, 720), None, 120, true), (1280, 720));
+        // A capture denser than the hint wins: the image we display must never
+        // be resampled on its way to the screen.
+        assert_eq!(overlay_buffer_size((1280, 720), Some((2560, 1440)), 180, true), (2560, 1440));
+        // Without wp_viewporter a larger buffer cannot be mapped back.
+        assert_eq!(overlay_buffer_size((1280, 720), Some((1920, 1080)), 180, false), (1280, 720));
+    }
+
+    #[test]
+    fn frozen_overlay_maps_buffer_pixels_through_the_logical_grid() {
+        // 4x4 logical output, 6x6 buffer (1.5x). A selection at global
+        // (1,1)-(3,3) must be the hole at buffer [2,4), not [1,3).
+        let output_info = OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 0, width: 4, height: 4 }, scale: 2 };
+        let frozen = frozen_test_output(output_info, 6, 6, [10, 20, 30, 255]);
+        let cache = build_overlay_render_cache(6, 6, output_info, &frozen, 1);
+        let mut data = vec![0u8; 6 * 6 * 4];
+        let selected = LogicalRect { x: 1, y: 1, width: 2, height: 2 };
+        draw_overlay(&mut data, &cache, output_info, Some(selected), 1, OVERLAY_BORDER_WHITE_BGRA);
+
+        // Inside the hole the frozen pixel is shown undimmed; outside it is
+        // dimmed, and the closed ring is white. Comparing against the raw
+        // frozen colour distinguishes the hole from both.
+        let frozen = [10, 20, 30, 255];
+        // buffer (1,1) is global (0,0) - outside the selection.
+        assert_ne!(pixel_at(&data, 6, 1, 1), frozen);
+        // buffer (2,2) and (4,4) are global (1,1) and (2,2) - inside.
+        assert_eq!(pixel_at(&data, 6, 2, 2), frozen);
+        assert_eq!(pixel_at(&data, 6, 4, 4), frozen);
+        // buffer (5,5) is global (3,3) - outside again.
+        assert_ne!(pixel_at(&data, 6, 5, 5), frozen);
+    }
+
+    #[test]
+    fn preview_fills_a_denser_buffer_without_gaps() {
+        let preview = LongPreviewSnapshot {
+            image: solid_image(2, 2, &[(0, 2, [255, 255, 255, 255])]),
+            current_origin_x: 0,
+            current_origin_y: 0,
+            viewport_rect: LogicalRect { x: 0, y: 0, width: 2, height: 2 },
+            capture_width: 2,
+            capture_height: 2,
+        };
+        let output_logical = LogicalRect { x: 0, y: 0, width: 2, height: 2 };
+        let mut data = vec![7u8; 4 * 4 * 4];
+        draw_preview_on_overlay(&mut data, 4, 4, &preview, output_logical, None);
+        for y in 0..4 {
+            for x in 0..4 {
+                assert_eq!(pixel_at(&data, 4, x, y), [255, 255, 255, 255], "buffer pixel ({x},{y})");
+            }
+        }
+
+        // The hole is in buffer coordinates and stays untouched.
+        let mut data = vec![7u8; 4 * 4 * 4];
+        let hole = LogicalRect { x: 0, y: 0, width: 2, height: 2 };
+        draw_preview_on_overlay(&mut data, 4, 4, &preview, output_logical, Some(hole));
+        assert_eq!(pixel_at(&data, 4, 0, 0), [7, 7, 7, 7]);
+        assert_eq!(pixel_at(&data, 4, 3, 3), [255, 255, 255, 255]);
     }
 
     #[test]
@@ -2781,6 +3064,8 @@ mod tests {
             shm: None,
             layer_shell: None,
             xdg_output_manager: None,
+            viewporter: None,
+            fractional_scale_manager: None,
             seat: None,
             pointer: None,
             keyboard: None,
@@ -3099,7 +3384,7 @@ mod tests {
         let mut frozen = frozen_test_output(output_info, 4, 4, [0, 0, 0, 255]);
         frozen.data[(2 * frozen.stride + 2 * 4) as usize..(2 * frozen.stride + 3 * 4) as usize].copy_from_slice(&[11, 22, 33, 255]);
 
-        assert_eq!(frozen_pixel(&frozen, output_info, 2, 2, 1, 1), [11, 22, 33, 255]);
+        assert_eq!(frozen_pixel(&frozen, 2, 2, 1, 1), [11, 22, 33, 255]);
     }
 
     fn pixel_at(data: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {

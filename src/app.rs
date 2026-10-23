@@ -49,9 +49,9 @@ fn run_normal(args: crate::cli::Args, config: crate::config::Config) -> Result<(
                 &frozen_outputs
             };
             session.close()?;
-            let (width, height) = viewport.capture_size()?;
+            let (width, height) = viewport.capture_size(captures)?;
             let frame = crate::image::composite_captured_region(
-                &viewport.capture_regions(),
+                &viewport.capture_regions(captures),
                 width,
                 height,
                 captures,

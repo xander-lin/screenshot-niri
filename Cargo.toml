@@ -18,7 +18,7 @@ libc = "0.2"
 png = "0.17"
 tempfile = "3"
 wayland-client = { version = "0.31", default-features = false }
-wayland-protocols = { version = "0.32", default-features = false, features = ["client", "unstable"] }
+wayland-protocols = { version = "0.32", default-features = false, features = ["client", "unstable", "staging"] }
 wayland-protocols-wlr = { version = "0.3", default-features = false, features = ["client"] }
 
 [profile.release]

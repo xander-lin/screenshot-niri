@@ -1,4 +1,4 @@
-use crate::wayland::screencopy::{CaptureOutputRegion, Region};
+use crate::wayland::screencopy::{CaptureOutputRegion, CapturedOutput, Region};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogicalRect {
@@ -25,7 +25,6 @@ pub struct SelectedViewport {
 pub struct SelectedOutputRegion {
     pub output_global_name: u32,
     pub output_logical: LogicalRect,
-    pub output_scale: i32,
     pub global_region: LogicalRect,
     pub local_region: LogicalRect,
 }
@@ -117,7 +116,6 @@ impl SelectedViewport {
             regions.push(SelectedOutputRegion {
                 output_global_name: output.global_name,
                 output_logical: output.logical,
-                output_scale: output.scale.max(1),
                 global_region,
                 local_region: LogicalRect {
                     x: global_region.x - output.logical.x,
@@ -133,27 +131,46 @@ impl SelectedViewport {
         Ok(Self { rect, regions })
     }
 
-    pub fn capture_regions(&self) -> Vec<CaptureOutputRegion> {
+    /// Pixel rectangles to crop out of the frozen captures.
+    ///
+    /// The logical-to-pixel factor comes from the capture itself
+    /// (`image.width / output logical width`), never from `wl_output.scale`:
+    /// that one is an integer, while a 1.5-scaled output delivers buffers at
+    /// 1.5x its logical size. Scaling by the integer reported by the
+    /// compositor asks the crop for pixels the capture does not have (which is
+    /// why a whole-output capture on the scaled screen produced no image at
+    /// all) or silently crops the wrong rectangle.
+    pub fn capture_regions(&self, captures: &[CapturedOutput]) -> Vec<CaptureOutputRegion> {
         self.regions
             .iter()
-            .map(|region| CaptureOutputRegion {
-                output_name: region.output_global_name,
-                region: Region {
-                    x: region.local_region.x * region.output_scale,
-                    y: region.local_region.y * region.output_scale,
-                    width: region.local_region.width * region.output_scale,
-                    height: region.local_region.height * region.output_scale,
-                },
-                dst_x: self.scaled_axis_offset(region.global_region.x, true),
-                dst_y: self.scaled_axis_offset(region.global_region.y, false),
+            .map(|region| {
+                let (scale_x, inv_x) = capture_pixel_scale(region, captures, true);
+                let (scale_y, inv_y) = capture_pixel_scale(region, captures, false);
+                let right = region.local_region.right();
+                let bottom = region.local_region.bottom();
+                CaptureOutputRegion {
+                    output_name: region.output_global_name,
+                    region: Region {
+                        x: scale_logical(region.local_region.x, scale_x, inv_x),
+                        y: scale_logical(region.local_region.y, scale_y, inv_y),
+                        // Edges, not widths: two adjacent pieces then share one
+                        // boundary even when the factor is fractional.
+                        width: scale_logical(right, scale_x, inv_x)
+                            - scale_logical(region.local_region.x, scale_x, inv_x),
+                        height: scale_logical(bottom, scale_y, inv_y)
+                            - scale_logical(region.local_region.y, scale_y, inv_y),
+                    },
+                    dst_x: self.scaled_axis_offset(region.global_region.x, true, captures),
+                    dst_y: self.scaled_axis_offset(region.global_region.y, false, captures),
+                }
             })
             .collect()
     }
 
-    pub fn capture_size(&self) -> Result<(u32, u32), String> {
+    pub fn capture_size(&self, captures: &[CapturedOutput]) -> Result<(u32, u32), String> {
         let mut width = 0u32;
         let mut height = 0u32;
-        for region in self.capture_regions() {
+        for region in self.capture_regions(captures) {
             let region_width = u32::try_from(region.region.width).map_err(|_| "capture region has negative width")?;
             let region_height = u32::try_from(region.region.height).map_err(|_| "capture region has negative height")?;
             width = width.max(region.dst_x.checked_add(region_width).ok_or("capture width overflow")?);
@@ -166,7 +183,7 @@ impl SelectedViewport {
         }
     }
 
-    fn scaled_axis_offset(&self, target: i32, horizontal: bool) -> u32 {
+    fn scaled_axis_offset(&self, target: i32, horizontal: bool, captures: &[CapturedOutput]) -> u32 {
         let viewport_start = if horizontal { self.rect.x } else { self.rect.y };
         let mut intervals: Vec<_> = self
             .regions
@@ -175,28 +192,62 @@ impl SelectedViewport {
                 let rect = region.global_region;
                 let start = if horizontal { rect.x } else { rect.y };
                 let end = if horizontal { rect.right() } else { rect.bottom() };
-                (start, end, region.output_scale)
+                // The ratio is defined on this output's own local frame, so the
+                // span must be anchored at the output's origin: mapping the
+                // global coordinate directly adds the phase of
+                // `origin * ratio`, which can round one pixel away from the crop
+                // width the same piece was written with.
+                let origin = if horizontal { region.output_logical.x } else { region.output_logical.y };
+                let (scale, inv) = capture_pixel_scale(region, captures, horizontal);
+                (start, end, origin, scale, inv)
             })
             .collect();
-        intervals.sort_by_key(|item| *item);
+        intervals.sort_by_key(|item| (item.0, item.1));
 
         let mut offset = 0u32;
         let mut covered_until = viewport_start;
-        for (start, end, scale) in intervals {
+        for (start, end, origin, scale, inv) in intervals {
             if end <= covered_until || start >= target {
                 continue;
             }
             let segment_start = start.max(covered_until).max(viewport_start);
             let segment_end = end.min(target);
             if segment_end > segment_start {
-                let span = u32::try_from(segment_end - segment_start).unwrap_or(0);
-                let scale = u32::try_from(scale).unwrap_or(1);
-                offset = offset.saturating_add(span.saturating_mul(scale));
+                // Map both edges in the output's local frame and subtract: the
+                // same rule as the source rectangles, so every piece's
+                // destination offset equals the widths already written.
+                let span = scale_logical(segment_end - origin, scale, inv)
+                    - scale_logical(segment_start - origin, scale, inv);
+                offset = offset.saturating_add(u32::try_from(span).unwrap_or(0));
                 covered_until = segment_end;
             }
         }
         offset
     }
+}
+
+/// Pixels per logical unit on one output, as `(numerator, denominator)` taken
+/// from the frozen capture for that output.
+fn capture_pixel_scale(region: &SelectedOutputRegion, captures: &[CapturedOutput], horizontal: bool) -> (i32, i32) {
+    let Some(capture) = captures.iter().find(|capture| capture.output_name == region.output_global_name) else {
+        return (1, 1);
+    };
+    let (pixels, logical) = if horizontal {
+        (capture.image.width, region.output_logical.width)
+    } else {
+        (capture.image.height, region.output_logical.height)
+    };
+    if pixels == 0 || logical <= 0 {
+        return (1, 1);
+    }
+    (i32::try_from(pixels).unwrap_or(1), logical)
+}
+
+fn scale_logical(value: i32, numerator: i32, denominator: i32) -> i32 {
+    if numerator <= 0 || denominator <= 0 {
+        return value;
+    }
+    (i64::from(value) * i64::from(numerator) / i64::from(denominator)) as i32
 }
 
 #[cfg(test)]
@@ -209,13 +260,71 @@ mod tests {
             OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 0, width: 100, height: 80 }, scale: 1 },
             OutputInfo { global_name: 2, logical: LogicalRect { x: 100, y: 0, width: 100, height: 80 }, scale: 2 },
         ];
+        let captures = [captured(1, 100, 80), captured(2, 200, 160)];
         let viewport = SelectedViewport::from_outputs(LogicalRect { x: 90, y: 10, width: 30, height: 20 }, &outputs).unwrap();
-        let regions = viewport.capture_regions();
+        let regions = viewport.capture_regions(&captures);
         assert_eq!(regions.len(), 2);
         assert_eq!(regions[0].region.width, 10);
         assert_eq!(regions[1].region.width, 40);
         assert_eq!(regions[1].dst_x, 10);
-        assert_eq!(viewport.capture_size().unwrap(), (50, 40));
+        assert_eq!(viewport.capture_size(&captures).unwrap(), (50, 40));
+    }
+
+    #[test]
+    fn capture_regions_follow_the_capture_pixel_ratio_on_fractional_scale() {
+        // A 100x80 logical output at scale 1.5. Some compositors report
+        // wl_output.scale = 2 for it while delivering 150x120 pixel buffers;
+        // cropping by the reported integer asks for 200x160 and fails, which is
+        // why a whole-output capture on the scaled screen produced no file.
+        let outputs = [OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 0, width: 100, height: 80 }, scale: 2 }];
+        let captures = [captured(1, 150, 120)];
+        let viewport = SelectedViewport::from_outputs(LogicalRect { x: 0, y: 0, width: 100, height: 80 }, &outputs).unwrap();
+        let regions = viewport.capture_regions(&captures);
+        assert_eq!((regions[0].region.x, regions[0].region.y), (0, 0));
+        assert_eq!((regions[0].region.width, regions[0].region.height), (150, 120));
+        assert_eq!(viewport.capture_size(&captures).unwrap(), (150, 120));
+
+        // Half the width in logical units is half the width in pixels.
+        let viewport = SelectedViewport::from_outputs(LogicalRect { x: 50, y: 0, width: 50, height: 80 }, &outputs).unwrap();
+        let regions = viewport.capture_regions(&captures);
+        assert_eq!((regions[0].region.x, regions[0].region.width), (75, 75));
+    }
+
+    #[test]
+    fn mixed_scale_selection_places_pieces_contiguously() {
+        // The selection starts inside a fractionally scaled output whose left
+        // edge is *not* at pixel zero (1 logical of unscaled output before it),
+        // so `origin * ratio` has a fractional part: 1 * 151/101 = 1.495.
+        // Each piece's destination must equal the accumulated crop widths of
+        // the pieces before it, otherwise the seam gains or loses a column.
+        let outputs = [
+            OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 0, width: 1, height: 80 }, scale: 1 },
+            OutputInfo { global_name: 2, logical: LogicalRect { x: 1, y: 0, width: 101, height: 80 }, scale: 2 },
+            OutputInfo { global_name: 3, logical: LogicalRect { x: 102, y: 0, width: 100, height: 80 }, scale: 1 },
+        ];
+        let captures = [captured(1, 1, 80), captured(2, 151, 80), captured(3, 100, 80)];
+        let viewport = SelectedViewport::from_outputs(LogicalRect { x: 7, y: 0, width: 143, height: 80 }, &outputs).unwrap();
+        let regions = viewport.capture_regions(&captures);
+        assert_eq!(regions.len(), 2);
+        let mut placed = 0u32;
+        for region in &regions {
+            assert_eq!(region.dst_x, placed, "output {} starts at the wrong column", region.output_name);
+            placed += u32::try_from(region.region.width).unwrap();
+        }
+        assert_eq!(viewport.capture_size(&captures).unwrap(), (placed, 80));
+    }
+
+    fn captured(output_name: u32, width: u32, height: u32) -> CapturedOutput {
+        CapturedOutput {
+            output_name,
+            image: crate::image::Image {
+                width,
+                height,
+                stride: width * 4,
+                format: wayland_client::protocol::wl_shm::Format::Xrgb8888,
+                data: vec![0; (width * height * 4) as usize],
+            },
+        }
     }
 
     #[test]
