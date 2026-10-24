@@ -153,7 +153,18 @@ impl CanvasWindow {
 }
 
 pub fn image_from_stitched_frame(frame: &StitchedFrame) -> Result<Image, Box<dyn Error>> {
-    image_from_stitched_window_reusing(frame, CanvasWindow::full(frame), Vec::new())
+    Ok(image_from_stitched_window_reusing(frame, CanvasWindow::full(frame), Vec::new())?.image)
+}
+
+/// A window of the canvas as RGBA, plus whether it is fully opaque.
+///
+/// `opaque` is exact, not a guess: it is true only when every pixel of the
+/// window was captured, which is what lets the overlay copy contiguous runs
+/// instead of testing each pixel's alpha. It is false for a ragged (T/L/arch)
+/// canvas and for a window that includes rows the capture never wrote.
+pub struct WindowImage {
+    pub image: Image,
+    pub opaque: bool,
 }
 
 /// One region of the canvas, as RGBA.
@@ -169,7 +180,7 @@ pub fn image_from_stitched_window_reusing(
     frame: &StitchedFrame,
     window: CanvasWindow,
     mut buffer: Vec<u8>,
-) -> Result<Image, Box<dyn Error>> {
+) -> Result<WindowImage, Box<dyn Error>> {
     if window.width == 0 || window.height == 0 {
         return Err("empty canvas window".into());
     }
@@ -198,6 +209,7 @@ pub fn image_from_stitched_window_reusing(
     // working-set lookup on every one of them (measured: 3× the cost of the
     // whole rest of the frame).
     let mut source = vec![0u8; window.width as usize * 3];
+    let mut opaque = true;
     for row in 0..window.height {
         let canvas_y = window.y as u32 + row;
         let dst_row = row as usize * stride as usize;
@@ -211,6 +223,7 @@ pub fn image_from_stitched_window_reusing(
             // this the row would show the previous frame's pixels, and the
             // overlay paints any pixel with a non-zero alpha.
             data[dst_row..dst_row + stride as usize].fill(0);
+            opaque = false;
             continue;
         }
         // Coverage is decided per row, not per pixel. The common canvas is
@@ -243,6 +256,7 @@ pub fn image_from_stitched_window_reusing(
         // so the gaps stay transparent rather than being filled with black.
         // Clearing first is what makes that true for a recycled buffer.
         data[dst_row..dst_row + stride as usize].fill(0);
+        opaque = false;
         for column in 0..window.width {
             let filled = covered.is_none_or(|row| row.contains(first + column));
             if !filled {
@@ -256,12 +270,15 @@ pub fn image_from_stitched_window_reusing(
             data[dst + 3] = 255;
         }
     }
-    Ok(Image {
-        width: window.width,
-        height: window.height,
-        stride,
-        format: Format::Argb8888,
-        data,
+    Ok(WindowImage {
+        image: Image {
+            width: window.width,
+            height: window.height,
+            stride,
+            format: Format::Argb8888,
+            data,
+        },
+        opaque,
     })
 }
 

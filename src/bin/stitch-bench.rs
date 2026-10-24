@@ -259,8 +259,8 @@ fn measure(frames: &[Image], with_preview: bool) -> Result<Report, Box<dyn std::
         reset_allocation_counters();
         let started = Instant::now();
         let recycled = std::mem::take(&mut preview_buffer);
-        let image = image_from_stitched_window_reusing(stitched, window, recycled)?;
-        preview_buffer = image.data;
+        let window_image = image_from_stitched_window_reusing(stitched, window, recycled)?;
+        preview_buffer = window_image.image.data;
         report.preview.push(started.elapsed().as_secs_f64() * 1e3);
         let allocated = ALLOCATED.load(Ordering::Relaxed);
         let allocations = ALLOCATIONS.load(Ordering::Relaxed);

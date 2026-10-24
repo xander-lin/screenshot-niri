@@ -4522,7 +4522,9 @@ mod tests {
         let covered =
             image_from_stitched_window_reusing(&stitched, CanvasWindow::full(&stitched), Vec::new())
                 .unwrap();
+        assert!(covered.opaque, "a rectangular canvas is fully opaque");
         assert!(covered
+            .image
             .data
             .as_chunks::<4>()
             .0
@@ -4535,11 +4537,12 @@ mod tests {
         let ragged = image_from_stitched_window_reusing(
             &stitched,
             CanvasWindow::full(&stitched),
-            covered.data,
+            covered.image.data,
         )
         .unwrap();
+        assert!(!ragged.opaque, "a ragged canvas is not opaque");
         for column in 0..4 {
-            let alpha = ragged.data[column * 4 + 3];
+            let alpha = ragged.image.data[column * 4 + 3];
             let want = if column < 2 { 255 } else { 0 };
             assert_eq!(
                 alpha, want,

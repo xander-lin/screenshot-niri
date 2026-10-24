@@ -827,6 +827,14 @@ pub enum LongSessionStatus {
 #[derive(Debug, Clone)]
 pub struct LongPreviewSnapshot {
     pub image: Image,
+    /// True when every pixel of `image` was captured.
+    ///
+    /// Comes from the canvas conversion, which is the only place that knows:
+    /// a ragged (T/L/arch) canvas and a window over never-written rows both
+    /// leave transparent pixels, and those must not be painted (the dimmed
+    /// base has to stay visible through them). When it is true the draw copies
+    /// contiguous runs instead of testing each pixel's alpha.
+    pub opaque: bool,
     pub current_origin_x: i32,
     pub current_origin_y: i32,
     pub viewport_rect: LogicalRect,
@@ -2397,41 +2405,101 @@ fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, prev
     // pixel it covers. Iterating the stitched image instead would leave gaps
     // as soon as the buffer is denser than the logical grid (fractional scale),
     // and the live screen would show through them.
-    let columns: Vec<Option<usize>> = (0..overlay_w)
-        .map(|bx| {
-            let sx = canvas_x(bx);
-            (sx >= 0 && sx < i64::from(pw)).then(|| sx as usize * 4)
-        })
-        .collect();
+    //
+    // Two properties decide the shape of this loop. A row fully covered by a
+    // full-width hole draws nothing, and a row the hole only partly covers
+    // draws two runs (left of it, right of it) — testing every column for
+    // membership made a 4K draw that painted nothing cost 3.2 ms. And when the
+    // capture and the buffer share a density (the normal case) the source
+    // columns are contiguous with the buffer columns, so a run is one memcpy
+    // instead of 4 bytes at a time: the same 24.6 MB costs 1.4 ms that way.
+    let one_to_one = i64::from(cw) == vp_buffer_w && i64::from(ch) == vp_buffer_h;
+    let columns: Vec<Option<usize>> = if one_to_one {
+        Vec::new()
+    } else {
+        (0..overlay_w)
+            .map(|bx| {
+                let sx = canvas_x(bx);
+                (sx >= 0 && sx < i64::from(pw)).then(|| sx as usize * 4)
+            })
+            .collect()
+    };
+    let hole_x0 = hole.x.clamp(0, overlay_w);
+    let hole_x1 = hole.x.saturating_add(hole.width).clamp(0, overlay_w);
+    let hole_hides_row = hole_x0 == 0 && hole_x1 >= overlay_w;
+    let hole_y1 = hole.y.saturating_add(hole.height);
+
     for by in 0..overlay_h {
-        let in_hole_row = by >= hole.y && by < hole.y + hole.height;
         let sy = canvas_y(by);
         if sy < 0 || sy >= i64::from(ph) {
             continue;
         }
+        let in_hole_row = by >= hole.y && by < hole_y1;
+        if in_hole_row && hole_hides_row {
+            continue;
+        }
         let src_row = sy as usize * img_stride;
         let dst_row = by as usize * buf_stride;
-        for (bx, column) in columns.iter().enumerate() {
-            let Some(src_column) = column else {
-                continue;
-            };
-            if in_hole_row && (bx as i32) >= hole.x && (bx as i32) < hole.x + hole.width {
-                continue;
-            }
-            let src_off = src_row + *src_column;
-            if src_off + 3 >= img_data.len() {
-                continue;
-            }
-            // Never-captured corners of ragged (T/L/arch) canvases stay
-            // transparent; leave the dimmed overlay visible beneath them.
-            if img_data[src_off + 3] == 0 {
+        // The visible runs of this row: the whole width, or the two sides of
+        // the hole when the hole touches it.
+        let segments: [(i32, i32); 2] = if in_hole_row {
+            [(0, hole_x0), (hole_x1, overlay_w)]
+        } else {
+            [(0, overlay_w), (0, 0)]
+        };
+        for (x0, x1) in segments {
+            if x1 <= x0 {
                 continue;
             }
-            let dst_off = dst_row + bx * 4;
-            data[dst_off] = img_data[src_off];
-            data[dst_off + 1] = img_data[src_off + 1];
-            data[dst_off + 2] = img_data[src_off + 2];
-            data[dst_off + 3] = 255;
+            if one_to_one {
+                // Canvas column `bx` is `origin_x + (bx - vp_buffer_x)`.
+                let shift = vp_buffer_x - i64::from(origin_x);
+                let first = i64::from(x0).max(shift);
+                let last = i64::from(x1).min(shift + i64::from(pw));
+                if last <= first {
+                    continue;
+                }
+                let src_start = src_row + (first - shift) as usize * 4;
+                let len = (last - first) as usize * 4;
+                let dst_start = dst_row + first as usize * 4;
+                if src_start + len > img_data.len() || dst_start + len > data.len() {
+                    continue;
+                }
+                if preview.opaque {
+                    data[dst_start..dst_start + len]
+                        .copy_from_slice(&img_data[src_start..src_start + len]);
+                } else {
+                    // Never-captured corners of ragged (T/L/arch) canvases stay
+                    // transparent; leave the dimmed overlay visible beneath them.
+                    for offset in (0..len).step_by(4) {
+                        if img_data[src_start + offset + 3] == 0 {
+                            continue;
+                        }
+                        data[dst_start + offset..dst_start + offset + 4]
+                            .copy_from_slice(&img_data[src_start + offset..src_start + offset + 4]);
+                    }
+                }
+                continue;
+            }
+            for bx in x0..x1 {
+                let Some(src_column) = columns[bx as usize] else {
+                    continue;
+                };
+                let src_off = src_row + src_column;
+                if src_off + 3 >= img_data.len() {
+                    continue;
+                }
+                // Never-captured corners of ragged (T/L/arch) canvases stay
+                // transparent; leave the dimmed overlay visible beneath them.
+                if img_data[src_off + 3] == 0 {
+                    continue;
+                }
+                let dst_off = dst_row + bx as usize * 4;
+                data[dst_off] = img_data[src_off];
+                data[dst_off + 1] = img_data[src_off + 1];
+                data[dst_off + 2] = img_data[src_off + 2];
+                data[dst_off + 3] = 255;
+            }
         }
     }
 }
@@ -3182,6 +3250,7 @@ mod tests {
                 80,
                 &[(0, 40, [255, 255, 255, 255]), (40, 80, [0, 0, 0, 255])],
             ),
+            opaque: true,
             current_origin_x: 0,
             current_origin_y: 40,
             viewport_rect: LogicalRect { x: 10, y: 20, width: 40, height: 40 },
@@ -3204,6 +3273,56 @@ mod tests {
         assert_eq!(pixel(30, 40), [7, 7, 7, 7]);
         // Outside the stitched width nothing is drawn.
         assert_eq!(pixel(5, 10), [7, 7, 7, 7]);
+    }
+
+    /// A selection that fills the output has no visible preview area, and the
+    /// draw must leave every pixel alone. It used to walk all of them: at 4K
+    /// that was 3.2 ms to paint nothing.
+    #[test]
+    fn a_full_width_hole_draws_nothing_at_all() {
+        let preview = LongPreviewSnapshot {
+            image: solid_image(100, 100, &[(0, 100, [1, 2, 3, 255])]),
+            opaque: true,
+            current_origin_x: 0,
+            current_origin_y: 0,
+            viewport_rect: LogicalRect { x: 0, y: 0, width: 100, height: 100 },
+            capture_width: 100,
+            capture_height: 100,
+        };
+        let output = LogicalRect { x: 0, y: 0, width: 100, height: 100 };
+        let hole = Some(LogicalRect { x: 0, y: 0, width: 100, height: 100 });
+        let mut data = vec![9u8; 100 * 100 * 4];
+        draw_preview_on_overlay(&mut data, 100, 100, &preview, output, hole);
+        assert!(data.iter().all(|&byte| byte == 9), "a full-width hole must draw nothing");
+    }
+
+    /// A hole that only covers the middle of a row splits it into two runs;
+    /// both sides must be drawn and the hole left untouched.
+    #[test]
+    fn a_hole_splits_a_row_into_two_drawn_runs() {
+        let preview = LongPreviewSnapshot {
+            image: solid_image(100, 100, &[(0, 100, [10, 20, 30, 255])]),
+            opaque: true,
+            current_origin_x: 0,
+            current_origin_y: 0,
+            viewport_rect: LogicalRect { x: 0, y: 0, width: 100, height: 100 },
+            capture_width: 100,
+            capture_height: 100,
+        };
+        let output = LogicalRect { x: 0, y: 0, width: 100, height: 100 };
+        let hole = Some(LogicalRect { x: 40, y: 0, width: 20, height: 100 });
+        let mut data = vec![0u8; 100 * 100 * 4];
+        draw_preview_on_overlay(&mut data, 100, 100, &preview, output, hole);
+        let pixel = |x: usize, y: usize| -> [u8; 4] {
+            let offset = (y * 100 + x) * 4;
+            [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]
+        };
+        assert_eq!(pixel(0, 0), [10, 20, 30, 255], "left of the hole");
+        assert_eq!(pixel(39, 99), [10, 20, 30, 255], "left edge, last row");
+        assert_eq!(pixel(40, 0), [0, 0, 0, 0], "hole untouched");
+        assert_eq!(pixel(59, 99), [0, 0, 0, 0], "hole untouched");
+        assert_eq!(pixel(60, 0), [10, 20, 30, 255], "right of the hole");
+        assert_eq!(pixel(99, 99), [10, 20, 30, 255], "right edge, last row");
     }
 
     #[test]
@@ -3296,7 +3415,8 @@ mod tests {
             image,
             current_origin_x: 0,
             current_origin_y: 0,
-            viewport_rect: LogicalRect { x: 1, y: 1, width: 2, height: 2 },
+            viewport_rect: LogicalRect { x: 1, y: 1, width: 2, height: 2 },            opaque: true,
+
             capture_width: 3,
             capture_height: 3,
         };
@@ -3336,7 +3456,8 @@ mod tests {
             image,
             current_origin_x: 0,
             current_origin_y: 0,
-            viewport_rect: LogicalRect { x: 200, y: 0, width: 4, height: 4 },
+            viewport_rect: LogicalRect { x: 200, y: 0, width: 4, height: 4 },            opaque: true,
+
             capture_width: 4,
             capture_height: 4,
         };
@@ -3351,6 +3472,7 @@ mod tests {
     fn preview_fills_a_denser_buffer_without_gaps() {
         let preview = LongPreviewSnapshot {
             image: solid_image(2, 2, &[(0, 2, [255, 255, 255, 255])]),
+            opaque: true,
             current_origin_x: 0,
             current_origin_y: 0,
             viewport_rect: LogicalRect { x: 0, y: 0, width: 2, height: 2 },
@@ -3385,6 +3507,7 @@ mod tests {
                 2,
                 &[(0, 1, [255, 255, 255, 255]), (1, 2, [255, 255, 255, 0])],
             ),
+            opaque: false,
             current_origin_x: 0,
             current_origin_y: 0,
             viewport_rect: LogicalRect { x: 0, y: 0, width: 2, height: 2 },
@@ -3553,6 +3676,7 @@ mod tests {
             draw_live_base(&mut pixels, 100, 100, hole);
             let preview = LongPreviewSnapshot {
                 image: solid_image(100, 100, &[(0, 100, [255, 255, 255, 255])]),
+            opaque: true,
                 current_origin_x: 0,
                 current_origin_y: 0,
                 viewport_rect: output.logical,
@@ -3591,6 +3715,7 @@ mod tests {
             let preview_color = [40, 80, 120, 255];
             let preview = LongPreviewSnapshot {
                 image: solid_image(100, 100, &[(0, 100, preview_color)]),
+            opaque: true,
                 current_origin_x: 0,
                 current_origin_y: 0,
                 viewport_rect: output,

@@ -401,7 +401,7 @@ fn run_long_capture(
                             live_rect,
                         );
                         let recycled = std::mem::take(&mut preview_buffer);
-                        if let Ok(image) = crate::stitch::image_from_stitched_window_reusing(
+                        if let Ok(rendered) = crate::stitch::image_from_stitched_window_reusing(
                             s,
                             window,
                             recycled,
@@ -422,7 +422,11 @@ fn run_long_capture(
                                 current_frame.height,
                             );
                             let snapshot = crate::wayland::selection::LongPreviewSnapshot {
-                                image,
+                                image: rendered.image,
+                                // Exact, from the conversion: the overlay uses
+                                // it to memcpy the preview instead of testing
+                                // every pixel's alpha.
+                                opaque: rendered.opaque,
                                 current_origin_x: s.current_origin_x - window.x,
                                 current_origin_y: s.current_origin_y - window.y,
                                 viewport_rect: preview_viewport,
