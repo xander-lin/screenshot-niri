@@ -1123,6 +1123,13 @@ impl SelectionSession {
 
     pub fn dispatch_poll(&mut self, timeout_ms: i32) -> Result<(), Box<dyn Error>> {
         if self.event_queue.dispatch_pending(&mut self.state)? > 0 {
+            // The events just dispatched can have asked for a redraw (a pointer
+            // drag, a key). Long capture drives this session with `dispatch_poll`
+            // and never runs `run_selection`, so this is the only place that can
+            // honour the request: without it an edit-mode drag updated the box
+            // in state and never on screen, and the border only caught up when
+            // the next captured frame rendered the overlay for another reason.
+            flush_render_request(&mut self.state);
             return Ok(());
         }
         self.event_queue.flush()?;
@@ -1152,6 +1159,7 @@ impl SelectionSession {
         }
         guard.read()?;
         self.event_queue.dispatch_pending(&mut self.state)?;
+        flush_render_request(&mut self.state);
         Ok(())
     }
 
