@@ -763,6 +763,12 @@ impl RgbSource for CanvasRegion<'_> {
             .pixel(self.x + x, (self.y + y) as i32)
             .unwrap_or([0, 0, 0])
     }
+
+    fn row_rgb_sampled_into(&self, x: u32, y: u32, step: u32, out: &mut [u8]) {
+        self.canvas
+            .store
+            .sampled_row_into(self.x + x, (self.y + y) as i32, step, out);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2945,6 +2951,23 @@ mod tests {
             height,
             stride,
             data: page.data[start..start + len].to_vec(),
+        }
+    }
+
+    /// The duplicate check reads the previous viewport through `CanvasRegion`.
+    /// Its sampled row accessor must agree with the per-pixel one, including
+    /// the black that a column past the captured width reports.
+    #[test]
+    fn sampled_canvas_rows_match_the_per_pixel_accessor() {
+        let canvas = StitchedFrame::from_first_frame(&frame_from(0, 8));
+        // Deliberately wider than the canvas: the tail columns are outside it.
+        let region = CanvasRegion::new(&canvas, W - 5, 0, 9, 8);
+        let mut row = vec![0u8; 9usize.div_ceil(4) * 3];
+        for y in (0..region.height()).step_by(4) {
+            region.row_rgb_sampled_into(0, y, 4, &mut row);
+            for (index, pixel) in row.as_chunks::<3>().0.iter().enumerate() {
+                assert_eq!(*pixel, region.pixel_rgb(index as u32 * 4, y), "({},{y})", index * 4);
+            }
         }
     }
 }

@@ -495,6 +495,29 @@ impl CanvasStore {
         self.with_row(y, |row| [row[offset], row[offset + 1], row[offset + 2]])
     }
 
+    /// Reads every `step`-th pixel of row `y` from column `x` into `out`.
+    ///
+    /// The duplicate and contrast checks sample a grid, and going through
+    /// [`pixel`] paid a tile lookup, a working-set touch and a `RefCell` borrow
+    /// per sample. One `with_row` per row pays them once. A column outside the
+    /// canvas reads as black, which is what `pixel` reports for it.
+    pub(super) fn sampled_row_into(&self, x: u32, y: i32, step: u32, out: &mut [u8]) {
+        let filled = self.with_row(y, |row| {
+            for (index, pixel) in out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let offset = (x as usize + index * step as usize) * 3;
+                match row.get(offset..offset + 3) {
+                    Some(bytes) => pixel.copy_from_slice(bytes),
+                    None => pixel.copy_from_slice(&[0, 0, 0]),
+                }
+            }
+        });
+        if filled.is_none() {
+            for pixel in out.as_chunks_mut::<3>().0.iter_mut() {
+                pixel.copy_from_slice(&[0, 0, 0]);
+            }
+        }
+    }
+
     /// Copies `[x, x + width)` of row `y` into `dst[..len]`.
     pub(super) fn row_into(&self, x: u32, y: i32, dst: &mut [u8]) -> bool {
         let offset = x as usize * 3;

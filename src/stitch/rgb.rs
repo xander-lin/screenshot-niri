@@ -46,6 +46,20 @@ pub trait RgbSource {
             destination.copy_from_slice(&pixel);
         }
     }
+
+    /// Reads every `step`-th pixel of row `y`, starting at column `x`, into
+    /// `out` (3 bytes per sample).
+    ///
+    /// The near-duplicate and contrast checks sample a grid — every fourth
+    /// pixel of every fourth row. Through `pixel_rgb` each sample costs a
+    /// virtual call and, on the canvas, a tile lookup plus a working-set touch:
+    /// at 4K that bookkeeping was 2.3 ms of a frame's 18.7 ms. A source that
+    /// can read a row at once overrides this and pays it once per row instead.
+    fn row_rgb_sampled_into(&self, x: u32, y: u32, step: u32, out: &mut [u8]) {
+        for (index, pixel) in out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+            *pixel = self.pixel_rgb(x + index as u32 * step, y);
+        }
+    }
 }
 
 pub(super) struct CroppedRgbSource<'a, S> {
@@ -102,6 +116,18 @@ impl RgbSource for RgbFrame {
             self.data[offset + 2],
         ]
     }
+
+    fn row_rgb_sampled_into(&self, x: u32, y: u32, step: u32, out: &mut [u8]) {
+        let start = y as usize * self.stride as usize + x as usize * 3;
+        let row = self.data.get(start..).unwrap_or(&[]);
+        for (index, pixel) in out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+            let offset = index * step as usize * 3;
+            match row.get(offset..offset + 3) {
+                Some(bytes) => pixel.copy_from_slice(bytes),
+                None => pixel.copy_from_slice(&[0, 0, 0]),
+            }
+        }
+    }
 }
 
 impl RgbSource for ImageRgbView<'_> {
@@ -144,6 +170,25 @@ impl RgbSource for ImageRgbView<'_> {
             self.image.data[offset],
         ]
     }
+
+    fn row_rgb_sampled_into(&self, x: u32, y: u32, step: u32, out: &mut [u8]) {
+        let row = self.crop.y + y;
+        let start = row as usize * self.image.stride as usize
+            + (self.crop.x + x) as usize * 4;
+        let row = self.image.data.get(start..).unwrap_or(&[]);
+        for (index, pixel) in out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+            let offset = index * step as usize * 4;
+            match row.get(offset..offset + 4) {
+                // ARGB8888 in memory is B, G, R, X; the packed form is R, G, B.
+                Some(bytes) => {
+                    pixel[0] = bytes[2];
+                    pixel[1] = bytes[1];
+                    pixel[2] = bytes[0];
+                }
+                None => pixel.copy_from_slice(&[0, 0, 0]),
+            }
+        }
+    }
 }
 
 impl<'a, S> CroppedRgbSource<'a, S>
@@ -175,6 +220,11 @@ where
     fn row_rgb_into(&self, x: u32, y: u32, count: u32, out: &mut [u8]) {
         self.source
             .row_rgb_into(self.crop.x + x, self.crop.y + y, count, out)
+    }
+
+    fn row_rgb_sampled_into(&self, x: u32, y: u32, step: u32, out: &mut [u8]) {
+        self.source
+            .row_rgb_sampled_into(self.crop.x + x, self.crop.y + y, step, out)
     }
 }
 
@@ -230,9 +280,25 @@ pub(super) fn average_difference_same_source(a: &impl RgbSource, b: &impl RgbSou
     let height = a.height().min(b.height());
     let mut total = 0u64;
     let mut samples = 0u64;
-    for y in (0..height).step_by(4) {
-        for x in (0..width).step_by(4) {
-            total += pixel_difference_source(a, x, y, b, x, y) as u64;
+    // Every fourth pixel of every fourth row, read a row at a time: on the
+    // canvas each `pixel_rgb` was a tile lookup and a working-set touch, and at
+    // 4K that bookkeeping was 2.3 ms of an 18.7 ms frame.
+    const STEP: u32 = 4;
+    let per_row = width.div_ceil(STEP) as usize;
+    let mut a_row = vec![0u8; per_row * 3];
+    let mut b_row = vec![0u8; per_row * 3];
+    for y in (0..height).step_by(STEP as usize) {
+        a.row_rgb_sampled_into(0, y, STEP, &mut a_row);
+        b.row_rgb_sampled_into(0, y, STEP, &mut b_row);
+        for (pa, pb) in a_row
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(b_row.as_chunks::<3>().0.iter())
+        {
+            total += (i32::from(pa[0]) - i32::from(pb[0])).unsigned_abs() as u64
+                + (i32::from(pa[1]) - i32::from(pb[1])).unsigned_abs() as u64
+                + (i32::from(pa[2]) - i32::from(pb[2])).unsigned_abs() as u64;
             samples += 1;
         }
     }
@@ -250,9 +316,12 @@ pub(super) fn average_difference_same_source(a: &impl RgbSource, b: &impl RgbSou
 pub(super) fn luminance_range_source(source: &impl RgbSource) -> f64 {
     let mut lo = 255u32;
     let mut hi = 0u32;
-    for y in (0..source.height()).step_by(4) {
-        for x in (0..source.width()).step_by(4) {
-            let [r, g, b] = source.pixel_rgb(x, y);
+    const STEP: u32 = 4;
+    let per_row = source.width().div_ceil(STEP) as usize;
+    let mut row = vec![0u8; per_row * 3];
+    for y in (0..source.height()).step_by(STEP as usize) {
+        source.row_rgb_sampled_into(0, y, STEP, &mut row);
+        for [r, g, b] in row.as_chunks::<3>().0.iter().copied() {
             let l = (77 * u32::from(r) + 150 * u32::from(g) + 29 * u32::from(b)) >> 8;
             lo = lo.min(l);
             hi = hi.max(l);
@@ -461,4 +530,51 @@ pub(super) fn crop_rgb_frame(
         stride,
         data,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The duplicate and contrast checks read their samples a row at a time.
+    /// That is an access-path change only if it returns exactly what the
+    /// per-pixel accessor returns.
+    #[test]
+    fn sampled_rows_match_the_per_pixel_accessor() {
+        let frame = RgbFrame {
+            width: 9,
+            height: 5,
+            stride: 27,
+            data: (0..9 * 5 * 3).map(|value| (value * 7 % 251) as u8).collect(),
+        };
+        let mut row = vec![0u8; 9usize.div_ceil(4) * 3];
+        for y in (0..frame.height).step_by(4) {
+            frame.row_rgb_sampled_into(0, y, 4, &mut row);
+            for (index, pixel) in row.as_chunks::<3>().0.iter().enumerate() {
+                assert_eq!(*pixel, frame.pixel_rgb(index as u32 * 4, y), "({},{y})", index * 4);
+            }
+        }
+
+        // The compose frame is sampled through its RGBA view (BGRA in memory),
+        // including a crop that does not start on a sample boundary.
+        let image = Image {
+            width: 12,
+            height: 6,
+            stride: 48,
+            format: Format::Argb8888,
+            data: (0..12 * 6 * 4).map(|value| (value * 11 % 253) as u8).collect(),
+        };
+        let view = ImageRgbView::with_crop(
+            &image,
+            ComposeCrop { x: 3, y: 1, width: 8, height: 4 },
+        )
+        .unwrap();
+        let mut row = vec![0u8; 8usize.div_ceil(4) * 3];
+        for y in (0..view.height()).step_by(4) {
+            view.row_rgb_sampled_into(0, y, 4, &mut row);
+            for (index, pixel) in row.as_chunks::<3>().0.iter().enumerate() {
+                assert_eq!(*pixel, view.pixel_rgb(index as u32 * 4, y), "({},{y})", index * 4);
+            }
+        }
+    }
 }

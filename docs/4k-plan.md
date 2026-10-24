@@ -155,26 +155,34 @@ on a thread that is not the bottleneck. Left out deliberately.
 4x, so the per-frame saving is ~19 ms: the capture thread stops allocating a
 gigabyte per second of fresh pages at 30 fps.
 
-### 4. Read canvas rows, not pixels, for the two checks — 3.9 ms → ~2.0 ms
+### 4. Read canvas rows, not pixels, for the two checks — 3.9 ms → ~1.1 ms
 
-**Problem.** The near-duplicate check (`CanvasRegion` → `CanvasStore::pixel`)
-and the colour verification sample every 4th pixel through `store.pixel`, which
-does a tile lookup, a working-set touch and a bounds check per sample. At 4K
-that is 6.83% + 5.25% + 2.60% of the frame.
+**Problem.** The near-duplicate check and the contrast check sample every 4th
+pixel of every 4th row. Through `RgbSource::pixel_rgb` each sample paid a
+virtual call and, on the canvas, `CanvasStore::pixel`'s tile lookup,
+working-set touch and `RefCell` borrow: `pixel` 1.28 + `touch_tile` 1.02 + the
+two loops 1.64 = 3.9 ms of a 4K frame.
 
-**Approach.** Add a strided row accessor to `RgbSource`
-(`row_rgb_into` already exists) and sample by row: for the every-4th-row grid,
-read the row's sampled columns from one `with_row` call. Keep the same sample
-set (every 4th pixel of every 4th row) so the decisions do not change. Apply to
-`average_difference_same_source` and `luminance_range_source` (and
-`pixel_difference_source` if it is the shared path).
+**Approach (as built).** `RgbSource::row_rgb_sampled_into(x, y, step, out)`
+reads the samples of one row in one pass. The default stays per-pixel (mocks,
+the legacy wrapper); `RgbFrame` and `ImageRgbView` gather with a stride from the
+row slice; `CroppedRgbSource` forwards with the crop offset; `CanvasRegion`
+calls the new `CanvasStore::sampled_row_into`, which pays one `with_row` per
+sampled row instead of one per sample, and reports black for a column outside
+the capture exactly as `pixel` does. The sample set is unchanged, so every
+decision is unchanged.
 
-**Files.** `src/stitch/rgb.rs` (`CanvasRegion` sampling), `src/stitch/store.rs`
-(a `with_row`-based sampled accessor if needed), `src/stitch/engine.rs`.
+**Files.** `src/stitch/rgb.rs` (trait method, `RgbFrame`, `ImageRgbView`,
+`CroppedRgbSource`, the two checks), `src/stitch/store.rs`
+(`sampled_row_into`), `src/stitch/engine.rs` (`CanvasRegion`).
 
-**Acceptance.** All corpora unchanged (204/97/7/3/7/7/78 accepted, 0 misplaced,
-0 uncovered) — this is a pure access-path change and any decision change is a
-bug. Perf: `CanvasStore::pixel`/`touch_tile` no longer in the top 10 at 4K.
+**Measured.** 4K push 18.76 → **15.97 ms** (median of 3); 1080p push
+4.94 → **4.17 ms**. Preview unchanged. UI thread at 4K (push + preview)
+24.64 → **21.85 ms**.
+
+**Acceptance.** All seven corpora unchanged (the sampled values are identical,
+so any decision change is a bug); two tests compare the row accessor against
+`pixel_rgb` for `RgbFrame`, `ImageRgbView` and `CanvasRegion`.
 
 ### 5. Build the RGB frame and the boundary descriptor in one pass — 10.0 ms → ~7.0 ms
 
@@ -250,6 +258,6 @@ grows by ~2 ms; net ~4 ms.
 | 1 overlay preview draw | **done** | full-screen hole 3.22 → **0.01 ms**; 24.6 MB history 10.04 → **2.1 ms**; 80% box 5.06 → **0.28 ms**; side column ~1.95 ms. UI thread at 4K: 29.4–36.2 → **26.2–28.3 ms**. 1080p unchanged (push 4.93, preview 1.36). Corpora unchanged. |
 | 2 overlay base copy | **done** | the 33 MB cache is gone (uniform base): steady-state restore **0.00 ms**, old copy 2.08–2.27 ms; moved footprint 0.74–1.03 ms; mask rebuild 1.18–1.27 ms (was 1.6). UI thread at 4K 26.2–28.3 → **24.0–26.1 ms**. 1080p bench unchanged. Corpora unchanged. clippy 41 (one fewer than baseline). |
 | 3 capture buffer reuse | **done** | real screencopy 1080p p50 6.82–6.91 → **1.87–1.93 ms** (p95 8.1 → 3.2); at 4K the page cost is 4x. `to_vec` recycling skipped: a fresh 33 MB Vec is 1.42 ms and needs a return channel. Corpora unchanged. clippy 41. |
-| 4 canvas row sampling | not started | |
+| 4 canvas row sampling | **done** | 4K push 18.76 → **15.97 ms** (median of 3), 1080p 4.94 → **4.17**; preview unchanged. Corpora unchanged. Two equivalence tests. clippy 41. |
 | 5 fused conversion + descriptor | not started | |
 | 6 preview direct from canvas | not started | |
