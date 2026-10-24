@@ -1,6 +1,6 @@
 [package]
 name = "screenshot-rs-rebuild"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 # Arch ships a rolling toolchain and releases are prebuilt binaries, so there is
 # no reason to hold back on the standard library. 1.88 is what `as_chunks` needs;
