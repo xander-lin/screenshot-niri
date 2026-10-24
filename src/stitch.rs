@@ -59,8 +59,8 @@ use engine::{
     WindowedEdgeMatcher,
 };
 use rgb::{
-    average_difference_same_source, average_luminance_difference_source, crop_rgb_frame,
-    luminance_range_source,
+    average_luminance_difference_source, crop_rgb_frame,
+    sampled_difference_and_luminance_range,
     pixel_difference_source, pixel_offset, rgb_frame_from_source,
     rgb_frame_from_source_reusing, rgb_frame_from_source_reusing_with, validate_rgb_frame,
     validate_rgb_source, CroppedRgbSource,
@@ -812,7 +812,12 @@ impl RawStitcher {
             previous_rect.height,
         );
         let duplicate_started_at = profile_enabled.then(Instant::now);
-        let duplicate_difference = average_difference_same_source(&previous, &active_compose);
+        // One pass answers both questions: the difference the near-duplicate
+        // gate tests, and the frame's own luminance range that sets its
+        // threshold. They read the same samples, so two passes read the frame
+        // twice for nothing.
+        let (duplicate_difference, duplicate_luminance_range) =
+            sampled_difference_and_luminance_range(&previous, &active_compose);
         if let Some(started_at) = duplicate_started_at {
             self.last_profile_breakdown.duplicate_check += started_at.elapsed();
         }
@@ -821,8 +826,8 @@ impl RawStitcher {
         // a two-gray page (delta 2) as a duplicate — every moving frame is
         // dropped and the canvas never grows. Cap the threshold at the old
         // absolute value so normal-contrast content behaves exactly as before.
-        let duplicate_threshold = (0.1 * luminance_range_source(&active_compose))
-            .clamp(0.25, self.duplicate_threshold);
+        let duplicate_threshold =
+            (0.1 * duplicate_luminance_range).clamp(0.25, self.duplicate_threshold);
         if duplicate_difference <= duplicate_threshold {
             self.last_duplicate_difference = Some(duplicate_difference);
             if crate::trace::trace_deep_profile_enabled() {

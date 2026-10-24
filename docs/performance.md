@@ -78,23 +78,24 @@ which caller is responsible. Symbols require the debug-info build — a plain
 | UI thread per frame | 15.3 ms (46%) | 6.2–7.4 ms (19–22%) |
 | steady-state allocation | 28.1 MB / frame | 0.9 MB / frame (40 px step; see below) |
 
-Resolution scaling after the pass (synthetic, steady state):
+Resolution scaling after the passes (synthetic, steady state; push p50 plus
+preview, plus the caller's conversion):
 
 | frame | UI thread per frame | share of a 30 fps budget |
 |---|---|---|
-| 960x700 | 2.0 ms | 6% |
-| 1280x900 | 3.5 ms | 10% |
-| 1920x1080 | 6.2 ms | 19% |
-| 2560x1440 | 11.2 ms | 34% |
+| 1280x900 | 3.08 ms | 9% |
+| 1920x1080 | 3.77 ms | 11% |
+| 2560x1440 | 6.62 ms | 20% |
+| 3840x2160 | 14.47 ms | 43% |
 
 Real corpora:
 
 | corpus | push mean | UI thread per frame |
 |---|---|---|
-| `real-1` | 0.38 ms | 0.49 ms (1%) |
-| `real-long` | 3.10 ms | 3.60 ms (11%) |
-| `real-scroll` | 3.59 ms | 4.08 ms (12%) |
-| `lowcontrast-2b` | 0.37 ms | 0.48 ms (1%) |
+| `real-1` | 0.28 ms | 0.36 ms (1%) |
+| `real-long` | 2.51 ms | 2.95 ms (9%) |
+| `real-scroll` | 3.23 ms | 3.72 ms (11%) |
+| `lowcontrast-2b` | 0.26 ms | 0.34 ms (1%) |
 
 ## What was wrong, and why
 
@@ -171,18 +172,67 @@ Steady-state allocation is 0.9 MB per frame at a 40 px step, all small. It is
 higher at faster scrolls (see the step table above) because the canvas grows
 faster; that part is retained content, not churn.
 
+## 2026-10-24, second pass: the descriptor inner loop
+
+The first pass left `EdgeLadder::from_source_on` (descriptor building) as the
+largest item, at 23%. Profiling the same 1080p synthetic page again showed where
+it actually goes: the descriptor is accumulated *inside* the frame conversion
+(`BinLayout::means_into` called from the `rgb_frame_from_source_reusing_with`
+row hook), and that inner loop was 30% of the frame on its own.
+
+Two changes:
+
+* **`BinLayout::means_into` reads slices, not indices.** It walked each bin with
+  `a in a0..a1` and recomputed `a * 3` plus two bounds checks per pixel. A
+  slice per bin with `as_chunks::<3>()` removes both; the sum is integer and
+  order-free, so the means are bit-identical. Alone: 1080p push p50
+  3.61 → 3.16 ms.
+* **The near-duplicate check and the duplicate threshold share one pass.**
+  `average_difference_same_source` (every 4th pixel of every 4th row, against
+  the canvas) and `luminance_range_source` (the same samples, for the
+  relative threshold) walked the frame separately. Both are now
+  `sampled_difference_and_luminance_range`, with identical answers. Alone:
+  3.65 → 3.61 ms (the pass was 3% of the frame; the fused loop costs slightly
+  more than the difference alone, so the net is 1%).
+
+`push`, median of three runs, synthetic scrolling page:
+
+| frame | before | after | change |
+|---|---|---|---|
+| 1280x900 | 2.11 ms | 1.84 ms | −13% |
+| 1920x1080 | 3.65 ms | 3.17 ms | −13% |
+| 2560x1440 | 6.19 ms | 5.48 ms | −11% |
+| 3840x2160 | 13.50 ms | 11.82 ms | −12% |
+
+`preview` (1920x1080) 0.60 → 0.57 ms; UI thread per frame 4.32 → 3.77 ms (11%
+of a 30 fps budget). Real corpora `push mean`: `real-1` 0.31 → 0.28 ms,
+`real-long` 2.66 → 2.51 ms, `real-scroll` 3.35 → 3.23 ms, `lowcontrast-2b`
+0.31 → 0.26 ms.
+
+Correctness: `real-1`'s stitched canvas is **byte-identical** before and after
+(same PNG sha256 — the descriptor arithmetic is unchanged, only its shape), all
+nine corpora replay to the same counts, and all four feature combinations plus
+clippy are unchanged.
+
+After this pass the conversion is memory-bound: `row_rgb_into` moves 14.5 MB per
+1080p frame at ~34 GB/s and the preview's `expand_row` moves 14 MB at ~42 GB/s.
+The remaining CPU is the descriptor's arithmetic (~26% of a frame), which is
+already vectorised at roughly 1.3 cycles per pixel; the rest of the profile is
+canvas reads, page zeroing for the growing canvas, and the colour check.
+
 ## What remains
 
-* **`EdgeLadder::from_source_on` — 23%.** Reading every pixel of the frame once
-  to build 48 bins. This is close to the memory bandwidth floor for touching
-  2 Mpx; further gains would need to skip pixels, which changes what the
-  descriptor means and therefore what the gates mean. Not attempted.
-* **`rgb_frame_from_source` — 14%.** One pass over the frame with a channel
-  swap. The floor is a memcpy of the same volume (0.10 ms against 0.85 ms); the
-  remaining gap is the 4→3 byte stride, not the swap.
-* **`CanvasStore::pixel` / `touch_tile` — 12%.** Canvas reads. `pixel` is
-  per-pixel and `touch_tile` unpacks cold tiles; both are on the canvas read
-  path, which the engine's colour verification uses.
+* **The descriptor's arithmetic — 26%.** `BinLayout::means_into` fused into the
+  conversion row loop. At ~1.3 cycles per pixel it is already vectorised; the
+  only further lever is touching fewer pixels, which changes what the descriptor
+  means and therefore what the gates mean. Not attempted.
+* **`row_rgb_into` — 14%.** BGRA→RGB, 14.5 MB per 1080p frame at ~34 GB/s. The
+  floor is that memcpy; the remaining cost is the 4→3 byte stride.
+* **Preview `expand_row` — 11%.** RGB→BGRA for the overlay window, ~14 MB at
+  ~42 GB/s. Memory-bound already.
+* **`CanvasStore::pixel` / `touch_tile` — canvas reads.** `pixel` is per-pixel
+  and `touch_tile` unpacks cold tiles; both are on the canvas read path, which
+  the engine's colour verification and the duplicate check use.
 * **4K at 30 fps is not reachable.** The scaling is linear in frame area
   (~5.9 ns/px before this pass), so 3840x2160 lands at roughly 4x the 1080p
   cost. If 4K is a target, the right lever is the frame-rate cap scaled by frame

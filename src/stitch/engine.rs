@@ -195,26 +195,32 @@ impl BinLayout {
     /// values. This is the single definition of the descriptor's evidence: the
     /// two-pass builder and the fused conversion both call it.
     pub(super) fn means_into(&self, line: &[u8], out: &mut [f32]) {
-        for b in 0..self.bins {
-            let a0 = self.body_start + b * self.bin_width;
-            let a1 = if b + 1 == self.bins {
-                self.body_end
+        // Slice-per-bin with `as_chunks::<3>`: the index form recomputed
+        // `a * 3` and re-checked bounds for every pixel, and this loop is the
+        // largest single cost of a push (descriptor building is ~30% of it, and
+        // this is the descriptor's inner loop). The sum is integer and
+        // order-free, so the result is bit-identical to the old shape.
+        let bins = self.bins as usize;
+        let mut start = self.body_start as usize * 3;
+        for (index, slot) in out.iter_mut().take(bins).enumerate() {
+            let end = if index + 1 == bins {
+                self.body_end as usize * 3
             } else {
-                a0 + self.bin_width
+                start + self.bin_width as usize * 3
             };
             let mut sum = 0u32;
-            for a in a0..a1 {
-                let pixel = a as usize * 3;
-                sum += 77 * u32::from(line[pixel])
-                    + 150 * u32::from(line[pixel + 1])
-                    + 29 * u32::from(line[pixel + 2]);
+            for pixel in line[start..end].as_chunks::<3>().0 {
+                sum += 77 * u32::from(pixel[0])
+                    + 150 * u32::from(pixel[1])
+                    + 29 * u32::from(pixel[2]);
             }
-            let count = a1 - a0;
-            out[b as usize] = if count == 0 {
+            let count = (end - start) / 3;
+            *slot = if count == 0 {
                 0.0
             } else {
                 (sum >> 8) as f32 / count as f32
             };
+            start = end;
         }
     }
 }

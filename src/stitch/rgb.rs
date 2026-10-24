@@ -313,25 +313,53 @@ pub(super) fn average_difference_same_source(a: &impl RgbSource, b: &impl RgbSou
 /// uses it to judge "identical" relative to how much contrast the content
 /// actually has: an absolute threshold treats real motion on low-contrast
 /// content as a duplicate frame and silently drops the capture.
-pub(super) fn luminance_range_source(source: &impl RgbSource) -> f64 {
+/// The near-duplicate difference and the duplicate threshold's input, from one
+/// pass over the frame.
+///
+/// Both need exactly the same samples — every fourth pixel of every fourth row
+/// of `b` — so reading `b` twice (`average_difference_same_source` then
+/// `luminance_range_source`) cost a redundant sampled pass: measured 3% of a
+/// 1080p push. The answers are identical to the separate functions.
+pub(super) fn sampled_difference_and_luminance_range(
+    a: &impl RgbSource,
+    b: &impl RgbSource,
+) -> (f64, f64) {
+    let width = a.width().min(b.width());
+    let height = a.height().min(b.height());
+    let mut total = 0u64;
+    let mut samples = 0u64;
     let mut lo = 255u32;
     let mut hi = 0u32;
     const STEP: u32 = 4;
-    let per_row = source.width().div_ceil(STEP) as usize;
-    let mut row = vec![0u8; per_row * 3];
-    for y in (0..source.height()).step_by(STEP as usize) {
-        source.row_rgb_sampled_into(0, y, STEP, &mut row);
-        for [r, g, b] in row.as_chunks::<3>().0.iter().copied() {
-            let l = (77 * u32::from(r) + 150 * u32::from(g) + 29 * u32::from(b)) >> 8;
+    let per_row = width.div_ceil(STEP) as usize;
+    let mut a_row = vec![0u8; per_row * 3];
+    let mut b_row = vec![0u8; per_row * 3];
+    for y in (0..height).step_by(STEP as usize) {
+        a.row_rgb_sampled_into(0, y, STEP, &mut a_row);
+        b.row_rgb_sampled_into(0, y, STEP, &mut b_row);
+        for (pa, pb) in a_row
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(b_row.as_chunks::<3>().0.iter())
+        {
+            total += (i32::from(pa[0]) - i32::from(pb[0])).unsigned_abs() as u64
+                + (i32::from(pa[1]) - i32::from(pb[1])).unsigned_abs() as u64
+                + (i32::from(pa[2]) - i32::from(pb[2])).unsigned_abs() as u64;
+            let l =
+                (77 * u32::from(pb[0]) + 150 * u32::from(pb[1]) + 29 * u32::from(pb[2])) >> 8;
             lo = lo.min(l);
             hi = hi.max(l);
+            samples += 1;
         }
     }
-    if hi >= lo {
-        (hi - lo) as f64
+    let difference = if samples == 0 {
+        f64::MAX
     } else {
-        0.0
-    }
+        total as f64 / samples as f64 / 3.0
+    };
+    let range = if hi >= lo { (hi - lo) as f64 } else { 0.0 };
+    (difference, range)
 }
 
 pub(super) fn average_luminance_difference_source(
