@@ -151,6 +151,13 @@ capture, the stitcher, and the corpus verification tooling.
   `screenshot-niri`. It was **not installed** on this machine: the installed
   `screenshot-niri-local 0.1.0-48` owns `/usr/bin/screenshot`, and replacing it
   would remove the full variant. Install only when the user asks for it.
+- **AUR 0.2.1-2 (2026-10-24)**: the x86_64 package lists both the v3 and
+  generic assets with their checksums, keeps `noextract`, and `prepare()`
+  extracts only the one the local CPU can run (`_has_x86_64_v3`: AVX/AVX2/
+  BMI1/2/F16C/FMA/MOVBE plus `lzcnt` or AMD's `abm`). One binary is installed.
+  Verified end to end with the published 0.2.1 assets: the v3 path packaged a
+  binary with 3 595 AVX2 instructions in `screenshot-plain`, the forced-generic
+  path 106, both reporting 0.2.1.
 - **Interactive flows**: drag selection, `1`–`9`, `0`, `H`, `Esc`, spanning
   selections and fractional-scale crispness need a live compositor pass; ask
   the user to run them.

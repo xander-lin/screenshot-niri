@@ -27,6 +27,15 @@ protocols must be available; missing capabilities are reported at runtime.
 cargo install --git https://github.com/xander-lin/screenshot-niri.git --branch plain
 ```
 
+### Prebuilt binaries
+
+The x86_64 release tarballs are built with `-C target-cpu=x86-64-v3`
+(AVX2/BMI/FMA: Intel Haswell 2013 / AMD Excavator 2015 or later). A
+`-x86_64-generic` asset is published for older CPUs; aarch64 uses the
+architecture default. The AUR package checks the local CPU while building and
+installs the v3 or generic binary automatically — exactly one binary, no
+runtime launcher and no manual choice.
+
 ### Arch Linux
 
 ```bash

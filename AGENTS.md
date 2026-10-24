@@ -140,3 +140,7 @@
 - Trace logs: `--features trace-logs` (see `src/trace.rs`).
 - Packaging: `PKGBUILD` (package `screenshot-plain`, conflicts with
   `screenshot-niri`).
+- Release binaries: x86_64 v3 with a generic fallback; the AUR PKGBUILD
+  lists both sources and extracts/installs the one the local CPU can run
+  (`avx avx2 bmi1 bmi2 f16c fma movbe` plus `lzcnt` or AMD's `abm`), so one
+  binary is installed. aarch64 uses the architecture default.
