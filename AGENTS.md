@@ -96,6 +96,6 @@ Concise boundaries for each module: what it owns, what it must not do, and how i
 ## Commands
 
 - Build: `cargo build --release` (binary `target/release/screenshot`; Rust 1.88+, enforced by `rust-version` in `Cargo.toml`).
-- Test: `cargo test` (260 tests, one target: `main.rs` links the library instead of re-declaring the modules, so the `#[cfg(test)]` blocks no longer run twice; `[profile.test] opt-level = 2` takes the suite from ~24 s to ~1.3 s). Corpus verification: `verify-corpora` runs every corpus against the baselines in `src/bin/verify-corpora.rs` (non-zero exit on any mismatch); `replay-frames` / `truth-frames` cache their standard answers in `testdata/frames/*/.truth-*.cache` (content-keyed; `--refresh` recomputes).
+- Test: `cargo test` (261 tests, one target: `main.rs` links the library instead of re-declaring the modules, so the `#[cfg(test)]` blocks no longer run twice; `[profile.test] opt-level = 2` takes the suite from ~24 s to ~1.3 s). Corpus verification: `verify-corpora` runs every corpus against the baselines in `src/bin/verify-corpora.rs` (non-zero exit on any mismatch); `replay-frames` / `truth-frames` cache their standard answers in `testdata/frames/*/.truth-*.cache` (content-keyed; `--refresh` recomputes).
 - Trace logs: `--features trace-logs` (see `src/trace.rs` env gates).
 - Packaging: `PKGBUILD` (package `screenshot-niri`, conflicts with `screenshot-plain`).
