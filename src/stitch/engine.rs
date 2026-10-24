@@ -1041,6 +1041,17 @@ impl RgbSource for CanvasRegion<'_> {
             .unwrap_or([0, 0, 0])
     }
 
+    /// One tile read per row instead of one per sample.
+    ///
+    /// The default samples through `pixel_rgb`, which pays a borrow and a
+    /// working-set lookup for every fourth pixel; the geometry-overlap score
+    /// and the descriptor reseed both sample this view over whole frames.
+    fn row_rgb_sampled_into(&self, x: u32, y: u32, step: u32, out: &mut [u8]) {
+        self.canvas
+            .store
+            .sampled_row_into(self.x + x, (self.y + y) as i32, step, out);
+    }
+
     fn row_rgb_into(&self, x: u32, y: u32, count: u32, out: &mut [u8]) {
         let pixels = (count as usize).min(out.len() / 3);
         let len = pixels * 3;
@@ -1050,11 +1061,6 @@ impl RgbSource for CanvasRegion<'_> {
         }
     }
 
-    fn row_rgb_sampled_into(&self, x: u32, y: u32, step: u32, out: &mut [u8]) {
-        self.canvas
-            .store
-            .sampled_row_into(self.x + x, (self.y + y) as i32, step, out);
-    }
 }
 
 // ---------------------------------------------------------------------------

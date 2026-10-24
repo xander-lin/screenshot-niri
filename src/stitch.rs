@@ -26,7 +26,7 @@ mod types;
 
 use canvas::{
     append_frame_at_position, append_frame_at_position_overwriting_overlap_rows,
-    canvas_overlap_rect, extract_stitched_region, translate_viewport_rect,
+    canvas_overlap_rect, translate_viewport_rect,
     viewport_rect_covered_by_stitched,
 };
 #[cfg(test)]
@@ -60,7 +60,7 @@ use engine::{
     WindowedEdgeMatcher,
 };
 use rgb::{
-    average_luminance_difference_source, crop_rgb_frame,
+    average_luminance_difference_source,
     sampled_difference_and_luminance_range,
     pixel_difference_source, pixel_offset, rgb_frame_from_source,
     rgb_frame_from_source_reusing, validate_rgb_frame,
@@ -79,6 +79,8 @@ pub use hash::{
     estimate_vertical_multi_level_fuzzy_hash_motion,
     estimate_vertical_multi_level_fuzzy_hash_motion_with_stats, FuzzyHashMotionStats,
 };
+#[allow(unused_imports)]
+use rgb::average_difference_same_source;
 #[allow(unused_imports)]
 pub use rgb::{average_difference_same, rgb_frame_from_image, ImageRgbView, RgbSource};
 pub use engine::RejectReason;
@@ -623,6 +625,8 @@ impl RawStitcher {
         analysis_frame: &impl RgbSource,
         new_offset: FrameScreenOffset,
     ) -> Result<PushResult, Box<dyn Error>> {
+        self.last_profile_breakdown = StitchProfileBreakdown::default();
+        let profile_enabled = cfg!(test) || crate::trace::trace_profile_enabled();
         let recycled = std::mem::take(&mut self.spare_compose_buffer);
         let frame = rgb_frame_from_source_reusing(compose_frame, recycled)?;
         let previous_rect = self.viewport_rect.ok_or("missing viewport rect")?;
@@ -647,11 +651,12 @@ impl RawStitcher {
             Some((x0, y0, x1, y1)) => {
                 let width = x1.saturating_sub(x0);
                 let height = y1.saturating_sub(y0);
-                let canvas_region = extract_stitched_region(
-                    stitched,
-                    ViewportRect { x: x0 as i32, y: y0 as i32, width, height },
-                )?;
-                let frame_region = crop_rgb_frame(
+                // Score the overlap as views, not as two full copies: the
+                // copies were 2 x 5 MB at 4K and measured 6-8 ms of a 10 ms
+                // geometry edit, while the sampled comparison reads ~1/16 of
+                // those pixels and is bit-identical either way.
+                let canvas_region = CanvasRegion::new(stitched, x0, y0, width, height);
+                let frame_region = CroppedRgbSource::new(
                     &frame,
                     ComposeCrop {
                         x: (x0 as i32 - frame_x) as u32,
@@ -660,7 +665,10 @@ impl RawStitcher {
                         height,
                     },
                 )?;
-                (height.min(width), average_difference_same(&canvas_region, &frame_region))
+                (
+                    height.min(width),
+                    average_difference_same_source(&canvas_region, &frame_region),
+                )
             }
             None => (0, 0.0),
         };
@@ -676,7 +684,11 @@ impl RawStitcher {
         let match_info = FrameMatch { direction, overlap: overlap_len, delta_x, delta_y, score };
 
         let stitched = self.stitched.as_mut().ok_or("missing stitched frame")?;
+        let append_started_at = profile_enabled.then(Instant::now);
         let new_rect = append_frame_at_position(stitched, previous_rect, &frame, match_info)?;
+        if let Some(started_at) = append_started_at {
+            self.last_profile_breakdown.append_frame += started_at.elapsed();
+        }
         self.viewport_rect = Some(new_rect);
         let bands = FixedBands::default();
         let new_crop = bands
@@ -741,12 +753,16 @@ impl RawStitcher {
             // rebuild the descriptor from those pixels instead of starting the
             // matcher over with one frame.
             if let Some(stitched) = self.stitched.as_ref() {
+                let reseed_started_at = profile_enabled.then(Instant::now);
                 self.engine.reseed_from_canvas(
                     stitched,
                     new_rect.x,
                     new_crop.width,
                     self.canvas_origin,
                 );
+                if let Some(started_at) = reseed_started_at {
+                    self.last_profile_breakdown.canvas_match += started_at.elapsed();
+                }
             }
         }
         self.last_profile_breakdown.path = Some(StitchDecisionPath::CanvasAccepted);
@@ -2776,6 +2792,7 @@ fn line_average_difference(total: u64, pixels: u32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stitch::rgb::crop_rgb_frame;
 
     fn frame(width: u32, height: u32, seed: u8) -> RgbFrame {
         let stride = width * 3;

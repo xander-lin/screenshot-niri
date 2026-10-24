@@ -442,6 +442,28 @@ same way.
 readers byte for byte on a frame with a half-captured row and a never-captured
 row, and asserts a small window stays serial.
 
+## 2026-10-24, ninth pass: a geometry edit scored two 5 MB copies
+
+The five box edits in `real-5-4k` were the slowest frames left (10-12 ms). A
+temporary stage trace split one edit into convert / score / commit / reseed; the
+**overlap score** was the surprise: it extracted the overlap into an `RgbFrame`
+and cropped the incoming frame into another one — 2 x 5 MB at 4K — only to
+sample one pixel in sixteen of them.
+
+`average_difference_same_source` already takes any `RgbSource`, so the score now
+runs on the two views (`CanvasRegion` and `CroppedRgbSource`). The sampled
+pixels, their order and the result are identical; the copies are gone. Per edit
+the score fell from ~6 ms to **0.06-0.52 ms**, and the worst frame's allocation
+dropped from 34.6 MB to 31.3 MB.
+
+What remains per edit is genuine work, all of it once per edit and not per
+frame: a **reflow** when the new rectangle widens the canvas past its current
+width (the box moved right and the canvas grew 2131 → 2339: 8.8 ms of re-cutting
+tiles), the descriptor **commit** and the **reseed** (0.6-7.5 ms each). Left
+alone deliberately: 10 ms on a key-release action is not a frame-budget problem,
+and parallelising the reseed would need another resident-view ladder builder for
+a once-per-edit win.
+
 ## What remains
 
 * **The descriptor's arithmetic — 26% at 1080p.** Fused into the conversion row

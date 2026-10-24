@@ -350,7 +350,7 @@ fn summarize(label: &str, mut report: Report) {
     );
     // With trace-logs + SCREENSHOT_TRACE_PROFILE the stitcher fills this; the
     // tail can then be attributed instead of only measured.
-    for (ms, index, outcome, breakdown) in report.slow.iter().take(3) {
+    for (ms, index, outcome, breakdown) in report.slow.iter().take(5) {
         if breakdown.path.is_none() {
             break;
         }

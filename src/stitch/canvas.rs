@@ -831,40 +831,6 @@ pub(super) fn viewport_rect_covered_by_stitched(
     Ok(true)
 }
 
-pub(super) fn extract_stitched_region(
-    stitched: &StitchedFrame,
-    rect: ViewportRect,
-) -> Result<RgbFrame, Box<dyn Error>> {
-    validate_stitched_frame(stitched)?;
-    let x = u32::try_from(rect.x)?;
-    let y = u32::try_from(rect.y)?;
-    if x.checked_add(rect.width).ok_or("viewport x overflow")? > stitched.width
-        || y.checked_add(rect.height).ok_or("viewport y overflow")? > stitched.height
-    {
-        return Err("viewport rectangle exceeds stitched frame".into());
-    }
-    let stride = rect
-        .width
-        .checked_mul(3)
-        .ok_or("viewport stride overflow")?;
-    let size = (stride as usize)
-        .checked_mul(rect.height as usize)
-        .ok_or("viewport size overflow")?;
-    let mut data = vec![0; size];
-    if !stitched
-        .store
-        .region_into(x, y as i32, rect.width, rect.height, &mut data, stride)
-    {
-        return Err("stitched canvas is missing a row the viewport covers".into());
-    }
-    Ok(RgbFrame {
-        width: rect.width,
-        height: rect.height,
-        stride,
-        data,
-    })
-}
-
 pub(super) fn canvas_overlap_rect(
     stitched: &StitchedFrame,
     frame: &impl RgbSource,
