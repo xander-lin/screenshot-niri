@@ -1,6 +1,6 @@
 pkgbase = screenshot-plain
 	pkgdesc = Lightweight wlroots Wayland screenshot tool — plain variant (region and full-screen capture)
-	pkgver = 0.2.0
+	pkgver = 0.2.1
 	pkgrel = 1
 	url = https://github.com/xander-lin/screenshot-niri
 	arch = x86_64

@@ -2,7 +2,7 @@
 # Contributor: screenshot-plain contributors
 
 pkgname=screenshot-plain
-pkgver=0.2.0
+pkgver=0.2.1
 pkgrel=1
 pkgdesc="Lightweight wlroots Wayland screenshot tool — plain variant (region and full-screen capture)"
 arch=('x86_64')
