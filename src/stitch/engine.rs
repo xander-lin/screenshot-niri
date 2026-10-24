@@ -58,16 +58,6 @@ const EDGE_MAX_SCORING_ROWS: usize = 192;
 /// enough to trust is decided by the gates below (winner cost, runner-up ratio,
 /// colour), which are normalised and do not reward or punish density.
 const EDGE_MIN_COMPARABLE_ROWS: u32 = 3;
-/// Boundary rows a *far* placement must show.
-///
-/// A placement beyond the previous frame's own height has no overlap with it,
-/// so the only evidence is how much of this frame the canvas can confirm. A
-/// sliver of a dense frame matching far away is how a repeated patch captures
-/// a jump frame; a frame with fewer than this many boundary rows carries too
-/// little content to identify a place without continuity. Local placements are
-/// not held to it: there the frame still overlaps the previous one, and that
-/// overlap is itself the evidence.
-const EDGE_FAR_MIN_SCORING_ROWS: u32 = 5;
 /// Absolute ceiling on the winner's cost.
 ///
 /// The cost is already an average over the boundary cells that carried
@@ -1089,7 +1079,7 @@ impl WindowedEdgeMatcher {
         let second = costs
             .iter()
             .find(|(_, top, _)| (top - best_top).abs() > basin)
-            .map(|(cost, _, _)| *cost);
+            .map(|&(cost, top, _)| (top, cost));
         // The other places that match about as well as the winner.
         //
         // "About as well" is the same relative test as the runner-up ratio —
@@ -1125,7 +1115,8 @@ impl WindowedEdgeMatcher {
         // narrow to contain one, not that the winner is unopposed. It must not
         // read as an infinite margin, or the absolute gate is bypassed and a
         // 0.71-cost "winner" gets written.
-        let second_over_best = match second {
+        let second_cost = second.map(|(_, cost)| cost);
+        let second_over_best = match second_cost {
             // A perfect winner (cost exactly 0) is as confident as it gets.
             Some(second) if second > 0.0 && best_cost <= 0.0 => f64::INFINITY,
             Some(second) if best_cost > 0.0 => second / best_cost,
@@ -1137,7 +1128,7 @@ impl WindowedEdgeMatcher {
         if crate::trace::edge_gate_trace_enabled() {
             crate::trace_log!(
                 "stitch: edge gate n={} window={}..={} best={best_cost:.4}@{best_top} used={} \
-                 second={second:?} rivals={} second_over_best={second_over_best:.2} \
+                 second={second_cost:?} rivals={} second_over_best={second_over_best:.2} \
                  max_accept={EDGE_MAX_ACCEPT_COST}",
                 costs.len(),
                 costs.iter().map(|c| c.1).min().unwrap_or(0),
@@ -1267,7 +1258,27 @@ impl WindowedEdgeMatcher {
             .iter()
             .find(|(_, top, _)| *top == chosen)
             .map_or((best_cost, 0), |(cost, _, used)| (*cost, *used));
-        DecideOutcome::Accept { top: chosen, cost: chosen_cost, used: chosen_used }
+        // Relative completeness, measured against what this window could
+        // explain: the winner must use as many of the frame's boundary rows as
+        // any plausible candidate does. A comb canvas (steps taller than the
+        // box leave holes) caps every candidate alike, and a jump at the canvas
+        // edge legitimately reads only part of the frame — those are not
+        // missing evidence. A dense frame reading a sliver while a rival reads
+        // it whole is a coincidental match, and is refused.
+        let plausible = EDGE_MIN_SECOND_OVER_BEST;
+        let window_used = costs
+            .iter()
+            .filter(|&&(cost, _, _)| cost <= best_cost * plausible)
+            .map(|&(_, _, used)| used)
+            .max()
+            .unwrap_or(chosen_used);
+        DecideOutcome::Accept {
+            top: chosen,
+            cost: chosen_cost,
+            used: chosen_used,
+            window_used,
+            runner_up: second,
+        }
     }
 
     /// Mean absolute colour difference between the frame and the pixel canvas
@@ -1423,7 +1434,7 @@ impl WindowedEdgeMatcher {
         bounds: (i32, i32),
         exclude: &[(i32, i32)],
         request: &PlacementRequest<'_>,
-    ) -> Option<(i32, f64, u32)> {
+    ) -> Option<StageAccept> {
         let (lo, hi) = bounds;
         if lo > hi {
             return None;
@@ -1435,10 +1446,10 @@ impl WindowedEdgeMatcher {
         let mut ring_inner = 0;
         let mut radius = (ladder.rows() as i32).min(max_radius);
         loop {
-            if let DecideOutcome::Accept { top, cost, used } = self.decide_ring(
+            if let DecideOutcome::Accept { top, cost, used, window_used, runner_up } = self.decide_ring(
                 cache, ladder, centre, ring_inner, radius, bounds, exclude, centre, request,
             ) {
-                return Some((top, cost, used));
+                return Some((top, cost, used, window_used, runner_up));
             }
             if radius >= max_radius {
                 return None;
@@ -1451,25 +1462,57 @@ impl WindowedEdgeMatcher {
     /// Whether a placement may be accepted outside the previous frame's reach.
     ///
     /// The guard's evidence is continuity: the frame still overlaps the one
-    /// before it. A far placement has none, so it must be supported by the
-    /// frame's own content: at least `EDGE_FAR_MIN_SCORING_ROWS` boundary rows,
-    /// and at least a quarter of them actually compared against the canvas.
-    /// Without this, a nearly blank frame is placed on the first repeated patch
-    /// the anchor can see — measured on `real-2`: 2–4 boundary rows matched at
-    /// 3 rows of a 383-row frame, hundreds of pixels from the truth, some with
-    /// a cost of 0.25 that the "confident" ratio escape let through.
-    fn far_placement_supported(&self, ladder: &EdgeLadder, top: i32, used: u32) -> bool {
+    /// before it, so whatever boundary rows it has are read against known
+    /// content. A far placement has no overlap, so it must carry its own — and
+    /// the demand is *relative*, exactly like the local floor: a frame cannot
+    /// be asked for more rows than it has, but a far answer must use **every**
+    /// row it does have (`used == scoring_rows`; a page whose only feature is
+    /// one boundary row is held to that row). The pixels must also be able to
+    /// **refute the runner-up**: when the alternative matches the canvas just
+    /// as well in pixels, the content cannot tell the two offsets apart — the
+    /// blank-patch signature measured on `real-2` (3 boundary rows, cost 0.0,
+    /// pixels within noise of each other) — and the frame is refused instead of
+    /// written at a guess. A strict `<` is not enough there: blank regions
+    /// differ by sampling noise, which "discriminates" without meaning anything.
+    fn far_placement_supported(
+        &self,
+        request: &PlacementRequest<'_>,
+        ladder: &EdgeLadder,
+        top: i32,
+        used: u32,
+        window_used: u32,
+        runner_up: Option<(i32, f64)>,
+    ) -> bool {
         let Some(pos) = self.pos else {
             return true;
         };
         if (top - pos).abs() < ladder.rows() as i32 {
             return true;
         }
-        let scoring = ladder.scoring_rows.len() as u32;
-        if scoring < EDGE_FAR_MIN_SCORING_ROWS {
+        // Relative completeness: the winner must explain as many of the
+        // frame's boundary rows as any plausible candidate in this window did.
+        if used < window_used {
             return false;
         }
-        used >= scoring.div_ceil(4).max(EDGE_FAR_MIN_SCORING_ROWS)
+        // A far answer must at least be verifiable in pixels.
+        let Some(winner) = self.colour_cost_at(request, top) else {
+            return false;
+        };
+        // Pixel refutation of the runner-up: it must sit nearer the "different
+        // content" side of the colour ceiling than the winner does. A blank
+        // patch is not refuted by noise around 0 (`real-2`: 0.0 vs 0.5), while
+        // a genuinely repeated structure on real content is (`real-1`/`real-2`
+        // rivals score in the tens). Measured on the shrunk-box scroll-back:
+        // winner 0.0 against rivals 25–44 — accept; blank aliases sit within a
+        // pixel of the winner — refuse.
+        let midpoint = (winner + EDGE_MAX_COLOUR_DIFFERENCE) * 0.5;
+        match runner_up {
+            None => true,
+            Some((rival_top, _)) => match self.colour_cost_at(request, rival_top) {
+                Some(rival) => rival >= midpoint,
+                None => false,
+            },
+        }
     }
 
     fn impulse_half_width(&self) -> i32 {
@@ -1540,9 +1583,21 @@ impl WindowedEdgeMatcher {
 }
 
 enum DecideOutcome {
-    Accept { top: i32, cost: f64, used: u32 },
+    Accept {
+        top: i32,
+        cost: f64,
+        used: u32,
+        window_used: u32,
+        runner_up: Option<(i32, f64)>,
+    },
     Reject(RejectReason),
 }
+
+/// What a stage accepted: the chosen top and cost, how many boundary rows it
+/// compared, the most any plausible candidate in the same window compared, and
+/// the runner-up's top and cost (the alternative the far-placement gate must be
+/// able to refute).
+type StageAccept = (i32, f64, u32, u32, Option<(i32, f64)>);
 
 impl PlacementEngine for WindowedEdgeMatcher {
     fn name(&self) -> &'static str {
@@ -1602,7 +1657,7 @@ impl PlacementEngine for WindowedEdgeMatcher {
         // Stage 1 — impulse: the neighbourhood of where the last step points.
         // Almost every frame is decided here, and it costs one narrow window.
         if impulse_reach > 0 {
-            if let DecideOutcome::Accept { top, cost, used } = self.decide(
+            if let DecideOutcome::Accept { top, cost, used, window_used, runner_up } = self.decide(
                 &mut cache,
                 &ladder,
                 predicted_top - impulse_reach,
@@ -1610,7 +1665,8 @@ impl PlacementEngine for WindowedEdgeMatcher {
                 predicted_top,
                 request,
             ) {
-                if self.far_placement_supported(&ladder, top, used) {
+                if self.far_placement_supported(request, &ladder, top, used, window_used, runner_up)
+                {
                     return self.accept(request, ladder, top, cost);
                 }
             }
@@ -1681,10 +1737,11 @@ impl PlacementEngine for WindowedEdgeMatcher {
         // stage above already scored.
         let anchor = self.anchor.unwrap_or(pos);
         if let Some(bounds) = self.canvas_bounds(&ladder) {
-            if let Some((top, cost, used)) =
+            if let Some((top, cost, used, window_used, runner_up)) =
                 self.search_rings(&mut cache, &ladder, anchor, bounds, &[guard], request)
             {
-                if self.far_placement_supported(&ladder, top, used) {
+                if self.far_placement_supported(request, &ladder, top, used, window_used, runner_up)
+                {
                     return self.accept(request, ladder, top, cost);
                 }
             }
@@ -3019,17 +3076,20 @@ mod tests {
         let first = frame_from(0, height);
         let rect = ViewportRect { x: 0, y: 0, width: W, height };
         engine.commit(rect, 0, &first);
-        engine.last_delta = Some(740);
-        engine.trend = 537.0;
+        // A flick whose step and trend both dwarf the frame height, so the
+        // prediction lands many guard bands away from `pos`.
+        engine.last_delta = Some(height as i32 * 12);
+        engine.trend = f64::from(height) * 9.0;
 
-        // An ordinary +17 step, although the prediction points at +1277.
-        let next = frame_from(17, height);
+        // An ordinary small step, although the prediction points far above.
+        let step = height as i32 / 3;
+        let next = frame_from(step as u32, height);
         let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first)];
         let req = request_on_canvas(&next, rect, &committed);
         match engine.place(&req) {
             EngineDecision::Place { rect: placed, match_info } => {
-                assert_eq!(placed.y, 17, "the local step must still be found");
-                assert_eq!(match_info.delta_y, 17);
+                assert_eq!(placed.y, step, "the local step must still be found");
+                assert_eq!(match_info.delta_y, step);
             }
             other => panic!("the local step must be placeable: {other:?}"),
         }
@@ -3039,19 +3099,64 @@ mod tests {
     /// frame's own content can justify it. A dense frame matching a sliver, or
     /// a nearly blank one, must not be written hundreds of rows away.
     #[test]
-    fn a_far_placement_needs_more_than_a_sliver_of_evidence() {
+    fn a_far_placement_needs_all_the_frames_rows_and_pixel_discrimination() {
+        let height = 60;
         let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
-        engine.pos = Some(0);
-        let dense = frame_from(0, 60);
-        let ladder = EdgeLadder::from_source(&dense, EdgeLadder::session_gain(&dense)).unwrap();
-        assert!(ladder.scoring_rows.len() >= 59);
-        assert!(!engine.far_placement_supported(&ladder, 600, 3));
-        assert!(engine.far_placement_supported(&ladder, 600, 15));
-        assert!(engine.far_placement_supported(&ladder, 17, 1));
+        let rect = ViewportRect { x: 0, y: 0, width: W, height };
+        // The rule's own unit is the frame height: anything at or beyond one
+        // height from `pos` is far. Ten heights keeps the far copy well clear
+        // of the guard band in every direction.
+        let far: i32 = (height as i32) * 10;
+        // A page that repeats verbatim `far` rows down: the frame matches at 0
+        // and at `far` equally, in structure *and* in pixels. The previous
+        // frame sits at 0, so `far` is a far candidate.
+        let base = frame_from(0, height);
+        engine.commit(rect, far, &base);
+        engine.commit(rect, 0, &base);
+        assert_eq!(engine.pos, Some(0));
+        let committed: Vec<(i32, &RgbFrame)> = vec![(far, &base), (0, &base)];
+        let req = request_on_canvas(&base, rect, &committed);
 
-        let flat = flat_frame(60);
-        let ladder = EdgeLadder::from_source(&flat, EdgeLadder::session_gain(&flat)).unwrap();
-        assert!(!engine.far_placement_supported(&ladder, 600, 0));
+        let ladder = EdgeLadder::from_source(&base, EdgeLadder::session_gain(&base)).unwrap();
+        let scoring = ladder.scoring_rows.len() as u32;
+        assert!(scoring >= 59);
+
+        // A sliver of the frame's rows is not evidence while a rival can read
+        // the frame whole.
+        assert!(!engine.far_placement_supported(&req, &ladder, far, 3, scoring, None));
+        // All rows, but the pixels cannot refute the copy at 0: refused.
+        assert!(!engine.far_placement_supported(
+            &req,
+            &ladder,
+            far,
+            scoring,
+            scoring,
+            Some((0, 0.0))
+        ));
+        // All rows and no rival in the window: the one scored candidate stands.
+        assert!(engine.far_placement_supported(&req, &ladder, far, scoring, scoring, None));
+        // Local placements are exempt — continuity is the evidence there.
+        assert!(engine.far_placement_supported(&req, &ladder, 17, 1, 1, None));
+
+        // Unique content `far` rows down: the runner-up at 0 is refuted by the
+        // pixels, and a frame whose only feature is one boundary row is held to
+        // that row rather than refused.
+        let unique = frame_from(far as u32, height);
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
+        engine.commit(rect, far, &unique);
+        engine.commit(rect, 0, &base);
+        let committed: Vec<(i32, &RgbFrame)> = vec![(far, &unique), (0, &base)];
+        let req = request_on_canvas(&unique, rect, &committed);
+        let ladder = EdgeLadder::from_source(&unique, EdgeLadder::session_gain(&unique)).unwrap();
+        let scoring = ladder.scoring_rows.len() as u32;
+        assert!(engine.far_placement_supported(
+            &req,
+            &ladder,
+            far,
+            scoring,
+            scoring,
+            Some((0, 0.0))
+        ));
     }
 
     /// Both directions are ordinary. A capture that scrolls back up must be

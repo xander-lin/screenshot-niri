@@ -324,9 +324,11 @@ seconds-long action.
   is searched and the prediction only breaks ties, so a runaway prediction
   cannot empty it), anchor (does it appear anywhere the canvas can see — tried
   whenever the guard has nothing, because a frame that shares no rows with the
-  previous one has no local answer at all; a placement outside the band needs
-  `≥ 5` boundary rows with a quarter of them actually compared, else the frame
-  is refused rather than written at a repeated patch).
+  previous one has no local answer at all; a placement outside the band must
+  compare as many boundary rows as any plausible candidate in its window (a
+  relative demand — one-row pages are held to their one row), be colour
+  verified, and leave the runner-up refuted by the pixels, else the frame is
+  refused rather than written at a repeated patch).
   `REFUSAL_PATIENCE = 8` governs the border and the frame-rate drop, not the
   search.
 * **Every acceptance gets a colour verification** against the pixel canvas,
