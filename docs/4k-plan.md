@@ -87,24 +87,46 @@ nothing and still costs 3.2 ms; the worst geometry costs 10.0 ms where a plain
 draws nothing, and a ragged preview still leaves the base visible in the gaps.
 Timing at 4K: full-screen hole < 0.2 ms, 24.6 MB history < 2 ms.
 
-### 2. Stop copying the dim base when it did not change — 1.6 ms → 0
+### 2. Stop copying the dim base when it did not change — 2.1 ms → 0
 
-**Problem.** Every committed overlay frame does
-`data[..buf_size].copy_from_slice(&base_pixels)` — 33 MB at 4K — even when the
-buffer already holds exactly that base from its previous commit.
+**Problem.** Every committed overlay frame did
+`data[..buf_size].copy_from_slice(&base_pixels)` — 33 MB read plus 33 MB
+written at 4K, measured 2.1–2.3 ms — to put back pixels the frame was about to
+overwrite. The cache itself was another 33 MB per overlay.
 
-**Approach.** Record the base key on the *buffer*, not only on the overlay:
-`OverlayBuffer` gets `base_key: Option<(i32, i32, Option<LogicalRect>)>`. On
-commit, if `buffer.base_key == cache_key` the copy is skipped (the buffer still
-holds its own copy of the same mask); otherwise copy and record. The overlay's
-`base_pixels` cache stays the source of truth for rebuilding.
+**Approach (as built).** The base is one uniform colour per pixel
+(`draw_live_base`: `[0,0,0,110]` outside the hole, transparent inside), so the
+cache is unnecessary. Each buffer records `base_key` (the dim/hole layout under
+its pixels) and `painted` (the rects the last commit drew over that base: the
+preview footprint and the border ring). On a commit:
 
-**Files.** `src/wayland/selection.rs` (`OverlayBuffer`, `render_live_overlays`).
+- `base_key` mismatch → redraw the mask in place (`erase_rect`, a row fill) and
+  clear `painted`.
+- match → `erase_stale` restores only what the new frame will not repaint: the
+  old preview footprint when the new one does not contain it (or when the
+  preview is ragged, because a ragged draw leaves its never-captured pixels
+  untouched), and the old ring when it moved. In the steady state nothing is
+  restored at all.
+- the erased rect is unioned into the damage reported to the compositor, so a
+  restore can never be left off-screen.
 
-**Acceptance.** Existing dirty-region tests pass; a test that two consecutive
-commits with an unchanged box copy nothing (observable through the recorded key)
-and a changed box copies again. Timing at 4K: the per-frame base copy
-disappears from the profile.
+`PreviewMap` (buffer ↔ image, separable in x and y) gives the exact rect the
+draw paints, and the draw clips itself to it — that rect is what makes
+"contains the previous footprint" a sound test.
+
+**Files.** `src/wayland/selection.rs` (`OverlayBuffer`, `render_live_overlays`,
+`draw_live_base`, `PreviewMap`, `Painted`, `erase_stale`, `erase_rect`,
+`erase_ring`, `for_each_border_pixel`).
+
+**Measured.** 4K, release, 8 runs: the old copy 2.08–2.27 ms, steady-state
+restore **0.00 ms**, a moved footprint 0.74–1.03 ms, a full mask rebuild
+1.18–1.27 ms (was 1.6 ms). Memory: the 33 MB base cache per overlay is gone.
+UI thread at 4K: 26.2–28.3 → **24.0–26.1 ms**.
+
+**Acceptance.** Existing overlay tests pass unchanged; new tests pin the
+uniform base, "unchanged footprint restores nothing", "moved footprint restores
+what it covered", "ragged preview always restores", "a moved ring restores only
+the old band", and "no pixel is drawn outside the footprint".
 
 ### 3. Reuse the capture buffer instead of a fresh memfd per frame — 16.1 ms → ~2 ms
 
@@ -227,7 +249,7 @@ grows by ~2 ms; net ~4 ms.
 | item | state | result |
 |---|---|---|
 | 1 overlay preview draw | **done** | full-screen hole 3.22 → **0.01 ms**; 24.6 MB history 10.04 → **2.1 ms**; 80% box 5.06 → **0.28 ms**; side column ~1.95 ms. UI thread at 4K: 29.4–36.2 → **26.2–28.3 ms**. 1080p unchanged (push 4.93, preview 1.36). Corpora unchanged. |
-| 2 overlay base copy | not started | |
+| 2 overlay base copy | **done** | the 33 MB cache is gone (uniform base): steady-state restore **0.00 ms**, old copy 2.08–2.27 ms; moved footprint 0.74–1.03 ms; mask rebuild 1.18–1.27 ms (was 1.6). UI thread at 4K 26.2–28.3 → **24.0–26.1 ms**. 1080p bench unchanged. Corpora unchanged. clippy 41 (one fewer than baseline). |
 | 3 capture buffer reuse | not started | |
 | 4 canvas row sampling | not started | |
 | 5 fused conversion + descriptor | not started | |

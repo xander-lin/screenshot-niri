@@ -155,6 +155,15 @@ struct OverlayBuffer {
     last_selected: Option<LogicalRect>,
     /// UiState::live_state_seq value this buffer was last committed with.
     live_seq: u64,
+    /// The dim/hole layout currently under this buffer's pixels.
+    ///
+    /// The base is one uniform colour outside the hole and transparent inside
+    /// it (`draw_live_base`), so it is never cached: a buffer whose key still
+    /// matches keeps its base, and only the pixels painted over it are
+    /// restored. A key mismatch redraws the mask in place.
+    base_key: Option<(i32, i32, Option<LogicalRect>)>,
+    /// What the last commit painted over that base.
+    painted: Painted,
 }
 
 impl Drop for OverlayBuffer {
@@ -270,10 +279,6 @@ struct OverlaySurface {
     /// configure — buffer creation and rendering therefore wait for the
     /// configure, which is also where the logical size comes from.
     configured: bool,
-    base_pixels: Option<Vec<u8>>,
-    /// Only the dim mask and transparent hole are cached. Preview and border
-    /// are composited afterwards, in that order, on every live redraw.
-    base_key: Option<(i32, i32, Option<LogicalRect>)>,
 }
 
 /// Marks an overlay as being on the frozen-image path, and how big its buffer is.
@@ -982,8 +987,7 @@ impl SelectionSession {
         self.state.frozen_outputs.clear();
         for overlay in &mut self.state.overlays {
             overlay.render_cache = None;
-            overlay.base_pixels = None;
-            overlay.base_key = None;
+            invalidate_overlay_base(overlay);
         }
         // The other outputs' canvases are never drawn on again: the pointer is
         // grabbed by the selected output, capture is scoped to it, and the
@@ -1274,8 +1278,6 @@ fn create_overlays(state: &mut UiState, qh: &QueueHandle<UiState>) -> Result<(),
             layer_surface,
             buffers: Vec::new(),
             render_cache: None,
-            base_pixels: None,
-            base_key: None,
             // Until the first configure both sizes are the logical geometry;
             // a fractionally scaled output replaces the buffer size with the
             // frozen capture's pixel size in the configure handler.
@@ -1322,7 +1324,6 @@ fn render_live_overlays(state: &mut UiState, output_name: Option<u32>) -> usize 
             None => continue,
         };
         let data = unsafe { std::slice::from_raw_parts_mut(buffer.data, buffer.size) };
-        let buf_size = overlay.width as usize * overlay.height as usize * 4;
         // Map through the actual overlay buffer size, not wl_output.scale:
         // our surfaces use buffer scale 1 even on a scaled output.
         let selection_local = rect.and_then(|r| selected_buffer_rect(output.info, r, overlay.width, overlay.height));
@@ -1336,38 +1337,59 @@ fn render_live_overlays(state: &mut UiState, output_name: Option<u32>) -> usize 
             continue;
         }
 
-        let cache_key = (overlay.width, overlay.height, selection_local);
-        let rebuild = overlay.base_key != Some(cache_key)
-            || overlay.base_pixels.as_ref().map_or(true, |b| b.len() != buf_size);
-        if rebuild {
+        // The base is a uniform colour, so it is never cached: a buffer that
+        // still holds this layout keeps it, and only the pixels the previous
+        // frame painted over it are restored (see `erase_stale`). At 4K the
+        // old cache cost a 33 MB read plus a 33 MB write per committed frame —
+        // 2.1 ms — to put back pixels this frame was about to paint anyway.
+        let base_key = (overlay.width, overlay.height, selection_local);
+        let rebuilt = buffer.base_key != Some(base_key);
+        if rebuilt {
             draw_live_base(data, overlay.width, overlay.height, selection_local);
-            let cache = data[..buf_size].to_vec();
-            overlay.base_pixels = Some(cache);
-            overlay.base_key = Some(cache_key);
-        } else if let Some(ref base) = overlay.base_pixels {
-            data[..buf_size.min(base.len())].copy_from_slice(&base[..buf_size.min(base.len())]);
+            buffer.base_key = Some(base_key);
+            buffer.painted = Painted::default();
         }
+        let border_thickness = buffer_length(border_width, overlay.width, output.info.logical.width);
+        let footprint = preview_footprint(
+            state.long_preview.as_ref(),
+            output.info.logical,
+            overlay.width,
+            overlay.height,
+        );
+        let ring = border_local.map(|rect| (rect, border_thickness));
+        let next = Painted { preview: footprint, ring };
+        let erased = erase_stale(
+            data,
+            overlay.width,
+            overlay.height,
+            selection_local,
+            buffer.painted,
+            next,
+            state.long_preview.as_ref().is_none_or(|preview| preview.opaque),
+        );
 
         draw_live_foreground(data, overlay.width, overlay.height, output.info.logical,
             selection_local, border_local, state.long_preview.as_ref(), border_width, border_color);
+        buffer.painted = next;
         overlay.surface.attach(Some(&buffer.buffer), 0, 0);
-        // The damage is what was actually rewritten, not the whole buffer: the
-        // mask/hole layer was either rebuilt (`rebuild`, which writes every
-        // pixel) or copied back from the cache, and only the foreground was
-        // redrawn over it. Reporting the full buffer while rebuilding nothing is
-        // a lie the compositor is entitled to act on.
-        if rebuild {
-            overlay.surface.damage_buffer(0, 0, overlay.width, overlay.height);
+        // The damage is what was actually rewritten. A rebuilt base writes
+        // every pixel; otherwise the foreground was redrawn over the restored
+        // base, and whatever `erase_stale` put back is part of the damage too.
+        // Reporting the full buffer while rebuilding nothing is a lie the
+        // compositor is entitled to act on.
+        let full = LogicalRect { x: 0, y: 0, width: overlay.width, height: overlay.height };
+        let damage = if rebuilt {
+            full
         } else {
-            let full = LogicalRect { x: 0, y: 0, width: overlay.width, height: overlay.height };
             let damage = foreground_damage(
                 state.long_preview.is_some(),
                 border_local,
-                buffer_length(border_width, overlay.width, output.info.logical.width),
+                border_thickness,
                 full,
             );
-            overlay.surface.damage_buffer(damage.x, damage.y, damage.width, damage.height);
-        }
+            erased.map_or(damage, |erased| union_rect(Some(damage), erased))
+        };
+        overlay.surface.damage_buffer(damage.x, damage.y, damage.width, damage.height);
         overlay.surface.commit();
         crate::trace_log!("render: committed canvas output={} (buffer freed the previous one on niri side)", overlay.output_name);
         buffer.available = false;
@@ -1407,14 +1429,42 @@ fn foreground_damage(
     }
 }
 
-fn draw_selection_border(data: &mut [u8], _width: i32, _height: i32, x: i32, y: i32, w: i32, h: i32, thickness: i32, border: [u8; 4]) {
-    let stride = _width as usize * 4;
+/// The area the ring can touch, clamped to the buffer.
+fn ring_bounds(rect: LogicalRect, thickness: i32, width: i32, height: i32) -> LogicalRect {
+    let outer = border_bounds(rect, thickness);
+    let x0 = outer.x.clamp(0, width);
+    let y0 = outer.y.clamp(0, height);
+    let x1 = outer.right().clamp(0, width);
+    let y1 = outer.bottom().clamp(0, height);
+    LogicalRect { x: x0, y: y0, width: (x1 - x0).max(0), height: (y1 - y0).max(0) }
+}
+
+fn draw_selection_border(data: &mut [u8], width: i32, height: i32, x: i32, y: i32, w: i32, h: i32, thickness: i32, border: [u8; 4]) {
+    let stride = width as usize * 4;
     let rect = LogicalRect { x, y, width: w, height: h };
+    for_each_border_pixel(width, height, rect, thickness, |px, py| {
+        let offset = py as usize * stride + px as usize * 4;
+        data[offset..offset + 4].copy_from_slice(&border);
+    });
+}
+
+/// Visits every pixel the selection border paints.
+///
+/// Shared with `erase_ring` so a restore cannot disagree with the draw about
+/// the ring's shape (corners included).
+fn for_each_border_pixel(
+    width: i32,
+    height: i32,
+    rect: LogicalRect,
+    thickness: i32,
+    mut visit: impl FnMut(i32, i32),
+) {
+    let LogicalRect { x, y, width: w, height: h } = rect;
     let thickness = thickness.max(1);
     let x0 = x.saturating_sub(thickness).max(0);
     let y0 = y.saturating_sub(thickness).max(0);
-    let x1 = x.saturating_add(w).saturating_add(thickness).min(_width);
-    let y1 = y.saturating_add(h).saturating_add(thickness).min(_height);
+    let x1 = x.saturating_add(w).saturating_add(thickness).min(width);
+    let y1 = y.saturating_add(h).saturating_add(thickness).min(height);
     for py in y0..y1 {
         // Skip the interior span: border work is proportional to perimeter.
         let spans = if py >= y && py < y + h {
@@ -1424,9 +1474,8 @@ fn draw_selection_border(data: &mut [u8], _width: i32, _height: i32, x: i32, y: 
         };
         for (start, end) in spans {
             for px in start..end {
-                if selection_border_pixel(px, py, rect, thickness, border).is_some() {
-                    let offset = py as usize * stride + px as usize * 4;
-                    data[offset..offset + 4].copy_from_slice(&border);
+                if selection_border_pixel(px, py, rect, thickness, OVERLAY_OUTSIDE_MASK_BGRA).is_some() {
+                    visit(px, py);
                 }
             }
         }
@@ -1497,12 +1546,20 @@ fn discard_selection(state: &mut UiState) {
     invalidate_overlay_bases(state);
 }
 
+/// Drops one overlay's cached base so the next render redraws the dim mask and
+/// the hole from scratch instead of trusting what its buffers hold.
+fn invalidate_overlay_base(overlay: &mut OverlaySurface) {
+    for buffer in &mut overlay.buffers {
+        buffer.base_key = None;
+        buffer.painted = Painted::default();
+    }
+}
+
 /// Drops cached overlay bases so the next render rebuilds them with the
 /// current selection rectangle (used after selection-box edits).
 fn invalidate_overlay_bases(state: &mut UiState) {
     for overlay in &mut state.overlays {
-        overlay.base_pixels = None;
-        overlay.base_key = None;
+        invalidate_overlay_base(overlay);
     }
 }
 
@@ -1514,8 +1571,7 @@ fn drop_frozen_bases(state: &mut UiState) {
     state.frozen_outputs.clear();
     for overlay in &mut state.overlays {
         overlay.render_cache = None;
-        overlay.base_pixels = None;
-        overlay.base_key = None;
+        invalidate_overlay_base(overlay);
     }
     queue_render(state, true);
 }
@@ -2300,19 +2356,156 @@ fn draw_overlay_dim_with_selection(
 }
 
 fn draw_live_base(data: &mut [u8], width: i32, height: i32, hole: Option<LogicalRect>) {
+    erase_rect(
+        data,
+        width,
+        height,
+        LogicalRect { x: 0, y: 0, width, height },
+        hole,
+    );
+}
+
+/// Fills `slice` (whole BGRA pixels) with one colour.
+fn fill_colour(slice: &mut [u8], colour: [u8; 4]) {
+    if colour == OVERLAY_SELECTED_TRANSPARENT_BGRA {
+        slice.fill(0);
+        return;
+    }
+    for pixel in slice.as_chunks_mut::<4>().0 {
+        pixel.copy_from_slice(&colour);
+    }
+}
+
+/// The base colour at one buffer pixel: the dim mask outside the hole, the
+/// transparent hole inside it.
+fn base_colour_at(x: i32, y: i32, hole: Option<LogicalRect>) -> [u8; 4] {
+    let inside = hole.is_some_and(|hole| {
+        x >= hole.x && x < hole.right() && y >= hole.y && y < hole.bottom()
+    });
+    if inside {
+        OVERLAY_SELECTED_TRANSPARENT_BGRA
+    } else {
+        OVERLAY_OUTSIDE_MASK_BGRA
+    }
+}
+
+/// Paints the base back over `rect`, in place.
+///
+/// The base is one uniform colour per pixel, so restoring is a fill rather than
+/// a copy of a cached mask — the 33 MB cache a 4K session used to hold per
+/// output is gone.
+fn erase_rect(
+    data: &mut [u8],
+    width: i32,
+    height: i32,
+    rect: LogicalRect,
+    hole: Option<LogicalRect>,
+) {
     let stride = width.max(0) as usize * 4;
-    for y in 0..height.max(0) as usize {
-        for x in 0..width.max(0) as usize {
-            let offset = y * stride + x * 4;
-            data[offset..offset + 4].copy_from_slice(&OVERLAY_OUTSIDE_MASK_BGRA);
+    let x0 = rect.x.clamp(0, width);
+    let x1 = rect.right().clamp(0, width);
+    let y0 = rect.y.clamp(0, height);
+    let y1 = rect.bottom().clamp(0, height);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let hole = hole.unwrap_or(LogicalRect { x: 0, y: 0, width: 0, height: 0 });
+    let hole_y1 = hole.y.saturating_add(hole.height);
+    for y in y0..y1 {
+        let row = &mut data[y as usize * stride..(y as usize + 1) * stride];
+        let (hx0, hx1) = if y >= hole.y && y < hole_y1 {
+            (hole.x.clamp(x0, x1), hole.right().clamp(x0, x1))
+        } else {
+            (x0, x0)
+        };
+        fill_colour(&mut row[x0 as usize * 4..hx0 as usize * 4], OVERLAY_OUTSIDE_MASK_BGRA);
+        fill_colour(&mut row[hx0 as usize * 4..hx1 as usize * 4], OVERLAY_SELECTED_TRANSPARENT_BGRA);
+        fill_colour(&mut row[hx1 as usize * 4..x1 as usize * 4], OVERLAY_OUTSIDE_MASK_BGRA);
+    }
+}
+
+/// Paints the base back over the ring `draw_selection_border` drew.
+fn erase_ring(
+    data: &mut [u8],
+    width: i32,
+    height: i32,
+    rect: LogicalRect,
+    thickness: i32,
+    hole: Option<LogicalRect>,
+) {
+    let stride = width.max(0) as usize * 4;
+    for_each_border_pixel(width, height, rect, thickness, |px, py| {
+        let colour = base_colour_at(px, py, hole);
+        let offset = py as usize * stride + px as usize * 4;
+        data[offset..offset + 4].copy_from_slice(&colour);
+    });
+}
+
+/// What the last commit painted over the base, in buffer pixels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Painted {
+    preview: Option<LogicalRect>,
+    ring: Option<(LogicalRect, i32)>,
+}
+
+/// Restores the base under whatever the previous commit painted and this one
+/// will not repaint, and returns the bounding rect it restored (for damage).
+///
+/// A steady-state long capture repaints the same preview footprint every frame,
+/// so this restores nothing at all — that is the whole point: the 33 MB copy
+/// that used to precede every commit was re-painting pixels the frame was
+/// about to overwrite.
+fn erase_stale(
+    data: &mut [u8],
+    width: i32,
+    height: i32,
+    hole: Option<LogicalRect>,
+    painted: Painted,
+    next: Painted,
+    preview_opaque: bool,
+) -> Option<LogicalRect> {
+    let mut erased: Option<LogicalRect> = None;
+    // A preview repaints its whole footprint only when it is opaque: a ragged
+    // (T/L/arch) canvas leaves its never-captured pixels untouched, so those
+    // must be restored even when the footprint is unchanged.
+    let covered = match (painted.preview, next.preview) {
+        (None, _) => true,
+        (Some(old), Some(new)) => preview_opaque && contains_rect(new, old),
+        (Some(_), None) => false,
+    };
+    if !covered {
+        if let Some(old) = painted.preview {
+            erase_rect(data, width, height, old, hole);
+            erased = Some(union_rect(erased, old));
         }
     }
-    if let Some(local) = hole {
-        for y in local.y..local.y + local.height {
-            for x in local.x..local.x + local.width {
-                let offset = (y as usize) * stride + (x as usize) * 4;
-                data[offset..offset + 4].copy_from_slice(&OVERLAY_SELECTED_TRANSPARENT_BGRA);
-            }
+    // The ring is repainted identically only when it did not move; otherwise
+    // the old band has to go back to the base.
+    if painted.ring != next.ring {
+        if let Some((rect, thickness)) = painted.ring {
+            erase_ring(data, width, height, rect, thickness, hole);
+            erased = Some(union_rect(erased, ring_bounds(rect, thickness, width, height)));
+        }
+    }
+    erased
+}
+
+fn contains_rect(outer: LogicalRect, inner: LogicalRect) -> bool {
+    inner.x >= outer.x
+        && inner.y >= outer.y
+        && inner.right() <= outer.right()
+        && inner.bottom() <= outer.bottom()
+}
+
+fn union_rect(a: Option<LogicalRect>, b: LogicalRect) -> LogicalRect {
+    match a {
+        None => b,
+        Some(a) => {
+            let x0 = a.x.min(b.x);
+            let y0 = a.y.min(b.y);
+            let x1 = a.right().max(b.right());
+            let y1 = a.bottom().max(b.bottom());
+            LogicalRect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }
         }
     }
 }
@@ -2344,29 +2537,68 @@ fn selected_local_intersection(output: LogicalRect, selected: LogicalRect) -> Op
     })
 }
 
-fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, preview: &LongPreviewSnapshot, output_logical: LogicalRect, selection_local: Option<LogicalRect>) {
-    let pw = preview.image.width as i32;
-    let ph = preview.image.height as i32;
-    if pw == 0 || ph == 0 || overlay_w <= 0 || overlay_h <= 0 {
-        return;
-    }
-    let logical_w = output_logical.width.max(1);
-    let logical_h = output_logical.height.max(1);
-    let vp = preview.viewport_rect;
-    if vp.intersection(output_logical).is_none() {
+/// Where a stitched preview lands in an overlay buffer.
+///
+/// The mapping is separable — the image column depends only on the buffer
+/// column and the image row only on the buffer row — so the set of buffer
+/// pixels that address the image is a rectangle. `footprint` returns it, and
+/// the draw clips itself to it. The render loop compares that rectangle between
+/// frames to decide whether this frame repaints everything the previous one
+/// painted; an over-estimate only costs a restore, an under-estimate would
+/// leave stale pixels.
+struct PreviewMap {
+    origin_x: i64,
+    origin_y: i64,
+    capture_w: i64,
+    capture_h: i64,
+    vp_buffer_x: i64,
+    vp_buffer_y: i64,
+    vp_buffer_w: i64,
+    vp_buffer_h: i64,
+    image_w: i64,
+    image_h: i64,
+}
+
+impl PreviewMap {
+    fn new(
+        preview: &LongPreviewSnapshot,
+        output_logical: LogicalRect,
+        overlay_w: i32,
+        overlay_h: i32,
+    ) -> Option<Self> {
+        let image_w = i64::from(preview.image.width);
+        let image_h = i64::from(preview.image.height);
+        if image_w == 0 || image_h == 0 || overlay_w <= 0 || overlay_h <= 0 {
+            return None;
+        }
+        let logical_w = i64::from(output_logical.width.max(1));
+        let logical_h = i64::from(output_logical.height.max(1));
+        let vp = preview.viewport_rect;
         // The preview belongs to the selection's output; rendering it on a
         // disjoint one would anchor the mapping far outside the buffer and
         // paint canvas content that is not on this screen.
-        return;
+        vp.intersection(output_logical)?;
+        let buffer_x = |logical: i32| -> i64 {
+            (i64::from(logical - output_logical.x) * i64::from(overlay_w)) / logical_w
+        };
+        let buffer_y = |logical: i32| -> i64 {
+            (i64::from(logical - output_logical.y) * i64::from(overlay_h)) / logical_h
+        };
+        let vp_buffer_x = buffer_x(vp.x);
+        let vp_buffer_y = buffer_y(vp.y);
+        Some(Self {
+            origin_x: i64::from(preview.current_origin_x),
+            origin_y: i64::from(preview.current_origin_y),
+            capture_w: i64::from(preview.capture_width.max(1)),
+            capture_h: i64::from(preview.capture_height.max(1)),
+            vp_buffer_x,
+            vp_buffer_y,
+            vp_buffer_w: (buffer_x(vp.right()) - vp_buffer_x).max(1),
+            vp_buffer_h: (buffer_y(vp.bottom()) - vp_buffer_y).max(1),
+            image_w,
+            image_h,
+        })
     }
-    let cw = preview.capture_width.max(1) as i32;
-    let ch = preview.capture_height.max(1) as i32;
-    let origin_x = preview.current_origin_x;
-    let origin_y = preview.current_origin_y;
-    let buf_stride = overlay_w as usize * 4;
-    let hole = selection_local.unwrap_or(LogicalRect { x: 0, y: 0, width: 0, height: 0 });
-    let img_data = &preview.image.data;
-    let img_stride = preview.image.stride as usize;
 
     // Buffer pixel -> stitched pixel, in one step.
     //
@@ -2377,29 +2609,77 @@ fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, prev
     // re-expands it, which samples the canvas at 1x and draws it at the
     // buffer's density: a 1.5x upscale of a 1x sample, i.e. a visibly soft
     // preview on any fractionally scaled output.
-    let buffer_x = |logical: i32| -> i64 {
-        (i64::from(logical - output_logical.x) * i64::from(overlay_w)) / i64::from(logical_w)
-    };
-    let buffer_y = |logical: i32| -> i64 {
-        (i64::from(logical - output_logical.y) * i64::from(overlay_h)) / i64::from(logical_h)
-    };
-    let vp_buffer_x = buffer_x(vp.x);
-    let vp_buffer_y = buffer_y(vp.y);
-    let vp_buffer_w = (buffer_x(vp.right()) - vp_buffer_x).max(1);
-    let vp_buffer_h = (buffer_y(vp.bottom()) - vp_buffer_y).max(1);
-    // Canvas pixels per buffer pixel: the capture's density over the buffer's.
-    // One when they agree, which is the normal case and needs no resampling.
+    //
     // `div_euclid` (floor) keeps the covering rule the same on both sides of
     // the anchor; truncation toward zero shifts the already-captured content
     // left of / above the selection by up to one pixel.
-    let canvas_x = |bx: i32| -> i64 {
-        i64::from(origin_x)
-            + ((i64::from(bx) - vp_buffer_x) * i64::from(cw)).div_euclid(vp_buffer_w)
+    fn canvas_x(&self, bx: i32) -> i64 {
+        self.origin_x
+            + ((i64::from(bx) - self.vp_buffer_x) * self.capture_w).div_euclid(self.vp_buffer_w)
+    }
+
+    fn canvas_y(&self, by: i32) -> i64 {
+        self.origin_y
+            + ((i64::from(by) - self.vp_buffer_y) * self.capture_h).div_euclid(self.vp_buffer_h)
+    }
+
+    /// The buffer rect whose pixels address the image, if any.
+    fn footprint(&self, overlay_w: i32, overlay_h: i32) -> Option<LogicalRect> {
+        let x0 = first_reaching(overlay_w, 0, |bx| self.canvas_x(bx));
+        let x1 = first_reaching(overlay_w, self.image_w, |bx| self.canvas_x(bx));
+        let y0 = first_reaching(overlay_h, 0, |by| self.canvas_y(by));
+        let y1 = first_reaching(overlay_h, self.image_h, |by| self.canvas_y(by));
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        Some(LogicalRect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 })
+    }
+}
+
+/// The first index in `[0, len)` where a non-decreasing `map` reaches `target`,
+/// or `len` when it never does.
+fn first_reaching(len: i32, target: i64, map: impl Fn(i32) -> i64) -> i32 {
+    let (mut lo, mut hi) = (0, len);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if map(mid) >= target {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+/// The buffer rect a preview paints on one overlay.
+fn preview_footprint(
+    preview: Option<&LongPreviewSnapshot>,
+    output_logical: LogicalRect,
+    overlay_w: i32,
+    overlay_h: i32,
+) -> Option<LogicalRect> {
+    let preview = preview?;
+    PreviewMap::new(preview, output_logical, overlay_w, overlay_h)?.footprint(overlay_w, overlay_h)
+}
+
+fn draw_preview_on_overlay(
+    data: &mut [u8],
+    overlay_w: i32,
+    overlay_h: i32,
+    preview: &LongPreviewSnapshot,
+    output_logical: LogicalRect,
+    selection_local: Option<LogicalRect>,
+) {
+    let Some(map) = PreviewMap::new(preview, output_logical, overlay_w, overlay_h) else {
+        return;
     };
-    let canvas_y = |by: i32| -> i64 {
-        i64::from(origin_y)
-            + ((i64::from(by) - vp_buffer_y) * i64::from(ch)).div_euclid(vp_buffer_h)
+    let Some(footprint) = map.footprint(overlay_w, overlay_h) else {
+        return;
     };
+    let buf_stride = overlay_w as usize * 4;
+    let hole = selection_local.unwrap_or(LogicalRect { x: 0, y: 0, width: 0, height: 0 });
+    let img_data = &preview.image.data;
+    let img_stride = preview.image.stride as usize;
 
     // Buffer-major: every buffer pixel of the dimmed area picks the stitched
     // pixel it covers. Iterating the stitched image instead would leave gaps
@@ -2413,14 +2693,14 @@ fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, prev
     // capture and the buffer share a density (the normal case) the source
     // columns are contiguous with the buffer columns, so a run is one memcpy
     // instead of 4 bytes at a time: the same 24.6 MB costs 1.4 ms that way.
-    let one_to_one = i64::from(cw) == vp_buffer_w && i64::from(ch) == vp_buffer_h;
+    let one_to_one = map.capture_w == map.vp_buffer_w && map.capture_h == map.vp_buffer_h;
     let columns: Vec<Option<usize>> = if one_to_one {
         Vec::new()
     } else {
         (0..overlay_w)
             .map(|bx| {
-                let sx = canvas_x(bx);
-                (sx >= 0 && sx < i64::from(pw)).then(|| sx as usize * 4)
+                let sx = map.canvas_x(bx);
+                (sx >= 0 && sx < map.image_w).then(|| sx as usize * 4)
             })
             .collect()
     };
@@ -2428,10 +2708,11 @@ fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, prev
     let hole_x1 = hole.x.saturating_add(hole.width).clamp(0, overlay_w);
     let hole_hides_row = hole_x0 == 0 && hole_x1 >= overlay_w;
     let hole_y1 = hole.y.saturating_add(hole.height);
+    let cols = footprint.x..footprint.right();
 
-    for by in 0..overlay_h {
-        let sy = canvas_y(by);
-        if sy < 0 || sy >= i64::from(ph) {
+    for by in footprint.y..footprint.bottom() {
+        let sy = map.canvas_y(by);
+        if sy < 0 || sy >= map.image_h {
             continue;
         }
         let in_hole_row = by >= hole.y && by < hole_y1;
@@ -2440,12 +2721,15 @@ fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, prev
         }
         let src_row = sy as usize * img_stride;
         let dst_row = by as usize * buf_stride;
-        // The visible runs of this row: the whole width, or the two sides of
-        // the hole when the hole touches it.
+        // The visible runs of this row: the whole footprint, or the two sides
+        // of the hole when the hole touches it.
         let segments: [(i32, i32); 2] = if in_hole_row {
-            [(0, hole_x0), (hole_x1, overlay_w)]
+            [
+                (cols.start, hole_x0.clamp(cols.start, cols.end)),
+                (hole_x1.clamp(cols.start, cols.end), cols.end),
+            ]
         } else {
-            [(0, overlay_w), (0, 0)]
+            [(cols.start, cols.end), (cols.start, cols.start)]
         };
         for (x0, x1) in segments {
             if x1 <= x0 {
@@ -2453,15 +2737,13 @@ fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, prev
             }
             if one_to_one {
                 // Canvas column `bx` is `origin_x + (bx - vp_buffer_x)`.
-                let shift = vp_buffer_x - i64::from(origin_x);
-                let first = i64::from(x0).max(shift);
-                let last = i64::from(x1).min(shift + i64::from(pw));
-                if last <= first {
+                let offset = i64::from(x0) - (map.vp_buffer_x - map.origin_x);
+                if offset < 0 {
                     continue;
                 }
-                let src_start = src_row + (first - shift) as usize * 4;
-                let len = (last - first) as usize * 4;
-                let dst_start = dst_row + first as usize * 4;
+                let src_start = src_row + offset as usize * 4;
+                let len = (x1 - x0) as usize * 4;
+                let dst_start = dst_row + x0 as usize * 4;
                 if src_start + len > img_data.len() || dst_start + len > data.len() {
                     continue;
                 }
@@ -2471,12 +2753,12 @@ fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, prev
                 } else {
                     // Never-captured corners of ragged (T/L/arch) canvases stay
                     // transparent; leave the dimmed overlay visible beneath them.
-                    for offset in (0..len).step_by(4) {
-                        if img_data[src_start + offset + 3] == 0 {
+                    for step in (0..len).step_by(4) {
+                        if img_data[src_start + step + 3] == 0 {
                             continue;
                         }
-                        data[dst_start + offset..dst_start + offset + 4]
-                            .copy_from_slice(&img_data[src_start + offset..src_start + offset + 4]);
+                        data[dst_start + step..dst_start + step + 4]
+                            .copy_from_slice(&img_data[src_start + step..src_start + step + 4]);
                     }
                 }
                 continue;
@@ -2495,10 +2777,7 @@ fn draw_preview_on_overlay(data: &mut [u8], overlay_w: i32, overlay_h: i32, prev
                     continue;
                 }
                 let dst_off = dst_row + bx as usize * 4;
-                data[dst_off] = img_data[src_off];
-                data[dst_off + 1] = img_data[src_off + 1];
-                data[dst_off + 2] = img_data[src_off + 2];
-                data[dst_off + 3] = 255;
+                data[dst_off..dst_off + 4].copy_from_slice(&img_data[src_off..src_off + 4]);
             }
         }
     }
@@ -2756,8 +3035,6 @@ fn refresh_overlay_surface(state: &mut UiState, output_name: u32, qh: &QueueHand
             Ok(buffers) => {
                 let overlay = &mut state.overlays[index];
                 overlay.buffers = buffers;
-                overlay.base_pixels = None;
-                overlay.base_key = None;
                 overlay.render_cache = None;
                 overlay.width = buffer_width;
                 overlay.height = buffer_height;
@@ -2869,7 +3146,7 @@ fn create_overlay_buffer(
     let pool_size = i32::try_from(size).map_err(|_| "shm buffer exceeds 2 GiB")?;
     let pool = shm.create_pool(fd.as_fd(), pool_size, qh, ());
     let buffer = pool.create_buffer(0, width, height, stride, Format::Argb8888, qh, id);
-    Ok(OverlayBuffer { size, data: data.cast(), _fd: fd, pool, buffer, available: true, initialized: false, last_selected: None, live_seq: 0 })
+    Ok(OverlayBuffer { size, data: data.cast(), _fd: fd, pool, buffer, available: true, initialized: false, last_selected: None, live_seq: 0, base_key: None, painted: Painted::default() })
 }
 
 impl Dispatch<WlRegistry, ()> for UiState {
@@ -3323,6 +3600,180 @@ mod tests {
         assert_eq!(pixel(59, 99), [0, 0, 0, 0], "hole untouched");
         assert_eq!(pixel(60, 0), [10, 20, 30, 255], "right of the hole");
         assert_eq!(pixel(99, 99), [10, 20, 30, 255], "right edge, last row");
+    }
+
+    /// The base is one uniform colour per pixel, which is why a buffer can keep
+    /// it instead of copying a cached mask back before every commit.
+    #[test]
+    fn a_base_is_uniform_dim_outside_the_hole_and_transparent_inside() {
+        let mut data = vec![7u8; 4 * 3 * 4];
+        let hole = LogicalRect { x: 1, y: 1, width: 2, height: 1 };
+        draw_live_base(&mut data, 4, 3, Some(hole));
+        for y in 0..3 {
+            for x in 0..4 {
+                let offset = (y * 4 + x) * 4;
+                let want = if y == 1 && (1..3).contains(&x) {
+                    [0, 0, 0, 0]
+                } else {
+                    [0, 0, 0, 110]
+                };
+                assert_eq!(&data[offset..offset + 4], &want, "({x},{y})");
+            }
+        }
+    }
+
+    /// A steady-state long capture repaints the same preview footprint every
+    /// frame, so the base under it must not be restored first: that copy was
+    /// 33 MB (1.6 ms) per committed frame at 4K.
+    #[test]
+    fn a_preview_that_covers_the_previous_footprint_restores_nothing() {
+        let mut data = vec![7u8; 8 * 8 * 4];
+        let before = data.clone();
+        let rect = LogicalRect { x: 2, y: 2, width: 4, height: 4 };
+        let erased = erase_stale(
+            &mut data,
+            8,
+            8,
+            None,
+            Painted { preview: Some(rect), ring: None },
+            Painted { preview: Some(rect), ring: None },
+            true,
+        );
+        assert_eq!(erased, None, "nothing was restored");
+        assert_eq!(data, before, "no pixel may be touched");
+    }
+
+    /// When the footprint moves, what the previous frame painted and this one
+    /// does not cover goes back to the base.
+    #[test]
+    fn a_preview_that_moves_restores_what_it_covered() {
+        let mut data = vec![7u8; 8 * 8 * 4];
+        let old = LogicalRect { x: 2, y: 2, width: 4, height: 4 };
+        let new = LogicalRect { x: 3, y: 3, width: 4, height: 4 };
+        let erased = erase_stale(
+            &mut data,
+            8,
+            8,
+            None,
+            Painted { preview: Some(old), ring: None },
+            Painted { preview: Some(new), ring: None },
+            true,
+        );
+        assert_eq!(erased, Some(old));
+        for y in 0..8 {
+            for x in 0..8 {
+                let offset = (y * 8 + x) * 4;
+                let inside_old = (2..6).contains(&x) && (2..6).contains(&y);
+                let want = if inside_old { [0, 0, 0, 110] } else { [7, 7, 7, 7] };
+                assert_eq!(&data[offset..offset + 4], &want, "({x},{y})");
+            }
+        }
+    }
+
+    /// A ragged canvas leaves its never-captured pixels untouched, so an
+    /// unchanged footprint does not mean the frame repainted it.
+    #[test]
+    fn a_ragged_preview_restores_its_footprint_even_when_unchanged() {
+        let mut data = vec![7u8; 8 * 8 * 4];
+        let rect = LogicalRect { x: 2, y: 2, width: 4, height: 4 };
+        let erased = erase_stale(
+            &mut data,
+            8,
+            8,
+            None,
+            Painted { preview: Some(rect), ring: None },
+            Painted { preview: Some(rect), ring: None },
+            false,
+        );
+        assert_eq!(
+            erased,
+            Some(rect),
+            "a non-opaque preview cannot be trusted to repaint its own footprint"
+        );
+    }
+
+    /// The ring is repainted identically only when it did not move; otherwise
+    /// the old band must go back to the base, and the box interior — which the
+    /// ring never covers — must be left alone.
+    #[test]
+    fn a_border_that_moved_restores_only_its_old_ring() {
+        let (w, h) = (20, 20);
+        let mut data = vec![0u8; (w * h * 4) as usize];
+        draw_live_base(&mut data, w, h, None);
+        let old = LogicalRect { x: 4, y: 4, width: 8, height: 8 };
+        draw_selection_border(&mut data, w, h, old.x, old.y, old.width, old.height, 2, [255, 0, 0, 255]);
+        let sentinel = [1, 2, 3, 4];
+        let interior = ((8 * w + 8) * 4) as usize;
+        data[interior..interior + 4].copy_from_slice(&sentinel);
+
+        let new = LogicalRect { x: 12, y: 12, width: 6, height: 6 };
+        let erased = erase_stale(
+            &mut data,
+            w,
+            h,
+            None,
+            Painted { preview: None, ring: Some((old, 2)) },
+            Painted { preview: None, ring: Some((new, 2)) },
+            true,
+        );
+        assert!(erased.is_some());
+        for_each_border_pixel(w, h, old, 2, |px, py| {
+            let offset = ((py * w + px) * 4) as usize;
+            assert_eq!(
+                &data[offset..offset + 4],
+                &OVERLAY_OUTSIDE_MASK_BGRA,
+                "old ring pixel ({px},{py})"
+            );
+        });
+        assert_eq!(
+            &data[interior..interior + 4],
+            &sentinel,
+            "the ring restore must not touch the box interior"
+        );
+    }
+
+    /// The render loop trusts the footprint to decide whether the previous
+    /// frame's pixels are all repainted, so no pixel outside it may be drawn.
+    #[test]
+    fn the_preview_footprint_bounds_every_pixel_the_draw_touches() {
+        let output = LogicalRect { x: 0, y: 0, width: 80, height: 80 };
+        let cases = [
+            // 1:1 with the buffer, offset so the image is clipped on all sides.
+            (40, 80, 5, 17, 1),
+            // A denser capture than the buffer (the fractional-scale case).
+            (40, 80, 5, 17, 2),
+        ];
+        for (image_w, image_h, origin_x, origin_y, density) in cases {
+            let preview = LongPreviewSnapshot {
+                image: solid_image(image_w, image_h, &[(0, image_h, [9, 9, 9, 255])]),
+                opaque: true,
+                current_origin_x: origin_x,
+                current_origin_y: origin_y,
+                viewport_rect: LogicalRect { x: 10, y: 20, width: 40, height: 40 },
+                capture_width: 40 * density,
+                capture_height: 40 * density,
+            };
+            let (w, h) = (80, 80);
+            let mut data = vec![0u8; (w * h * 4) as usize];
+            draw_preview_on_overlay(&mut data, w, h, &preview, output, None);
+            let footprint =
+                preview_footprint(Some(&preview), output, w, h).expect("the image lands somewhere");
+            for y in 0..h {
+                for x in 0..w {
+                    let offset = ((y * w + x) * 4) as usize;
+                    if data[offset..offset + 4] == [0, 0, 0, 0] {
+                        continue;
+                    }
+                    assert!(
+                        x >= footprint.x
+                            && x < footprint.right()
+                            && y >= footprint.y
+                            && y < footprint.bottom(),
+                        "painted ({x},{y}) outside {footprint:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
