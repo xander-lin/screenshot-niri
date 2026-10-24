@@ -1,3 +1,6 @@
+pub mod app;
+pub mod clipboard;
+pub mod cli;
 pub mod corpus;
 pub mod geometry;
 pub mod image;

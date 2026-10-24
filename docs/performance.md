@@ -289,7 +289,8 @@ Measured, three runs each, same machine, release build:
 | 1920x1080, before | 3.25 ms | 0.61 ms | 3.90 ms (12%) |
 | 1920x1080, after | 1.88 ms | 0.60 ms | 2.50 ms (8%) |
 | `real-5-4k`, before | 5.87 ms | 1.82 ms | 7.75 ms (23%) |
-| `real-5-4k`, after | 5.76 ms | 1.92 ms | 6.31 ms (19%) |
+| `real-5-4k`, after (same budget) | 5.76 ms | 1.92 ms | 6.31 ms (19%) |
+| `real-5-4k`, after the working-set fix below | 0.94 ms | 0.29 ms | 2.20 ms (7%) |
 
 `real-5-4k`'s p50 barely moves because its frames are lz4-packed canvas reads,
 not descriptor arithmetic; its **p95** falls 16.1 → 7.3 ms, which is the anchor
@@ -309,6 +310,32 @@ Bit-identical check: `real-4-4k` and `real-5-4k` canvases replay **byte for
 byte identical** with the helpers forced serial and parallel (PNG sha256
 `c6ddb92c…` / `aad70178…`), and every corpus keeps its acceptance count
 (`real-4-4k` 438 / `real-5-4k` 542).
+
+## 2026-10-24, fifth pass: the tile working set was smaller than one frame's read pattern
+
+`replay-frames` on `real-5-4k` took **three minutes** for 812 frames. `perf` put
+66% in `Lz4Tiles::unpack` and 20% in `lz4_flex` compression: the capture was
+thrashing its own tile store. `CanvasStore::default_budget` was four frames'
+worth of pixels (21 MB for a 2 131x835 frame), while the canvas grows to 30 MB;
+every frame's duplicate check, colour check and write crossed the budget, so
+every sweep packed tiles the next frame immediately unpacked.
+
+The budget is now eight frames' worth (8 MB floor) with the reasoning written on
+the constant: the working set is the previous frame's rectangle plus one
+screenful of preview, and eight frames leaves slack for the sweep. Measured on
+the same corpus: push mean **181 → 2.4 ms** (p50 5.87 → **0.94 ms** in
+`stitch-bench`), preview 1.83 → 0.29 ms, the whole replay 180 → 30 s, and 26 s
+of those 30 are the independent reprojection check. Canvases are byte-identical
+(`real-4-4k` `c6ddb92c…`, `real-5-4k` `aad70178…`), every corpus keeps its
+acceptance count, and synthetic 4K (a 59-frame canvas that never crossed the old
+budget) is unchanged at 6.0 ms push.
+
+The trade-off is memory and it is deliberate: the 30 MB canvas is now resident
+instead of packed to ~9 MB while it fits the budget. A capture still reaches a
+bounded footprint, only later — `CanvasStore::report` measures it, and the
+budget is one constant to lower if a machine needs the memory back. The old
+figure was not "packing works"; it was "packing ran more often than the capture
+read the same tiles".
 
 ## What remains
 

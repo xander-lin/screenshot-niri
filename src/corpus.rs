@@ -155,3 +155,67 @@ pub fn luminance(image: &Image) -> Vec<u8> {
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// Truth cache
+// ---------------------------------------------------------------------------
+//
+// The standard answer a tool computes for a corpus (the exhaustive pairwise
+// search of `replay-frames`, the consensus verdicts of `truth-frames`) depends
+// on the frames and on the tool's parameters — never on the stitcher. A
+// verification pass runs the same corpus again after every stitcher change, so
+// recomputing it is pure repeated work: measured, the `replay-frames` oracle is
+// most of a corpus run and `truth-frames` is minutes on the 4K corpora.
+//
+// The cache is a dot-file inside the corpus directory (gitignored). Its first
+// line carries a key built from the tool, its parameters and a fingerprint of
+// every frame (name, size, mtime); a mismatch — including any frame rewritten —
+// discards it. `--refresh` forces a recompute.
+
+/// Version of the cache *format and semantics*. Bump whenever a change alters
+/// what a cached answer means; the fingerprint only covers the corpus, not the
+/// code that judged it.
+pub const TRUTH_CACHE_VERSION: u32 = 1;
+
+/// Where a tool's truth cache for `dir` lives.
+pub fn truth_cache_path(dir: &Path, tool: &str) -> PathBuf {
+    dir.join(format!(".truth-{tool}.cache"))
+}
+
+/// A fingerprint of the corpus contents plus the parameters an answer depends
+/// on.
+///
+/// Frame identity is `(file name, size, mtime)`: hashing the pixels would cost
+/// a full read of 50 MB per invocation, and a rewritten frame changes its size
+/// or its mtime. The manifest's own bytes are covered by the file list it
+/// names (a changed manifest changes which files are read).
+pub fn truth_key(
+    dir: &Path,
+    tool: &str,
+    params: &[(&str, String)],
+) -> Result<String, Box<dyn Error>> {
+    use std::hash::{Hash, Hasher};
+    use std::time::UNIX_EPOCH;
+
+    let entries = load_frames(dir)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    tool.hash(&mut hasher);
+    TRUTH_CACHE_VERSION.hash(&mut hasher);
+    for (name, value) in params {
+        name.hash(&mut hasher);
+        value.hash(&mut hasher);
+    }
+    for entry in &entries {
+        entry.path.file_name().hash(&mut hasher);
+        let metadata = std::fs::metadata(&entry.path)?;
+        metadata.len().hash(&mut hasher);
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|elapsed| (elapsed.as_secs(), elapsed.subsec_nanos()))
+            .unwrap_or((0, 0));
+        modified.hash(&mut hasher);
+    }
+    Ok(format!("{:016x}", hasher.finish()))
+}

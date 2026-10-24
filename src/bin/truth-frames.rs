@@ -29,12 +29,18 @@
 //! * `edge`        — too little of the frame is covered by *other* frames to
 //!   judge it (the first/last screenfuls).
 //!
-//! Usage: truth-frames --dir DIR [--window ROWS] [--tsv OUT] [--quiet]
+//! Usage: truth-frames --dir DIR [--window ROWS] [--tsv OUT] [--quiet] [--refresh]
+//!
+//! The verdicts depend only on the frames and the parameters, so they are
+//! cached per corpus (`.truth-truth.cache`, content-keyed). A stitcher change
+//! never invalidates them; `--refresh` recomputes anyway.
 
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use screenshot_rs_rebuild::corpus::{load_frames, load_png, luminance};
+use screenshot_rs_rebuild::corpus::{
+    load_frames, load_png, luminance, truth_cache_path, truth_key,
+};
 
 /// Overlap (as a fraction of the frame's height) below which a displacement is
 /// not considered: a 25% overlap is the least that still says something, and
@@ -115,6 +121,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut window = 0i32;
     let mut tsv: Option<PathBuf> = None;
     let mut quiet = false;
+    let mut refresh = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -124,8 +131,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             "--tsv" => tsv = Some(PathBuf::from(args.next().ok_or("--tsv needs a path")?)),
             "--quiet" | "-q" => quiet = true,
+            "--refresh" => refresh = true,
             "--help" | "-h" => {
-                println!("truth-frames --dir DIR [--window ROWS] [--tsv OUT] [--quiet]");
+                println!("truth-frames --dir DIR [--window ROWS] [--tsv OUT] [--quiet] [--refresh]");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument: {other}").into()),
@@ -135,6 +143,29 @@ fn run() -> Result<(), Box<dyn Error>> {
     let entries = load_frames(&dir)?;
     if entries.len() < 2 {
         return Err("a corpus needs at least two frames".into());
+    }
+
+    // The verdicts are a function of the frames and the window only. Recomputing
+    // them after every stitcher change is the expensive part of a verification
+    // pass (minutes on the 4K corpora), and it cannot differ.
+    let cache_key = truth_key(&dir, "truth", &[("window", window.to_string())])?;
+    let cache_path = truth_cache_path(&dir, "truth");
+    if !refresh {
+        if let Some((summary, rows)) = load_verdict_cache(&cache_path, &cache_key) {
+            if !quiet {
+                for line in &summary {
+                    println!("{line}");
+                }
+            }
+            write_verdict_tsv(tsv.as_deref(), &rows)?;
+            if !quiet {
+                if let Some(path) = &tsv {
+                    println!("wrote {}", path.display());
+                }
+                println!("truth: cached for this corpus ({})", cache_path.display());
+            }
+            return Ok(());
+        }
     }
 
     // 1. Decode once, as luminance.
@@ -154,11 +185,13 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     // 2. Exact pairwise costs, all displacements, in parallel over pairs.
     let pairs = pairwise_costs(&frames);
-    if !quiet {
+    let pairs_line = {
         let decided = pairs.iter().filter(|pair| pair.is_some()).count();
-        println!("pairs: {decided} with a common geometry, {} geometry changes", pairs.len() - 1 - decided);
-    }
-
+        format!(
+            "pairs: {decided} with a common geometry, {} geometry changes",
+            pairs.len() - 1 - decided
+        )
+    };
     // 3. Chain into a page. A tie resolves towards the previous step: on a
     //    repeated page every member is equally consistent, and the capture did
     //    not teleport, so the near one is the honest reading. Magnitude is never
@@ -332,34 +365,28 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     rows.sort_by_key(|row| row.index);
-    // 6. Report.
-    if !quiet {
-        println!(
+    // 6. Report, and cache the verdicts so the next verification pass is free.
+    let summary = vec![
+        pairs_line,
+        format!(
             "runs: {} (largest {largest_run} frames), {uncovered} uncovered page rows (content no frame ever captured)",
             runs_count(&loose)
-        );
-        println!(
+        ),
+        format!(
             "verdicts: {} determinate, {} ambiguous, {} no-consensus, {} inconsistent, {} edge",
             counts[0], counts[1], counts[2], counts[3], counts[4]
-        );
-
-    }
-    if let Some(path) = tsv {
-        let mut text = String::from("index\tpage\tdelta\tverdict\tloo_cost\talternative\tcoverage\n");
-        for row in &rows {
-            text.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\n",
-                row.index,
-                row.page,
-                row.delta,
-                row.verdict.as_str(),
-                row.cost.map(|cost| format!("{cost:.4}")).unwrap_or_else(|| "-".into()),
-                row.alt.map(|alt| alt.to_string()).unwrap_or_else(|| "-".into()),
-                row.coverage,
-            ));
+        ),
+    ];
+    let tsv_rows = verdict_rows_text(&rows);
+    save_verdict_cache(&cache_path, &cache_key, &summary, &tsv_rows);
+    if !quiet {
+        for line in &summary {
+            println!("{line}");
         }
-        std::fs::write(&path, text)?;
-        if !quiet {
+    }
+    write_verdict_tsv(tsv.as_deref(), &tsv_rows)?;
+    if !quiet {
+        if let Some(path) = &tsv {
             println!("wrote {}", path.display());
         }
     }
@@ -643,4 +670,71 @@ fn pairwise_costs(frames: &[Frame]) -> Vec<Option<Pair>> {
         out[index] = Some(pair);
     }
     out
+}
+
+/// The per-frame TSV body (no header) for the report.
+fn verdict_rows_text(rows: &[Row]) -> Vec<String> {
+    rows.iter()
+        .map(|row| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{:.3}",
+                row.index,
+                row.page,
+                row.delta,
+                row.verdict.as_str(),
+                row.cost.map(|cost| format!("{cost:.4}")).unwrap_or_else(|| "-".into()),
+                row.alt.map(|alt| alt.to_string()).unwrap_or_else(|| "-".into()),
+                row.coverage,
+            )
+        })
+        .collect()
+}
+
+fn write_verdict_tsv(path: Option<&Path>, rows: &[String]) -> Result<(), Box<dyn Error>> {
+    let Some(path) = path else { return Ok(()) };
+    let mut text = String::from("index\tpage\tdelta\tverdict\tloo_cost\talternative\tcoverage\n");
+    for row in rows {
+        text.push_str(row);
+        text.push('\n');
+    }
+    std::fs::write(path, text)?;
+    Ok(())
+}
+
+/// Loads `(summary lines, tsv rows)` when the cache matches `key`.
+fn load_verdict_cache(path: &Path, key: &str) -> Option<(Vec<String>, Vec<String>)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != key {
+        return None;
+    }
+    let mut summary = Vec::new();
+    let mut rows = Vec::new();
+    for line in lines {
+        match line.chars().next() {
+            Some('S') => summary.push(line[1..].to_string()),
+            Some('T') => rows.push(line[1..].to_string()),
+            _ => {}
+        }
+    }
+    (!summary.is_empty()).then_some((summary, rows))
+}
+
+fn save_verdict_cache(path: &Path, key: &str, summary: &[String], rows: &[String]) {
+    let mut text = String::new();
+    text.push_str(key);
+    text.push('\n');
+    for line in summary {
+        text.push('S');
+        text.push_str(line);
+        text.push('\n');
+    }
+    for row in rows {
+        text.push('T');
+        text.push_str(row);
+        text.push('\n');
+    }
+    if std::fs::write(path, text).is_err() {
+        eprintln!("truth-frames: could not write {}", path.display());
+    }
 }

@@ -204,11 +204,21 @@ impl CanvasStore {
     ///
     /// Chosen against what a frame actually reads, not against the canvas: the
     /// stitcher touches the previous frame's rectangle (≈0.5 MB on `real-1`)
-    /// and the overlay displays at most one screenful, so a budget a few times
-    /// that never evicts a tile the capture is still using. It is what bounds
-    /// the footprint of a capture that can be arbitrarily long.
+    /// and the overlay displays at most one screenful. Eight frames' worth keeps
+    /// every tile the capture is still using resident with slack for the sweep,
+    /// and it is what bounds the footprint of a capture that can be arbitrarily
+    /// long.
+    ///
+    /// It was four frames (4 MB floor), which is below the working set of a wide
+    /// 4K capture: `real-5-4k` (2 131x835) builds a 30 MB canvas against a 21 MB
+    /// budget, and every frame's read/write cycle crossed it. Measured on
+    /// `replay-frames`: push mean **181 → 2.4 ms**, whole run 180 → 30 s, with
+    /// `Lz4Tiles::unpack` at 66% of the profile before the change. The cost is
+    /// memory: that canvas now stays resident (~30 MB instead of ~9 MB packed)
+    /// until it grows past eight frames' worth. A capture still reaches the same
+    /// bound, only later; `CanvasStore::report` is the measurement.
     pub fn default_budget(frame_bytes: usize) -> usize {
-        (frame_bytes.saturating_mul(4)).max(4 << 20)
+        (frame_bytes.saturating_mul(8)).max(8 << 20)
     }
 
     /// A store for test fixtures that need a canvas without going through the

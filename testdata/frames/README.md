@@ -103,3 +103,21 @@ cargo build --release --bins
 `pipeline-test` / `pipeline-bad` 是合成语料，脚本在 `docs/edge-stitch-design.md` §14 有说明；它们的唯一目的是验证回放工具本身能把「错位」和「歧义」区分开。
 
 `real-long` / `real-scroll` 来自 CDP，重建需要 headless Chrome + `websocket-client`。**注意**：这条路径不经过 niri 合成器，不能用来定阈值（见 `found.md` 教训 20）。
+
+## Ground-truth cache
+
+Both corpus tools cache the answer that depends only on the frames:
+
+* `replay-frames` caches its per-pair exhaustive oracle in
+  `.truth-replay-oracle.cache` (keyed by the corpus contents, `--exact`, and the
+  sampling step);
+* `truth-frames` caches its verdicts and TSV rows in `.truth-truth.cache`
+  (keyed by the corpus contents and `--window`).
+
+The key covers every frame's name, size and mtime, so a rewritten corpus
+invalidates it automatically; `--refresh` recomputes anyway. The files are
+derived, gitignored, and never read by the stitcher or its tests. Measured on
+`real-1`: `truth-frames` 2.18 s → 0.002 s, `real-3` 0.39 s → 0.001 s; the 4K
+corpora take minutes to compute and load instantly afterwards. A stitcher change
+does not invalidate either cache — the standard answer is a property of the
+frames, not of the code under test.

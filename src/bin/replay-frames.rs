@@ -13,7 +13,7 @@
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-use screenshot_rs_rebuild::corpus::{load_frames, load_png, luminance};
+use screenshot_rs_rebuild::corpus::{load_frames, load_png, luminance, truth_cache_path, truth_key};
 use screenshot_rs_rebuild::image::Image;
 use screenshot_rs_rebuild::stitch::{ImageRgbView, PushResult, RawStitcher};
 
@@ -40,18 +40,20 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut save: Option<PathBuf> = None;
     let mut dump_ladder: Option<PathBuf> = None;
     let mut exact = false;
+    let mut refresh = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dir" | "-d" => dir = Some(PathBuf::from(args.next().ok_or("--dir needs a path")?)),
             "--verbose" | "-v" => verbose = true,
             "--exact" => exact = true,
+            "--refresh" => refresh = true,
             "--save" => save = Some(PathBuf::from(args.next().ok_or("--save needs a path")?)),
             "--dump-ladder" => {
                 dump_ladder = Some(PathBuf::from(args.next().ok_or("--dump-ladder needs a directory")?))
             }
             "--help" | "-h" => {
-                println!("replay-frames --dir DIR [--verbose] [--exact] [--save OUT.png] [--dump-ladder DIR]");
+                println!("replay-frames --dir DIR [--verbose] [--exact] [--refresh] [--save OUT.png] [--dump-ladder DIR]");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument: {other}").into()),
@@ -64,6 +66,21 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err(format!("need at least two frames, found {}", frames.len()).into());
     }
     println!("frames: {}", frames.len());
+
+    // The exhaustive oracle depends only on the frames: cache it per corpus so
+    // a before/after verification pass does not pay for it twice. `--exact`
+    // changes the answer, so it is part of the key.
+    let cache_key = truth_key(&dir, "replay-oracle", &[("exact", exact.to_string()), ("step", ORACLE_STEP.to_string())])?;
+    let cache_path = truth_cache_path(&dir, "replay-oracle");
+    let mut oracles: Option<Vec<Option<Oracle>>> = if refresh {
+        None
+    } else {
+        load_oracle_cache(&cache_path, &cache_key, frames.len())
+    };
+    let cached_oracles = oracles.is_some();
+    if !cached_oracles {
+        oracles = Some(Vec::with_capacity(frames.len().saturating_sub(1)));
+    }
 
     let mut stitcher = RawStitcher::new();
     let mut accepted = 0u32;
@@ -116,8 +133,17 @@ fn run() -> Result<(), Box<dyn Error>> {
     for (i, entry) in frames.iter().enumerate().skip(1) {
         let image = load_png(&entry.path)?;
 
-        // Ground truth: exhaustive search between this frame and the last one.
-        let oracle = oracle_delta(&previous, &image, if exact { 1 } else { ORACLE_STEP });
+        // Ground truth: exhaustive search between this frame and the last one,
+        // or the cached answer for this corpus.
+        let oracle = match oracles.as_mut() {
+            Some(cached) if cached_oracles => cached.get(i - 1).cloned().flatten(),
+            Some(computed) => {
+                let oracle = oracle_delta(&previous, &image, if exact { 1 } else { ORACLE_STEP });
+                computed.push(oracle.clone());
+                oracle
+            }
+            None => unreachable!("oracles is filled above"),
+        };
         let oracle_delta = match &oracle {
             Some(o) => o.delta,
             None => {
@@ -285,6 +311,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
 
         previous = image;
+    }
+
+    if !cached_oracles {
+        if let Some(computed) = oracles.as_ref() {
+            save_oracle_cache(&cache_path, &cache_key, computed);
+            println!("oracle: cached for this corpus ({})", cache_path.display());
+        }
     }
 
     // Blend threshold. On the screencopy corpus sharp pairs cost ~0.05 and
@@ -613,6 +646,64 @@ fn split_range(lo: i32, hi: i32, parts: usize) -> Vec<(i32, i32)> {
 }
 
 /// What the exhaustive search concluded about one frame pair.
+/// Loads the oracle cache when it matches `key` and has one record per pair.
+fn load_oracle_cache(path: &Path, key: &str, frames: usize) -> Option<Vec<Option<Oracle>>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != key {
+        return None;
+    }
+    let mut oracles = Vec::with_capacity(frames.saturating_sub(1));
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split('\t');
+        let delta: i32 = fields.next()?.parse().ok()?;
+        let cost: f64 = fields.next()?.parse().ok()?;
+        let ambiguous = fields.next()? == "1";
+        let ties: Vec<i32> = fields
+            .next()?
+            .split(',')
+            .filter(|tie| !tie.is_empty())
+            .map(|tie| tie.parse().ok())
+            .collect::<Option<_>>()?;
+        oracles.push(if delta == i32::MIN {
+            None
+        } else {
+            Some(Oracle { delta, ambiguous, cost, ties })
+        });
+    }
+    (oracles.len() == frames.saturating_sub(1)).then_some(oracles)
+}
+
+/// Writes the oracle cache for `key`, atomically enough for a re-run: the file
+/// is small and a torn cache is rejected by the length check above anyway.
+fn save_oracle_cache(path: &Path, key: &str, oracles: &[Option<Oracle>]) {
+    let mut text = String::with_capacity(oracles.len() * 32);
+    text.push_str(key);
+    text.push('\n');
+    for oracle in oracles {
+        match oracle {
+            Some(oracle) => {
+                let ties: Vec<String> = oracle.ties.iter().map(|tie| tie.to_string()).collect();
+                text.push_str(&format!(
+                    "{}\t{:?}\t{}\t{}\n",
+                    oracle.delta,
+                    oracle.cost,
+                    u8::from(oracle.ambiguous),
+                    ties.join(",")
+                ));
+            }
+            None => text.push_str(&format!("{}\t0.0\t0\t\n", i32::MIN)),
+        }
+    }
+    if std::fs::write(path, text).is_err() {
+        eprintln!("replay-frames: could not write {}", path.display());
+    }
+}
+
+#[derive(Clone)]
 struct Oracle {
     /// Smallest-magnitude displacement that matches as well as the best one.
     delta: i32,
