@@ -86,7 +86,7 @@ preview, plus the caller's conversion):
 | 1280x900 | 3.08 ms | 9% |
 | 1920x1080 | 3.77 ms | 11% |
 | 2560x1440 | 6.62 ms | 20% |
-| 3840x2160 | 14.47 ms | 43% |
+| 3840x2160 | 12.55 ms | 38% |
 
 Real corpora:
 
@@ -220,12 +220,42 @@ The remaining CPU is the descriptor's arithmetic (~26% of a frame), which is
 already vectorised at roughly 1.3 cycles per pixel; the rest of the profile is
 canvas reads, page zeroing for the growing canvas, and the colour check.
 
+## 2026-10-24, third pass: 4K column pooling
+
+At 4K a descriptor bin is 80 px wide (48 bins across 3840), and the per-row bin
+mean was still the descriptor's dominant cost. `BinLayout::pooled_means_into`
+samples one pixel in two per bin and scales the sum back, so the mean keeps the
+sampled pixels' weight. Only 4K takes that path: `EDGE_POOL_MIN_BIN_WIDTH = 64`
+leaves 1080p (40 px bins) and 1440p (53 px) on the exact sum, so their output is
+bit-identical.
+
+| frame | before | after | change |
+|---|---|---|---|
+| 1920x1080 | 3.17 ms | 3.18 ms | — (unpooled) |
+| 3840x2160 | 11.82 ms | 9.86 ms | −17% |
+
+All 59 synthetic 4K frames still place. Two shape rules, both measured:
+
+* **The two bodies must stay monomorphic.** Choosing `step` inside the per-bin
+  loop cost 1080p 3.17 → 4.20 ms: the branch defeated vectorisation of the
+  common path.
+* **Only the across axis is pooled.** The along axis *is* the placement
+  resolution — a one-row shift is the basin — so halving it would move every
+  answer.
+
+Forced-pooling stress test (threshold temporarily 0, i.e. every corpus pooled):
+real-1 204/0, real-3 65/0, real-long 97, lowcontrast-2b 78 all unchanged; only
+`real-2` — the corpus whose blank regions are ambiguous by construction — moved
+(230 → 176 accepted, different chain). That is why the threshold is 4K-only
+rather than applied everywhere.
+
 ## What remains
 
-* **The descriptor's arithmetic — 26%.** `BinLayout::means_into` fused into the
-  conversion row loop. At ~1.3 cycles per pixel it is already vectorised; the
-  only further lever is touching fewer pixels, which changes what the descriptor
-  means and therefore what the gates mean. Not attempted.
+* **The descriptor's arithmetic — 26% at 1080p.** Fused into the conversion row
+  loop and vectorised at ~1.3 cycles per pixel; 4K halves the pixels it reads
+  (column pooling above). At 1080p the only further lever is touching fewer
+  pixels, which changes what the descriptor means and therefore what the gates
+  mean. Not attempted.
 * **`row_rgb_into` — 14%.** BGRA→RGB, 14.5 MB per 1080p frame at ~34 GB/s. The
   floor is that memcpy; the remaining cost is the 4→3 byte stride.
 * **Preview `expand_row` — 11%.** RGB→BGRA for the overlay window, ~14 MB at

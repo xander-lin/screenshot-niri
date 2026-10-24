@@ -330,10 +330,10 @@ seconds-long action.
   verified, and leave the runner-up refuted by the pixels, else the frame is
   refused rather than written at a repeated patch), and thin continuation (the
   overlap carries fewer boundary rows than the `min(3, rows)` floor — a nearly
-  blank page; the placement needs a perfect structural cost, a strictly worse
-  runner-up, pixels agreeing to noise over the whole overlap, and an offset
-  inside the impulse window).
-  `REFUSAL_PATIENCE = 8` governs the border and the frame-rate drop, not the
+  blank page; the placement is searched in the guard band and needs a perfect
+  structural cost, a strictly worse runner-up, pixels agreeing to noise over
+  the whole overlap, and at least half the frame overlapping the previous one).
+  `REFUSAL_PATIENCE = 5` governs the border and the frame-rate drop, not the
   search.
 * **Every acceptance gets a colour verification** against the pixel canvas,
   because the boundary descriptor is colour-blind by design.

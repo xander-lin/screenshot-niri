@@ -105,6 +105,14 @@ const EDGE_MAX_COLOUR_DIFFERENCE: f64 = 30.0;
 /// candidates measured 1.8-7.1 and are refused, which is why the bound sits
 /// below them rather than at the acceptance ceiling.
 const EDGE_THIN_MAX_COLOUR_DIFFERENCE: f64 = 1.0;
+/// Bin width from which the descriptor pools its columns 2:1.
+///
+/// A bin must stay wide enough that a subsample estimates its mean within the
+/// descriptor's own quantisation: at 4K a bin is 80 px, at 1080p 40 px, and
+/// only the former is pooled. Measured on the 4K synthetic page: push p50
+/// 11.82 -> 10.01 ms, all 59 frames still placed. The along axis is never
+/// pooled — one row of error is the placement basin.
+const EDGE_POOL_MIN_BIN_WIDTH: u32 = 64;
 /// Margin at which a high absolute cost is forgiven: the winner is this many
 /// times better than the runner-up, so the match is unmistakable even on
 /// imperfect content.
@@ -195,11 +203,23 @@ impl BinLayout {
     /// values. This is the single definition of the descriptor's evidence: the
     /// two-pass builder and the fused conversion both call it.
     pub(super) fn means_into(&self, line: &[u8], out: &mut [f32]) {
-        // Slice-per-bin with `as_chunks::<3>`: the index form recomputed
-        // `a * 3` and re-checked bounds for every pixel, and this loop is the
-        // largest single cost of a push (descriptor building is ~30% of it, and
-        // this is the descriptor's inner loop). The sum is integer and
-        // order-free, so the result is bit-identical to the old shape.
+        // Two monomorphic bodies rather than a branch per bin: the row loop is
+        // the hot path and a `step` chosen inside it stops the compiler
+        // vectorising the common case (measured: 1080p push 3.17 -> 4.20 ms
+        // when the two were merged).
+        if self.bin_width >= EDGE_POOL_MIN_BIN_WIDTH {
+            self.pooled_means_into(line, out);
+        } else {
+            self.dense_means_into(line, out);
+        }
+    }
+
+    /// Slice-per-bin with `as_chunks::<3>`: the index form recomputed
+    /// `a * 3` and re-checked bounds for every pixel, and this loop is the
+    /// largest single cost of a push (descriptor building is ~30% of it, and
+    /// this is the descriptor's inner loop). The sum is integer and
+    /// order-free, so the result is bit-identical to the old shape.
+    fn dense_means_into(&self, line: &[u8], out: &mut [f32]) {
         let bins = self.bins as usize;
         let mut start = self.body_start as usize * 3;
         for (index, slot) in out.iter_mut().take(bins).enumerate() {
@@ -215,6 +235,36 @@ impl BinLayout {
                     + 29 * u32::from(pixel[2]);
             }
             let count = (end - start) / 3;
+            *slot = if count == 0 {
+                0.0
+            } else {
+                (sum >> 8) as f32 / count as f32
+            };
+            start = end;
+        }
+    }
+
+    /// The 4K form: one pixel in two per bin, scaled back so the mean keeps
+    /// the sampled pixels' weight. Only the *across* axis is pooled — the
+    /// along axis is the placement resolution itself.
+    fn pooled_means_into(&self, line: &[u8], out: &mut [f32]) {
+        let bins = self.bins as usize;
+        let mut start = self.body_start as usize * 3;
+        for (index, slot) in out.iter_mut().take(bins).enumerate() {
+            let end = if index + 1 == bins {
+                self.body_end as usize * 3
+            } else {
+                start + self.bin_width as usize * 3
+            };
+            let mut sum = 0u32;
+            let mut count = 0u32;
+            for pixel in line[start..end].as_chunks::<3>().0.iter().step_by(2) {
+                sum += (77 * u32::from(pixel[0])
+                    + 150 * u32::from(pixel[1])
+                    + 29 * u32::from(pixel[2]))
+                    * 2;
+                count += 1;
+            }
             *slot = if count == 0 {
                 0.0
             } else {
@@ -1589,13 +1639,18 @@ impl WindowedEdgeMatcher {
         &self,
         ladder: &EdgeLadder,
         request: &PlacementRequest<'_>,
-        predicted_top: i32,
-        reach: i32,
+        tie_centre: i32,
     ) -> Option<(i32, f64)> {
+        let pos = self.pos?;
         let canvas = self.canvas.as_ref()?;
         let (bounds_lo, bounds_hi) = self.canvas_bounds(ladder)?;
-        let lo = (predicted_top - reach).max(bounds_lo);
-        let hi = (predicted_top + reach).min(bounds_hi);
+        // The guard band is the honest question for thin evidence too: does
+        // this frame still overlap the previous one? A predicted step narrows
+        // it only for *ties*, not for what may be searched — the same rule the
+        // guard applies, and for the same reason.
+        let radius = self.adjacency_radius(ladder);
+        let lo = (pos - radius).max(bounds_lo);
+        let hi = (pos + radius).min(bounds_hi);
         if lo > hi {
             return None;
         }
@@ -1609,16 +1664,26 @@ impl WindowedEdgeMatcher {
         if costs.len() < 4 {
             return None;
         }
+        // Thin structure is only trustworthy when the frame is *mostly* the
+        // previous frame's content: the one or two readable rows are then the
+        // whole page's evidence, not a coincidence at a far end of the band.
+        // `real-2` measured both faces of this: a +60 step (84% overlap) is
+        // right, a +340 step (11% overlap) on a 286-row periodic section is a
+        // duplicated block. Half the frame is the line between them.
+        let reach = self.frame_rows as i32 / 2;
         // Cost first, then continuity: with thin evidence a repeated page can
         // offer several perfect offsets and only the expected step can tell
         // them apart.
         costs.sort_by(|a, b| {
             a.0.total_cmp(&b.0)
-                .then_with(|| (a.1 - predicted_top).abs().cmp(&(b.1 - predicted_top).abs()))
+                .then_with(|| (a.1 - tie_centre).abs().cmp(&(b.1 - tie_centre).abs()))
         });
         let (best_cost, best_top, _) = costs[0];
         // A fact, not a fit.
         if best_cost > 0.0 {
+            return None;
+        }
+        if (best_top - pos).abs() > reach {
             return None;
         }
         let basin = self.basin_rows();
@@ -1879,12 +1944,8 @@ impl PlacementEngine for WindowedEdgeMatcher {
         // floor (a nearly blank page). A perfect, pixel-exact, strictly unique
         // answer near the predicted step is still an answer; see
         // `thin_continuation`.
-        if impulse_reach > 0 {
-            if let Some((top, cost)) =
-                self.thin_continuation(&ladder, request, predicted_top, impulse_reach)
-            {
-                return self.accept(request, ladder, top, cost);
-            }
+        if let Some((top, cost)) = self.thin_continuation(&ladder, request, predicted_top) {
+            return self.accept(request, ladder, top, cost);
         }
 
         // Stage 5 — the frame overlaps the canvas, but nothing in it matches
@@ -3379,13 +3440,26 @@ mod tests {
             "a thin match the pixels do not confirm must be refused"
         );
 
-        // The expected step is part of the evidence: with nothing moving last
-        // time the prediction does not reach 60 rows, and thin structure cannot
-        // justify the leap on its own.
+        // The prediction is not part of the requirement: thin evidence is
+        // judged by the guard band (does the frame still overlap?) and by the
+        // pixels, so a capture that paused before this step still places it.
         let (mut engine, req) = thin_setup(&first, &second, rect, 0);
         assert!(
-            matches!(engine.place(&req), EngineDecision::Reject { .. }),
-            "thin evidence without a step to corroborate it must be refused"
+            matches!(engine.place(&req), EngineDecision::Place { .. }),
+            "thin evidence does not need a predicted step"
+        );
+
+        // What it does need is a frame that is mostly the previous frame's
+        // content: the pixel corroboration has to cover half the frame. A step
+        // of 80 rows on a 120-row frame leaves a third of it, and the thin path
+        // refuses it however perfect the sliver is.
+        let far = sparse_page_frame(180, height, (260, 320), 0);
+        let (engine, req) = thin_setup(&first, &far, rect, 80);
+        let ladder =
+            EdgeLadder::from_source(&far, EdgeLadder::session_gain(&far)).unwrap();
+        assert!(
+            engine.thin_continuation(&ladder, &req, 80).is_none(),
+            "thin evidence needs most of the frame to overlap"
         );
 
         // Two identical edges a step apart: the descriptor keeps |dL/dy| and

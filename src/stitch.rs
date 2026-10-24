@@ -133,9 +133,11 @@ const NOMATCH_RECOVERY_CLEAN_MATCH_SCORE: f64 = 0.02;
 ///
 /// One unplaceable frame is not evidence that the content stopped overlapping.
 /// The border turns red only once the failure has repeated this many times in a
-/// row, which at 30 fps is about a quarter of a second — long enough to ride out
-/// a rendering seam, short enough that a real jump is still reported promptly.
-pub(super) const REFUSAL_PATIENCE: u32 = 8;
+/// row — five frames at 30 fps is about 170 ms, long enough to ride out a
+/// rendering seam, short enough that a real jump is reported while the user is
+/// still scrolling. (It was 8; the wait is a UI promise, not a search budget,
+/// and the user asked for the red border to arrive sooner.)
+pub(super) const REFUSAL_PATIENCE: u32 = 5;
 
 #[cfg(feature = "stitch-legacy")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
