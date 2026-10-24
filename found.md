@@ -490,6 +490,19 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
   the first supported generation in the README, and never claim `arch=('x86_64')`
   compatibility for a v3 binary without that note.
 
+### 43. 与外部实现对比时的两个判据错误：并行采集的计时，和按列名猜语义的落位表
+
+- **Context**：用户要求把当前引擎与 DMS 再对比一次。复测产出 `docs/dms-stitch-comparison.md` §16 与常驻判定脚本 `tools/dms-cmp/analyze.py`。过程中犯了两类错，都在结果里留下了可察觉的痕迹。
+- **错误 1：计时与被测负载并行采集**。为了"省时间"，DMS 批跑与本实现的 `replay-frames` 计时链同时进行（8 核机）。DMS real-1 均值 0.320 ms；空载复测 **0.185 ms**，差 1.8×。若直接引用，会把"性能差距已消除"的结论写成"差距 1.8× 消除不彻底"。
+- **错误 2：判读 `placements.tsv` 时按列名猜语义**。harness 把 seam 行记成 `placed=false`（`pushFrame` 失败转 `seamAppend` 时 `placed` 未置位），但 `seamAppend` **确实推进了 anchor**。第一版分析脚本在"未放置就沿用旧 anchor"与"seam 后按当前 anchor"之间各取一半，把 seam 之后正确重放的 8 帧误判成 CONTRA（ok 51/CONTRA 22 ↔ ok 43/CONTRA 30，同一份数据）。更深层：进入 seam 的前帧必是拒绝帧，**拒绝帧的 anchor 不再描述该帧内容**，其后任何"相邻对"的 anchor 差都跨了多帧位移，拿单对真值去判就是自欺。
+- **Correction**：①计时全部作废，空载顺序重测两侧；②判定脚本引入显式锚链状态（`anchored`）：放置/seam 重新锚定，dup 在前帧锚定时保持，拒绝帧断链；断链后的重新锚定放置**单列计数，不判**；③把"seam 行 placed=false 但 anchor 前进"写进 `tools/dms-cmp/README.md`，判读以状态机为准。
+- **实测（修正后）**：real-1 DMS ok 51 / CONTRA 22 / STALE 15 / DUP-DROP 296 / 断链放置 13，严格对像素丢失 48.7%；8 个真实语料中 DMS 在 6 个上静默丢失 37–100%。修正前误判的 8 帧全是 seam 后的正确重放。
+- **Prevention**：
+  1. **计时采集必须空载顺序**；并行跑出的数字即使"看起来合理"也整体作废，不挑着信。
+  2. 判读外部工具的转储文件前，先从它的**生产者**（状态机/写出代码）推导每一列的真实语义——`placed=false` 且 anchor 前进是本例；列名是标签不是不变量。
+  3. 用相邻对真值判定时，先问"参考点的锚还描述参考帧的内容吗"；拒绝/seam/编辑都会断链，断链后的第一次放置不可判，**计数而不是猜**。
+  4. 对比脚本要进仓库（`tools/dms-cmp/analyze.py`）而不是留在 /tmp——本次第一版的两个错误若不可回放，就无法被 review 出来。
+
 ## Verification Memory
 
 - **Release 0.2.1 (2026-10-24)**: niri HEAD `3076758`, tag `v0.2.1-niri`;
