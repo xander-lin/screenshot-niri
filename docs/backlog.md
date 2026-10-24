@@ -1,126 +1,127 @@
 # Improvement backlog
 
-A durable, prioritised list of what is still worth changing. It exists so that a
-context reset does not lose the findings; every item names the evidence and the
-next concrete step. Keep it current: move finished items to the "done" section
-with the commit or measurement that closed them.
+A durable, prioritised list of what is still worth changing. It exists so a
+context reset cannot lose the findings; every item names the evidence and the
+next concrete step. Move finished items to "Delivered" with the commit or
+measurement that closed them.
 
-## Delivered (context, so it is not re-opened)
+## Delivered (do not re-open)
 
 - **Normal-mode drag residue on fractional scale** — the user's "4K striping"
-  report was this, not stitched output: normal mode, *before the first release*,
-  while the box shrinks under fast pointer motion. Fixed by the dirty-band
-  outset in `changed_selection_rects` (found.md lesson 36); user-confirmed gone
-  on 0.1.0-40.
-- **Low-contrast band pages** — magnitude-only descriptor + absolute colour
-  ceiling accepted a one-period tone swap; now `boundary_directions_agree` on
-  thin evidence. Tests: `a_continuous_low_contrast_band_pattern_stitches`,
+  was this, not stitched output: normal mode, *before the first release*, while
+  the box shrinks under fast pointer motion. Fixed by the dirty-band outset in
+  `changed_selection_rects` (found.md lesson 36); user-confirmed on 0.1.0-40.
+- **Low-contrast band pages** — the magnitude-only descriptor accepted a
+  one-period tone swap; `boundary_directions_agree` on thin evidence fixes it.
+  Tests: `a_continuous_low_contrast_band_pattern_stitches`,
   `a_band_page_with_one_readable_edge_still_stitches`.
-- **Two parallel passes** — fused conversion+descriptor and scoring windows
-  (`src/stitch/parallel.rs`), bit-identical, four helpers.
-- **4K-wide tile thrash** — `CanvasStore::default_budget` 4× → 8× a frame:
-  `real-5-4k` push mean 181 → 2.56 ms, replay 180 → 30 s, canvases unchanged.
-- **Normal mode `0` = all screens**; **`R` debug canvas view**.
-- **Verification speed** — one test target, `[profile.test] opt-level = 2`,
-  content-keyed truth caches (`--refresh`), `stitch-bench --dir` now uses the
-  manifest's offsets/direction.
+- **Parallel passes** — fused conversion+descriptor, scoring windows, and the
+  overlay preview draw (`draw_preview_on_overlay_with_threads`: 4K 6.29 → 2.40 ms
+  1:1, 4.27 → 1.90 ms scaled), all with pixel-identity tests.
+- **4K-wide tile thrash** — budget 4× → 8× a frame (8 MB floor), then raised on a
+  width change (`raise_budget_for`). `real-5-4k` push mean 181 → 2.50 ms, replay
+  180 → 30 s, canvas byte-identical. `stitch-bench` prints `memory_report`.
+- **Normal-mode `0` = every screen**; **`R` debug canvas view**.
+- **Verification speed** — one test target (main.rs links the library),
+  `[profile.test] opt-level = 2` (26.7 → 1.36 s warm), content-keyed truth caches
+  (`--refresh`), `truth_key_for`, `stitch-bench --dir` uses manifest
+  offsets/direction, corpus PNG loader shared.
+- **Store write path** — `write_spans` copies a span at a time. Measured: no
+  change on `real-5` (the write is not the bottleneck); kept for simplicity.
 
-## Remaining after the preview-draw pass
+## P0 — next
 
-### 1. Canvas window → preview image (still single-threaded)
+1. **Canvas window → preview image (last single-threaded per-frame pass).**
+   `image_from_stitched_window_reusing` (row loop + `expand_row`) is 2.9 ms at
+   3840x2160 and 0.39 ms on `real-5-4k`. Blocked on `CanvasStore`'s `RefCell`:
+   every read mutates the working set (`touch_tile`), so rows cannot be split.
+   Next step: a concurrency-safe read path — unpack under a write lock and
+   convert outside it, or a per-tile read handle. A plain `Mutex<Vec<Tile>>`
+   would serialise the lz4 decode and is not worth it. Measure after.
 
-`image_from_stitched_window_reusing` (row loop calling `store.with_row`, then
-`expand_row`) costs 2.9 ms at 3840x2160 in `stitch-bench` and 0.39 ms on
-`real-5-4k`. Its blocker is `CanvasStore`'s `RefCell`: every read mutates the
-working set through `touch_tile`, so rows cannot be split without a
-concurrency-safe read path (unpack under a write lock and convert outside it, or
-a per-tile read handle; a plain `Mutex<Vec<Tile>>` would serialise the lz4
-decode). **The overlay preview draw itself is done** — see the delivered list.
+2. **Refusal-path tail on wide 4K.** `real-5-4k` push p95 12.1 ms / max 14.7 ms
+   (a refused frame scans the whole anchor window). Fits 33 ms today, but a
+   3840-wide selection with dense content could exceed it. Levers: shorter anchor
+   ring ladder, cap the anchor window on very tall canvases, or drop to the
+   warning frame rate sooner (the border already does after 5 refusals). Measure
+   before changing gates.
 
-**Delivered in this pass**: the overlay preview draw splits its destination rows
-across four helpers (4K: 6.29 → 2.40 ms 1:1, 4.27 → 1.90 ms scaled), with a
-pixel-identity test and a full-hole early-out.
-
-### 2. `replay-frames` reprojection check: 26 s of the 30 s 4K replay
-
-`locate_in_canvas` scans every canvas row for every accepted frame because the
-engine's recorded row is not trustworthy (found.md lesson 34). This is the
-*independent measurement*, so it is not cacheable across stitcher changes.
-
-Options, in order of preference:
-1. Leave it as the gold standard and accept 30 s on `real-5-4k` (it is one run
-   per verification pass, and the corpora can be run in parallel).
-2. Add an opt-in `--fast` that searches ±2 frame heights around the recorded row
-   first and falls back to the full scan when the local best is poor. It can
-   differ from the gold standard on repeated content, so it must be documented
-   as a *different* verdict, never the default.
-
-### 3. Overlay commit/damage cost at 4K
-
-Not measured offline. The live path recomposites the preview then the border on
-every redraw (`draw_live_foreground`). At 3840x2160 that is up to 8 MP written
-per accepted frame. If a live profile shows it, the border could be damaged
-separately from the preview, and the preview damage could be the changed rows
-only.
+3. **A single verification runner.** Verification is still a shell loop over
+   corpora with counts read by eye. Wanted: one command that runs
+   `replay-frames` for every corpus, compares accepted / MISPLACED / bands /
+   uncovered against the recorded baselines, runs them **in parallel** (each
+   replay is internally parallel), and exits non-zero on any mismatch. Baselines
+   live in AGENTS.md and testdata/frames/README.md today; move them into the
+   runner and have the docs point at it.
 
 ## P1 — measured, smaller, or risky
 
-### 4. `CanvasStore::write_spans` per-pixel loop
+4. **`replay-frames` reprojection check** — 26 s of the 30 s `real-5-4k` replay.
+   It locates each accepted frame's content in the canvas the stitcher just
+   built, so it is not cacheable across stitcher changes (it *is* the independent
+   measurement). Options: leave it; add an opt-in `--fast` (local search ±2 frame
+   heights around the recorded row, full scan as fallback) documented as a
+   different verdict; or run corpora concurrently.
 
-`src/stitch/store.rs` copies three bytes per column with bounds checks per
-pixel. A span copy (`copy_from_slice` per `(start,end)`, clamped once) is
-semantically identical for valid spans and should cut the write path at 4K
-(5.3 MB per accepted frame on `real-5`). Measure with `stitch-bench`; the store
-tests (`a_write_into_a_packed_tile…`, `a_written_row_reads_back_exactly`) pin
-the behaviour.
+5. **Overlay commit/damage cost** — the preview *draw* is now measured and
+   parallel; the commit and damage path at 4K is not in any benchmark. Measure in
+   a live session (or a probe that exercises `render_live_overlays` on a 4K
+   buffer). If material, damage only the changed rows/border.
 
-### 5. `truth-frames` consensus stage: two `walk` passes per candidate
+6. **`truth-frames` consensus** — `Mosaic::loo_cost` walks each frame twice (fit
+   gain/offset, then median). Fusing needs an approximate gain first. Verdicts
+   are cached, so only a first run on a new corpus pays it; low value.
 
-`Mosaic::loo_cost` walks the frame twice (fit gain/offset, then median). Fusing
-would need an approximate gain first. Only the first run pays it now (verdicts
-are cached), so this is low value; do it only if truth-frames is used on new
-corpora often.
+7. **`capture-frames` writes `session.json` every frame** — O(n²) bytes (813
+   frames ≈ 10 MB). Flush every N frames + on exit if corpora get much longer.
 
-### 6. `capture-frames` rewrites `session.json` every frame
+8. **Preview draw thread spawn per redraw** — four scoped spawns per accepted
+   frame (~0.1 ms). A persistent pool would remove it; not worth the lifecycle
+   until something else needs a pool.
 
-O(n²) bytes written (813 frames ≈ 10 MB). Negligible today; if corpora get much
-longer, flush every N frames plus on exit.
+9. **Code hygiene** — `draw_preview_rows` takes 16 arguments; a small context
+   struct would read better. No behaviour change, low priority.
 
-### 7. 1.2× corpora and the 45 band flags on `real-4-4k`
+## P2 — known limitations, documented, not scheduled
 
-A 1-logical-px scroll is 1.2 physical px, so integer-row matching cannot align
-every step; `real-4-4k` records 45 displaced-band flags with 0 far placements.
-This is a property of fractional scaling, not a defect in the current model.
-Sub-pixel/phase matching is the only real fix and would invalidate every gate
-calibration; do not attempt without a concrete user report that needs it.
-
-## P2 — known limitations, documented
-
-- **Mirrored/clone outputs**: `rect_spans_outputs` sees every rectangle as
-  spanning, so long capture refuses on a clone pair. Normal mode composites
-  correctly.
-- **A capture that starts on a featureless screen**: the scroll through it is
-  unobservable; the engine refuses rather than guessing
+- **Mirrored/clone outputs** make long capture refuse (every rectangle spans).
+- **A capture that starts on a featureless screen** cannot know how far it
+  scrolled; refused rather than guessed
   (`a_capture_that_starts_on_a_featureless_screen_is_not_guessed`).
-- **Sticky headers/footers** are out of scope by product decision (use `E`).
+- **Sticky headers/footers** are out of scope (product decision; use `E`).
+- **1.2× fractional scale** — a 1-logical-px scroll is 1.2 physical px, so
+  integer-row matching cannot align every step; `real-4-4k` records 45 displaced
+  band flags with 0 far placements. Sub-pixel/phase matching would invalidate
+  every gate calibration; do not attempt without a concrete user report.
 - **`stitch-bench --synthetic` has no geometry changes** by construction; use
-  `--dir` with a real corpus for the production path.
+  `--dir` for the production path.
+
+## Pending real-machine confirmation
+
+- Band-pattern page (the user's real page) stitches through thin evidence.
+- `0` in normal mode saves one image covering every screen.
+- `R` shows the stitched canvas in the box (amber border, capture paused).
+- 4K long capture: preview follows the scroll; per-frame UI time down.
+- Normal-mode drag with a shrinking box on the fractional-scale output: no
+  residue (user-confirmed on 0.1.0-40; re-check after later changes).
 
 ## Measurement debt
 
-- The overlay draw and commit are only measurable in a live session; a probe
-  that renders one 4K frame into a buffer and times `draw_preview_on_overlay`
-  would make item 1/3 decidable offline.
-- `stitch-bench` reports push and canvas→preview conversion, not the overlay
-  draw. Say which one a number covers when quoting it.
+- The overlay draw was measured with an in-module probe (removed); re-measuring
+  means re-adding a timing test temporarily or tracing a live session. The
+  remaining timing test compares pixels only.
+- `stitch-bench` reports push, canvas→window conversion and the final canvas
+  footprint; it does **not** include the overlay draw, commit or Wayland
+  round-trips. Say which one a number covers when quoting it (some older numbers
+  in `docs/performance.md` predate the manifest-offset fix and are labelled).
 
-## Reproduce the current baselines
+## Reproduce the baselines
 
 ```
-cargo test                     # 257 tests, ~1.3 s warm
+cargo test                                   # 258 tests, ~1.3 s warm
 ./target/release/replay-frames --dir testdata/frames/real-1
-./target/release/replay-frames --dir testdata/frames/real-5-4k   # 30 s
-./target/release/stitch-bench --dir testdata/frames/real-5-4k     # push p50 0.89 ms
+./target/release/replay-frames --dir testdata/frames/real-5-4k   # ~30 s
+./target/release/stitch-bench --dir testdata/frames/real-5-4k     # push p50 0.86 ms
 ```
 
 Expected acceptance counts are in `AGENTS.md` and

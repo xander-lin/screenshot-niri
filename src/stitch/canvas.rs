@@ -512,6 +512,10 @@ fn append_frame_at_position_with_overlap_mode(
         stitched.store.ensure_top(0);
         stitched.store.ensure_bottom(output_height as i32);
     } else {
+        // A wider frame is a wider working set: the store's budget was decided
+        // from the first frame, and packing a 4x wider canvas against it costs
+        // more than the memory it saves (measured on `real-5-4k`).
+        stitched.store.raise_budget_for(frame.width, frame.height);
         reflow_store(
             stitched,
             output_width,

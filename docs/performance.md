@@ -322,7 +322,18 @@ every sweep packed tiles the next frame immediately unpacked.
 
 The budget is now eight frames' worth (8 MB floor) with the reasoning written on
 the constant: the working set is the previous frame's rectangle plus one
-screenful of preview, and eight frames leaves slack for the sweep. Measured on
+screenful of preview, and eight frames leaves slack for the sweep. A selection
+that *widens* raises it too (`raise_budget_for` on the reflow path), because
+`real-5-4k` starts at 499 px (budget 10 MB) and grows to 2131 px — the old
+budget then packed a 29 MB canvas every frame. `stitch-bench` now prints the
+finished canvas footprint (`memory_report`), which is how this is measured:
+
+| corpus | logical | resident | packed |
+|---|---|---|---|
+| `real-1` (644x254) | 15.8 MB | 7.1 MB | 0.4 MB |
+| `real-long` | 33.4 MB | 12.8 MB | 1.8 MB |
+| `real-5-4k` (starts 499, grows to 2131) | 28.9 MB | 28.9 MB | 0.0 MB |
+ Measured on
 the same corpus: push mean **181 → 2.4 ms** (p50 5.87 → **0.94 ms** in
 `stitch-bench`), preview 1.83 → 0.29 ms, the whole replay 180 → 30 s, and 26 s
 of those 30 are the independent reprojection check. Canvases are byte-identical
@@ -373,12 +384,19 @@ threads — the full-screen-box redraw paints nothing and must not pay a fan-out
 * **`CanvasStore::pixel` / `touch_tile` — canvas reads.** `pixel` is per-pixel
   and `touch_tile` unpacks cold tiles; both are on the canvas read path, which
   the engine's colour verification and the duplicate check use.
-* **4K at 30 fps is not reachable.** The scaling is linear in frame area
-  (~5.9 ns/px before this pass), so 3840x2160 lands at roughly 4x the 1080p
-  cost. If 4K is a target, the right lever is the frame-rate cap scaled by frame
-  area — not further constant-factor work. Measured 4K numbers are absent
-  because the synthetic page does not produce a dense enough descriptor at that
-  size; a real 4K capture is needed to state one.
+* **4K at 30 fps is reachable now.** 3840x2160 measures 6.0 ms push + 3.0 ms
+  preview (9.1 ms, 27% of the 33.3 ms budget) and `real-5-4k` is 0.86 ms p50
+  after the working-set fix. The old claim that 4K was out of reach was written
+  before the parallel passes and before the tile budget matched the working set.
+* **The refusal-path tail** is now the largest per-frame cost on a wide 4K
+  canvas: `real-5-4k` push p95 is 12.1 ms (max 14.7) because a refused frame
+  scans the whole anchor window. It fits the budget, but a 3840-wide selection
+  with dense content could exceed it. Levers: a shorter anchor ring ladder, an
+  earlier frame-rate drop (the border already drops to 5 fps), or a cap on the
+  anchor window for very tall canvases. Not attempted — measure first.
+* **Canvas window → preview image** (2.9 ms at 3840x2160) is the last
+  single-threaded per-frame pass; it is blocked on `CanvasStore`'s `RefCell`
+  (every read mutates the working set). See `docs/backlog.md`.
 
 ## Dependency freshness
 

@@ -345,6 +345,18 @@ impl CanvasStore {
         self.origin_row += delta;
     }
 
+    /// Raises the budget to cover a frame of this geometry, never lowers it.
+    ///
+    /// The budget is decided once from the first frame, but a long capture's
+    /// selection can widen: `real-5-4k` starts at 499x835 (budget 10 MB) and
+    /// grows to 2131x835, where the canvas is 29 MB and the old budget packs
+    /// every frame's working set. Raising it on the geometry change keeps the
+    /// working set resident; the cap still exists, it just follows the frame.
+    pub(super) fn raise_budget_for(&mut self, width: u32, height: u32) {
+        let frame_bytes = width as usize * 3 * height as usize;
+        self.budget = self.budget.max(Self::default_budget(frame_bytes));
+    }
+
     /// Discards everything and starts over at `width`/`stride`, which is what a
     /// width change needs: the row length changes, so no band survives.
     pub(super) fn rebuild(&mut self, width: u32, stride: u32, row: i32) {

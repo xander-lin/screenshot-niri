@@ -35,8 +35,8 @@ use std::time::Instant;
 
 use screenshot_rs_rebuild::image::Image;
 use screenshot_rs_rebuild::stitch::{
-    image_from_stitched_window_reusing, CanvasWindow, FrameScreenOffset, ImageRgbView, PushResult,
-    RawStitcher,
+    image_from_stitched_window_reusing, CanvasMemoryReport, CanvasWindow, FrameScreenOffset,
+    ImageRgbView, PushResult, RawStitcher,
 };
 use screenshot_rs_rebuild::wayland::selection::LongDirection;
 use wayland_client::protocol::wl_shm::Format;
@@ -177,6 +177,8 @@ struct Report {
     /// The worst frame after the first, which is the steady state a long
     /// capture actually runs in: the first preview has to allocate its buffer.
     steady_allocated: usize,
+    /// The finished canvas's footprint: the tile budget is chosen against it.
+    canvas: Option<CanvasMemoryReport>,
     steady_allocations: usize,
     frames_measured: usize,
 }
@@ -201,6 +203,7 @@ fn measure(frames: &[BenchFrame], with_preview: bool) -> Result<Report, Box<dyn 
         worst_allocations: 0,
         steady_allocated: 0,
         steady_allocations: 0,
+        canvas: None,
         frames_measured: 0,
     };
     for frame in &frames[1..] {
@@ -259,6 +262,7 @@ fn measure(frames: &[BenchFrame], with_preview: bool) -> Result<Report, Box<dyn 
             report.steady_allocations = report.steady_allocations.max(allocations);
         }
     }
+    report.canvas = stitcher.stitched().map(|stitched| stitched.memory_report());
     Ok(report)
 }
 
@@ -308,6 +312,16 @@ fn summarize(label: &str, mut report: Report) {
         total,
         total / 33.3 * 100.0,
     );
+    if let Some(canvas) = report.canvas {
+        let mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+        println!(
+            "  canvas  logical {:5.1} MB  resident {:5.1} MB  packed {:5.1} MB  ({})",
+            mb(canvas.logical_bytes),
+            mb(canvas.resident_bytes),
+            mb(canvas.packed_bytes),
+            canvas.codec,
+        );
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

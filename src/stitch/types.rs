@@ -251,7 +251,10 @@ impl StitchedFrame {
     }
 
     /// What the canvas costs right now, in bytes.
-    #[allow(dead_code)] // the tile budget is documented against this report
+    ///
+    /// `stitch-bench` prints it after a corpus run: the tile budget is chosen
+    /// against this, so it must be measurable with the real workload rather
+    /// than only asserted in a unit test.
     pub fn memory_report(&self) -> CanvasMemoryReport {
         self.store.report()
     }

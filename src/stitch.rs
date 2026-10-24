@@ -70,6 +70,7 @@ use rgb::{
 pub use canvas::{
     image_from_stitched_frame, image_from_stitched_window_reusing, CanvasWindow,
 };
+pub use store::CanvasMemoryReport;
 use canvas::crop_rgb_frame_if_needed;
 #[allow(unused_imports)]
 pub use hash::{
