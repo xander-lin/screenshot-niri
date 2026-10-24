@@ -1,0 +1,749 @@
+{
+ "selection": {
+  "x": 0,
+  "y": 0,
+  "width": 644,
+  "height": 254
+ },
+ "region": {
+  "output": 1,
+  "x": 0,
+  "y": 0,
+  "width": 644,
+  "height": 254
+ },
+ "fps": 30,
+ "outputs": [
+  {
+   "name": 1,
+   "x": 0,
+   "y": 0,
+   "width": 644,
+   "height": 254,
+   "scale": 1
+  }
+ ],
+ "frames": [
+  {
+   "file": "frame-0000.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0001.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0002.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0003.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0004.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0005.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0006.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0007.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0008.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0009.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0010.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0011.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0012.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0013.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0014.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0015.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0016.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0017.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0018.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0019.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0020.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0021.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0022.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0023.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0024.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0025.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0026.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0027.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0028.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0029.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0030.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0031.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0032.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0033.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0034.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0035.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0036.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0037.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0038.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0039.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0040.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0041.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0042.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0043.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0044.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0045.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0046.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0047.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0048.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0049.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0050.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0051.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0052.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0053.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0054.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0055.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0056.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0057.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0058.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0059.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0060.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0061.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0062.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0063.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0064.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0065.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0066.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0067.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0068.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0069.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0070.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0071.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0072.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0073.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0074.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0075.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0076.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0077.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0078.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0079.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0080.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0081.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0082.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0083.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0084.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0085.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0086.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0087.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0088.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0089.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0090.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0091.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0092.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0093.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0094.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0095.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0096.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0097.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0098.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0099.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0100.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0101.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0102.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0103.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0104.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0105.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0106.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0107.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0108.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0109.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0110.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0111.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0112.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0113.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0114.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0115.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0116.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0117.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0118.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  },
+  {
+   "file": "frame-0119.png",
+   "width": 644,
+   "height": 254,
+   "direction": "down"
+  }
+ ],
+ "note": "generated: alternating grays 128/130, random runs 12-48px"
+}

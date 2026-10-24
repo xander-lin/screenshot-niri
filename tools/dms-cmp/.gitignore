@@ -1,0 +1,6 @@
+# DMS 源码（构建时下载，见 README）与构建产物
+stitch.go
+dms.tar.gz
+cmp
+placements.tsv
+dms_canvas.png
