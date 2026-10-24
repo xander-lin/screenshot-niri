@@ -446,6 +446,8 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
 
 ## Verification Memory
 
+- **Local install 0.1.0-45 (2026-10-24)**: HEAD `5edd125` (geometry-edit overlap scored through views instead of two 5 MB copies; `stitch-bench` prints the breakdown of all five slowest frames; the ad-hoc geometry stage trace removed) packaged with the local recipe, pkgrel 45, installed over 0.1.0-44. `makepkg` with `check()` passed (260 tests), `pacman -Qkk` reports 0 altered files (11 total), installed `/usr/bin/screenshot` sha256 `90699b9f…`. Per edit the overlap score fell from ~6 ms to 0.06-0.52 ms and the worst frame allocation 34.6 → 31.3 MB; all 11 corpora unchanged. Remaining edit cost (reflow/commit/reseed) recorded in `docs/backlog.md` as measured-but-not-worth-chasing.
+
 - **Local install 0.1.0-44 (2026-10-24)**: HEAD `206a1f1` (preview window conversion on up to four helpers via `CanvasStore::with_resident_rows`) packaged with the local recipe, pkgrel 44, installed over 0.1.0-43. `makepkg` with `check()` passed (260 tests), `pacman -Qkk` reports 0 altered files (11 total), installed `/usr/bin/screenshot` sha256 `2c5efe0c…`. Preview: 3840x2160 2.9 → 2.0 ms, `real-5-4k` 0.36 → 0.24 ms, all 11 corpora unchanged. Awaiting a real-machine 4K long capture (preview + axis fixes should both show as a steadier UI thread).
 
 
