@@ -82,47 +82,35 @@ fn reset_allocation_counters() {
 // Inputs
 // ---------------------------------------------------------------------------
 
-fn load_png(path: &Path) -> Result<Image, Box<dyn std::error::Error>> {
-    let file = std::fs::File::open(path)?;
-    let decoder = png::Decoder::new(std::io::BufReader::new(file));
-    let mut reader = decoder.read_info()?;
-    let mut buffer = vec![0; reader.output_buffer_size().ok_or("PNG reports no output size")?];
-    let info = reader.next_frame(&mut buffer)?;
-    let (width, height) = (info.width, info.height);
-    let channels = match info.color_type {
-        png::ColorType::Rgba => 4,
-        png::ColorType::Rgb => 3,
-        other => return Err(format!("unexpected PNG colour type {other:?}").into()),
-    };
-    let mut data = vec![0u8; (width as usize) * (height as usize) * 4];
-    for pixel in 0..(width as usize) * (height as usize) {
-        let source = pixel * channels;
-        // The stitcher takes ARGB8888, whose memory order is B, G, R, X.
-        data[pixel * 4] = buffer[source + 2];
-        data[pixel * 4 + 1] = buffer[source + 1];
-        data[pixel * 4 + 2] = buffer[source];
-        data[pixel * 4 + 3] = 255;
-    }
-    Ok(Image {
-        width,
-        height,
-        stride: width * 4,
-        format: Format::Argb8888,
-        data,
-    })
+/// One frame with the geometry the production path would give it.
+struct BenchFrame {
+    image: Image,
+    offset: FrameScreenOffset,
+    direction: Option<LongDirection>,
 }
 
-fn corpus(dir: &Path) -> Result<Vec<Image>, Box<dyn std::error::Error>> {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|extension| extension == "png"))
-        .collect();
-    paths.sort();
-    if paths.len() < 2 {
-        return Err(format!("need at least two frames in {}, found {}", dir.display(), paths.len()).into());
+fn corpus(dir: &Path) -> Result<Vec<BenchFrame>, Box<dyn std::error::Error>> {
+    // The manifest is the authority on each frame's screen offset and direction
+    // hint — exactly what `app` passes to `push_frame_with_offset`. This tool
+    // used to feed `(0, 0)` and `Down` for every frame, which is a different
+    // workload: with a constant offset the stitcher never runs the geometry
+    // path, and the number it reported was not the number a capture pays.
+    let entries = screenshot_rs_rebuild::corpus::load_frames(dir)?;
+    if entries.len() < 2 {
+        return Err(format!("need at least two frames in {}, found {}", dir.display(), entries.len()).into());
     }
     // Decoded up front so PNG decoding is never attributed to the stitcher.
-    paths.iter().map(|path| load_png(path)).collect()
+    let frames = entries
+        .iter()
+        .map(|entry| {
+            Ok(BenchFrame {
+                image: screenshot_rs_rebuild::corpus::load_png(&entry.path)?,
+                offset: entry.offset,
+                direction: entry.direction,
+            })
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    Ok(frames)
 }
 
 /// A deterministic scrolling page, cropped into frames.
@@ -193,14 +181,14 @@ struct Report {
     frames_measured: usize,
 }
 
-fn measure(frames: &[Image], with_preview: bool) -> Result<Report, Box<dyn std::error::Error>> {
+fn measure(frames: &[BenchFrame], with_preview: bool) -> Result<Report, Box<dyn std::error::Error>> {
     let mut stitcher = RawStitcher::new();
-    let first = ImageRgbView::new(&frames[0])?;
+    let first = ImageRgbView::new(&frames[0].image)?;
     stitcher.push_frame_with_offset(
         &first,
         &first,
-        Some(LongDirection::Down),
-        FrameScreenOffset { x: 0, y: 0 },
+        frames[0].direction,
+        frames[0].offset,
     )?;
 
     // Carried across frames exactly as `app` carries it.
@@ -216,14 +204,14 @@ fn measure(frames: &[Image], with_preview: bool) -> Result<Report, Box<dyn std::
         frames_measured: 0,
     };
     for frame in &frames[1..] {
-        let view = ImageRgbView::new(frame)?;
+        let view = ImageRgbView::new(&frame.image)?;
         reset_allocation_counters();
         let started = Instant::now();
         let outcome = stitcher.push_frame_with_offset(
             &view,
             &view,
-            Some(LongDirection::Down),
-            FrameScreenOffset { x: 0, y: 0 },
+            frame.direction,
+            frame.offset,
         )?;
         report.push.push(started.elapsed().as_secs_f64() * 1e3);
         let allocated = ALLOCATED.load(Ordering::Relaxed);
@@ -252,8 +240,8 @@ fn measure(frames: &[Image], with_preview: bool) -> Result<Report, Box<dyn std::
             stitched,
             0,
             stitched.current_origin_y,
-            frame.width as i32,
-            frame.height as i32,
+            frame.image.width as i32,
+            frame.image.height as i32,
         )
         .unwrap_or_else(|| CanvasWindow::full(stitched));
         reset_allocation_counters();
@@ -370,7 +358,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some((width, height, count)) = synthetic {
-        let frames = synthetic_page(width, height, count, step);
+        let frames: Vec<BenchFrame> = synthetic_page(width, height, count, step)
+            .into_iter()
+            .map(|image| BenchFrame {
+                image,
+                offset: FrameScreenOffset { x: 0, y: 0 },
+                direction: Some(LongDirection::Down),
+            })
+            .collect();
         summarize(
             &format!("{width}x{height} synthetic, {count} frames"),
             measure(&frames, !no_preview)?,

@@ -290,7 +290,7 @@ Measured, three runs each, same machine, release build:
 | 1920x1080, after | 1.88 ms | 0.60 ms | 2.50 ms (8%) |
 | `real-5-4k`, before | 5.87 ms | 1.82 ms | 7.75 ms (23%) |
 | `real-5-4k`, after (same budget) | 5.76 ms | 1.92 ms | 6.31 ms (19%) |
-| `real-5-4k`, after the working-set fix below | 0.94 ms | 0.29 ms | 2.20 ms (7%) |
+| `real-5-4k`, after the working-set fix below | 0.89 ms (p50), 2.56 ms (mean) | 0.39 ms | 2.96 ms (9%) |
 
 `real-5-4k`'s p50 barely moves because its frames are lz4-packed canvas reads,
 not descriptor arithmetic; its **p95** falls 16.1 → 7.3 ms, which is the anchor

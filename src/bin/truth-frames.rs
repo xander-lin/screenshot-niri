@@ -39,7 +39,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 
 use screenshot_rs_rebuild::corpus::{
-    load_frames, load_png, luminance, truth_cache_path, truth_key,
+    load_frames, load_png, luminance, truth_cache_path, truth_key_for,
 };
 
 /// Overlap (as a fraction of the frame's height) below which a displacement is
@@ -148,7 +148,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     // The verdicts are a function of the frames and the window only. Recomputing
     // them after every stitcher change is the expensive part of a verification
     // pass (minutes on the 4K corpora), and it cannot differ.
-    let cache_key = truth_key(&dir, "truth", &[("window", window.to_string())])?;
+    let cache_key = truth_key_for(&entries, "truth", &[("window", window.to_string())])?;
     let cache_path = truth_cache_path(&dir, "truth");
     if !refresh {
         if let Some((summary, rows)) = load_verdict_cache(&cache_path, &cache_key) {

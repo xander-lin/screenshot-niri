@@ -194,10 +194,19 @@ pub fn truth_key(
     tool: &str,
     params: &[(&str, String)],
 ) -> Result<String, Box<dyn Error>> {
+    truth_key_for(&load_frames(dir)?, tool, params)
+}
+
+/// [`truth_key`] for a caller that already loaded the corpus, so the manifest
+/// is parsed once per invocation instead of twice.
+pub fn truth_key_for(
+    entries: &[FrameEntry],
+    tool: &str,
+    params: &[(&str, String)],
+) -> Result<String, Box<dyn Error>> {
     use std::hash::{Hash, Hasher};
     use std::time::UNIX_EPOCH;
 
-    let entries = load_frames(dir)?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     tool.hash(&mut hasher);
     TRUTH_CACHE_VERSION.hash(&mut hasher);
@@ -205,7 +214,7 @@ pub fn truth_key(
         name.hash(&mut hasher);
         value.hash(&mut hasher);
     }
-    for entry in &entries {
+    for entry in entries {
         entry.path.file_name().hash(&mut hasher);
         let metadata = std::fs::metadata(&entry.path)?;
         metadata.len().hash(&mut hasher);

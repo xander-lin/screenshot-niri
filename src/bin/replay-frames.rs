@@ -13,7 +13,7 @@
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-use screenshot_rs_rebuild::corpus::{load_frames, load_png, luminance, truth_cache_path, truth_key};
+use screenshot_rs_rebuild::corpus::{load_frames, load_png, luminance, truth_cache_path, truth_key_for};
 use screenshot_rs_rebuild::image::Image;
 use screenshot_rs_rebuild::stitch::{ImageRgbView, PushResult, RawStitcher};
 
@@ -70,7 +70,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     // The exhaustive oracle depends only on the frames: cache it per corpus so
     // a before/after verification pass does not pay for it twice. `--exact`
     // changes the answer, so it is part of the key.
-    let cache_key = truth_key(&dir, "replay-oracle", &[("exact", exact.to_string()), ("step", ORACLE_STEP.to_string())])?;
+    let cache_key = truth_key_for(&frames, "replay-oracle", &[("exact", exact.to_string()), ("step", ORACLE_STEP.to_string())])?;
     let cache_path = truth_cache_path(&dir, "replay-oracle");
     let mut oracles: Option<Vec<Option<Oracle>>> = if refresh {
         None
