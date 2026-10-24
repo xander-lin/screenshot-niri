@@ -1,0 +1,35 @@
+[package]
+name = "screenshot-rs-rebuild"
+version = "0.2.1"
+edition = "2021"
+# Arch ships a rolling toolchain and releases are prebuilt binaries, so there is
+# no reason to hold back on the standard library. 1.88 is what `as_chunks` needs;
+# `is_none_or` and `repeat_n` (1.82) were already in use before it was declared,
+# which is why this is now enforced here rather than only stated in the README.
+rust-version = "1.88"
+
+[[bin]]
+name = "screenshot"
+path = "src/main.rs"
+
+[features]
+trace-logs = []
+
+[dependencies]
+libc = "0.2"
+png = "0.18"
+tempfile = "3"
+wayland-client = { version = "0.31", default-features = false }
+wayland-protocols = { version = "0.32", default-features = false, features = ["client", "unstable", "staging"] }
+wayland-protocols-wlr = { version = "0.3", default-features = false, features = ["client"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# The overlay tests are pixel loops: an unoptimised build spends seconds on
+# them and an optimised one under a second. Overflow checks and debug
+# assertions stay on (`debug-assertions` is a separate switch), so the tests
+# still exercise the checked build; only the code generation changes.
+[profile.test]
+opt-level = 2

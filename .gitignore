@@ -1,0 +1,10 @@
+/target/
+/pkg/
+/screenshot-niri/
+/screenshot-plain/
+.idea/
+.omo/
+.cortexkit/
+perf.data*
+*.pkg.tar.*
+*.tar.gz

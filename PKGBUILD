@@ -1,0 +1,32 @@
+# Maintainer: Xander Lin <xander-lin@users.noreply.github.com>
+# Contributor: screenshot-plain contributors
+
+pkgname=screenshot-plain
+pkgver=0.2.1
+pkgrel=1
+pkgdesc="Lightweight wlroots Wayland screenshot tool — plain variant (region and full-screen capture)"
+arch=('x86_64')
+url="https://github.com/xander-lin/screenshot-niri"
+license=('MIT')
+depends=()
+makedepends=('cargo' 'git')
+conflicts=('screenshot-niri')
+source=("screenshot-plain::git+${url}.git#branch=plain")
+sha256sums=('SKIP')
+
+build() {
+    cd "$srcdir/screenshot-plain"
+    cargo build --release --locked
+}
+
+check() {
+    cd "$srcdir/screenshot-plain"
+    cargo test --release --locked
+}
+
+package() {
+    cd "$srcdir/screenshot-plain"
+    install -Dm755 target/release/screenshot "$pkgdir/usr/bin/screenshot"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/" 2>/dev/null || true
+}
