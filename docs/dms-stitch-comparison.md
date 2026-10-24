@@ -394,7 +394,7 @@ SCREENSHOT_TRACE_PROFILE=1 SCREENSHOT_TRACE_VERBOSE=1 \
 
 - 语料：`testdata/frames/real-1`（462 帧 644×254，niri 下 `zwlr_screencopy` 抓取，
   滚轮跳变滚动：461 对相邻帧中 348 对 delta=0，其余 60–120px 档位跳动）。
-  真值 = 逐像素穷举（`truth.tsv`，累计位移 -8020）。
+  真值 = 逐像素穷举（`replay-frames` 现场计算，累计位移 -8020）。
 - DMS 侧：`tools/dms-cmp`——v1.6.3 `stitch.go` 原样（只改包名 + 补 `clamp`/
   `scrollSeamTicks`）+ `scroll.go:546-581` 状态机逐行复刻。计时含每帧全部拼接
   工作（rowSamples + frameSig + duplicateFrame + pushFrame/seamAppend）。

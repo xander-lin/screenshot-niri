@@ -245,9 +245,17 @@ All 59 synthetic 4K frames still place. Two shape rules, both measured:
 
 Forced-pooling stress test (threshold temporarily 0, i.e. every corpus pooled):
 real-1 204/0, real-3 65/0, real-long 97, lowcontrast-2b 78 all unchanged; only
-`real-2` — the corpus whose blank regions are ambiguous by construction — moved
-(230 → 176 accepted, different chain). That is why the threshold is 4K-only
-rather than applied everywhere.
+`real-2` moved (230 → 176 accepted, different chain). That is why the threshold
+is 4K-only rather than applied everywhere.
+
+What that corpus's movement means was clarified later by `truth-frames`: 249 of
+`real-2`'s 1290 steps have **no single answer** (several displacements fit
+equally well), so a small perturbation to the descriptor changes which member of
+the tie set is taken and the accept count is not a quality signal. The earlier
+write-up of this experiment also quoted a misplaced-count improvement (200 → 127)
+that turned out to be an artefact of `replay-frames`'s row bookkeeping (found.md
+lesson 34) — do not use it as evidence. The decision itself stands: with no real
+4K corpus, pooling stays gated at `EDGE_POOL_MIN_BIN_WIDTH = 64`.
 
 ## What remains
 

@@ -619,11 +619,13 @@ const EDGE_MAX_DISPLACEMENT_DENOMINATOR: i32 = 10;
 
 即使门限修好，单帧歧义仍会发生（渲染接缝、偶发的低对比区域）。把一次拒绝直接变成红框，会让边框在正常滚动中闪烁。
 
-引入 `PushResult::Pending`：拒绝**前 8 次**只报 `Pending`，边框不变、不降频；第 8 次起才是 `NoMatch`（红框 + 5 fps）。任何接受都会把计数清零。
+引入 `PushResult::Pending`：连续拒绝**前 `REFUSAL_PATIENCE` 次**只报 `Pending`，边框不变、不降频；到达该次数才是 `NoMatch`（红框 + 5 fps）。任何接受都会把计数清零。
 
 ```rust
-const REFUSAL_PATIENCE: u32 = 8; // 30 fps 下约 260 ms
+const REFUSAL_PATIENCE: u32 = 5; // 30 fps 下约 170 ms
 ```
+
+落地时是 8（约 260 ms）；真实使用中仍嫌红框来得慢，按用户反馈改为 5。只有 `Pending`/`NoMatch` 的分界变了，判据本身没有动。
 
 语义上 `Pending` 与 `NoMatch` **完全一致地不推进任何状态**，区别只在「告诉用户什么」。所以这条改动不会引入静默错位。
 

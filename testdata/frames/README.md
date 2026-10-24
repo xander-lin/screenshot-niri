@@ -1,6 +1,6 @@
 # testdata/frames — 真实抓屏语料
 
-拼接器的验收语料。**PNG 不进 git**（50 MB），只把 `session.json`、`truth.tsv` 和本文件纳入版本管理；`truth.tsv` 记录每帧的真值位移，重新分析不必再算一遍。
+拼接器的验收语料。**PNG 不进 git**（50 MB），只把 `session.json` 和本文件纳入版本管理。真值不落盘：`replay-frames` 现场逐像素穷举（`--exact` 为逐像素、默认 4 像素采样），`truth-frames` 现场做全局判定。
 
 丢掉了也能重建，见文末。
 
@@ -17,21 +17,14 @@
 | `pipeline-test` | 8 | 900×600 | 合成，内容逐行唯一 | 回放工具自检：必须 0 错位 |
 | `pipeline-bad` | 8 | 900×600 | 合成，60 行周期 | 回放工具自检：必须报 ambiguous |
 
-`real-long` / `real-scroll` 的文件名自带真实滚动位置（`f000_00600.png` → 600），`truth.tsv` 最后一列就是它。
+`real-long` / `real-scroll` 没有 manifest，文件名自带真实滚动位置（`f000_00600.png` → 600）；`replay-frames` 按文件名顺序读入、offset 记 0，因此它们的"屏幕坐标"是序列内的相对坐标。
 
-## truth.tsv
+## 真值
 
-每帧一行，由**相邻帧之间的逐像素穷举搜索**得出，不依赖拼接器：
+没有存储的真值文件：两套工具都在回放时现场计算，语料改了也不会留下过期的答案。
 
-```
-# index  delta_px  match_cost  cumulative_px
-0        0         0.0000      0
-37       -60       0.0000      -60
-```
-
-- `delta_px`：相对上一帧的位移（负 = 向下滚）
-- `match_cost`：该位移下的平均亮度差。**大于 1.0 表示这一帧是滚动动画的中间帧**（运动模糊，像素在任何位移下都对不齐）。`real-1` 有 21 帧属于这类。
-- `cumulative_px`：累计位移
+- **逐帧位移**：`replay-frames` 对相邻帧做逐像素穷举，保留**平局集合**（同一代价下所有可区分的位移）。`--exact` 改成逐像素（默认每 4 像素采样一次，两者在接受数/错位数/条带数上完全一致，只有平局计数差几帧）。`match_cost > 1.0` 表示这一帧是滚动动画的中间帧（像素在任何位移下都对不齐）；`real-1` 有 21 帧属于这类。
+- **全局位置**：`truth-frames` 用"一步唯一可判"的边把会话切成 grounded run，在每个 run 内用除本帧外所有帧的共识画布判定该帧位置，输出 `determinate / ambiguous / no-consensus / inconsistent / edge`。详见下文与 `found.md` 教训 34–35。
 
 ## 怎么用
 
@@ -43,14 +36,15 @@ cargo build --release --bins
 
 穷举部分（oracle 与画布定位）按候选位移拆分到所有核心，结果与线程数无关。`real-1` 全量 462 帧约 **1 秒**（32 核），串行实现约 30 分钟。默认每 4 像素采样一次（`ORACLE_STEP`）；`--exact` 改成逐像素（`real-1` 约 6 秒、`real-2` 约 9 秒），只在需要给判定做最终裁定时用——实测两种采样的接受数、错位数、条带数完全相同，只有"同一偏移集合"的计数会差几帧。
 
-判据是三条，只有后两条算错位：
+判据（前两条是诊断项，其余算错位）：
 
-1. `delta differs from the pairwise truth` —— 恢复时把拒绝期间漏掉的位移一次补齐，**不是**错位
-2. `placements whose pixels do not fit the canvas` —— 回投影逐像素比对
-3. `placements far from their neighbours` —— 帧在画布中的真实行是否落在邻居的连续序列上
+1. `delta outside the pixels' tie set` —— 接受帧的 delta 不在像素允许的平局集合里：可能是恢复补步，也可能是真放错，要逐帧看
+2. `placements whose recorded row is not the content row` —— 引擎记录的页坐标与帧内容实际所在行不一致（恢复路径会给引擎重新定基），**不是**错位
+3. `placements far from their neighbours` —— 按内容定位后，帧的位置是否落在邻居的连续序列上（`MISPLACED`）
 4. `coverage check` —— 画布内不得存在没有任何被接受帧覆盖过的行（恢复跳变丢内容会在这里现形）
-5. `frames with displaced bands` —— 每个被接受帧分 4 条带独立定位，条带内容不得落在远离自己帧顶的位置（跳变过渡帧写错行会在这里现形）
+5. `frames with displaced bands` —— 每个被接受帧分 4 条带独立定位，条带内容不得落在远离本帧内容行的位置（跳变过渡帧写错行会在这里现形）
 6. `chain drift` —— 引擎链与逐帧真值链的累计偏差；跳变过渡帧（一帧含两个滚动位置）上出现有限漂移是预期行为，只要条带判据为 0
+7. `refusals on a uniquely resolvable pair` —— 该对像素唯一可解、画布却没有用上（诊断项，不是错位）
 
 ## 当前基线
 
@@ -103,20 +97,6 @@ cargo build --release --bins
 操作流程与正式工具完全一致：`E` 进入/退出编辑模式（边缘缩放、整框拖动，拖动期间不抓帧，松手后按新矩形继续）、方向键给滚动方向提示、`--fps` 缺省读配置文件的 `max_fps`、选区边框宽度读 `border_width`。只有两件事不同：不拼接、不显示拼接预览。
 
 每帧都走正式的 `prepare_capture_clean` → 抓帧 → `complete_capture` 握手，所以边框不会进画面、编辑中的中间矩形不会被抓、几何在抓帧期间变化的那一帧会被丢弃（并在终端说明）。抓到的帧**不做去重**（重复帧是正常输入，拼接器自己会判 `Duplicate`）。PNG 由写盘线程用 `Compression::Fast` + `Filter::Sub` 编码（4K 一帧约 27 ms），抓帧循环不会因为编码掉速；`session.json` 每帧重写但不 `fsync`，结束时才落盘。输出目录里若已有 `frame-*.png` 会直接报错，避免两次抓帧混在一起。
-
-然后重算真值：
-
-```bash
-python3 - <<'PY'
-# 见 git 历史中 testdata/frames/*/truth.tsv 的生成脚本
-PY
-```
-
-真值脚本依赖 `numpy` + `Pillow`。用项目内 venv，不要装到系统：
-
-```bash
-uv venv .venv-analysis && uv pip install --python .venv-analysis numpy pillow
-```
 
 `pipeline-test` / `pipeline-bad` 是合成语料，脚本在 `docs/edge-stitch-design.md` §14 有说明；它们的唯一目的是验证回放工具本身能把「错位」和「歧义」区分开。
 

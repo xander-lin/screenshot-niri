@@ -577,7 +577,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 }
 
 /// Pairwise cost above which the oracle calls a frame a blurred blend of two
-/// scroll positions (the same convention as truth.tsv). Writing such a frame
+/// scroll positions (the convention the corpora's per-frame truth used). Writing such a frame
 /// bakes the smear into the output even when its position is right.
 const ORACLE_BLEND_COST: f64 = 1.0;
 /// Number of worker threads used by the exhaustive searches.
