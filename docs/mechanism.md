@@ -341,6 +341,62 @@ seconds-long action.
   key only seeds the first frame. A horizontal fallback runs only when the user
   indicated a horizontal direction.
 
+### The decision tree, and what is actually a branch
+
+`place` is four searches followed by refusal; each search feeds the *same* gate.
+Written as the code's nesting:
+
+```
+ladder = prebuilt means ? from_means : from_source      (uniform → NoBoundaries)
+prediction = pos + last_delta + trend
+
+last_delta?  → impulse window  pred ± max(24, 1.05|Δ|) ─┐
+              guard band       pos ± rows               ├→ gate → far-support → accept
+              anchor rings     from anchor, ×4, minus guard band ┘
+              thin             guard band, floor 1, perfect + unique + pixels
+              else             refusal
+```
+
+The gate (`decide_from_costs`) has six branches, in cost order: sort; winner
+cost ≤ 0.08, or the `second/best ≥ 2.5` margin escape; ambiguity `second/best <
+1.5` → colour check → nearest to the window centre; colour verification; the
+boundary-direction check when the winner compared ≤ 8 rows; and, outside the
+guard band only, relative completeness (`used ≥ window_used`) plus pixel
+refutation of the runner-up.
+
+Every search answers a *different* question, which is why the tree is not
+collapsed further:
+
+* **impulse** is the cheap common case, and its narrow candidate set is itself
+  evidence: the runner-up ratio it computes is what decides most frames, and a
+  wider window changes that ratio (measurements in `docs/edge-stitch-design.md`
+  §12: 1.05× is the widest impulse that does not start catching jump frames).
+* **guard** is continuity: only positions that still overlap the previous frame
+  can be "the next step". Merging it into the anchor would let a far match be
+  accepted as if it were local.
+* **anchor** is recovery, nearest-first. A single full-canvas scan finds the
+  same winner but scores every position on every refusal (≈3-5× the work on the
+  corpora's 4 600-row canvases); the ring ladder is what makes this path
+  affordable. `ScoreCache` exists for the same reason — the impulse and guard
+  windows overlap, and re-scoring a position costs ~9 k bin comparisons.
+* **thin** is the only stage that may accept fewer than the evidence floor, and
+  it charges for that with exactness, uniqueness and whole-overlap pixels.
+
+Three simplifications were **measured and rejected** while this was written:
+running thin before the guard (its uniqueness test only looks outside the
+basin, so a terminal's repeated line inside the basin becomes a "unique"
+answer — `real-4-4k` went from 2 to 196 far placements), replacing the
+direction check with a colour ceiling scaled to the frame's own luminance range
+(fractional-scale resampling on `real-4-4k` produces colour differences of the
+same order as a band's tone range, so the ceiling rejects correct placements),
+and dropping the margin escape for thin evidence (real motion blur legitimately
+needs it — 116-190 compared rows on `real-long`). What *was* simplified is the
+code, not the decision: all three scored searches and the thin stage now share
+one scoring path (`window_costs` → `score_tops`), `decide` is no longer a
+duplicate of `decide_ring`, and the scoring path is the one that parallelises
+(see `docs/performance.md`). The remaining complexity is calibration — the
+numbers in the gate — not structure.
+
 The canvas is `StitchedFrame`, and its storage is the memory-critical part:
 
 ```
