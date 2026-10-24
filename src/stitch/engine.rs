@@ -117,6 +117,21 @@ const EDGE_POOL_MIN_BIN_WIDTH: u32 = 64;
 /// times better than the runner-up, so the match is unmistakable even on
 /// imperfect content.
 const EDGE_CONFIDENT_SECOND_OVER_BEST: f64 = 2.5;
+/// Comparable rows below which the colour check is replaced by a
+/// boundary-direction check.
+///
+/// The mean colour difference is calibrated on ordinary content (ceiling 30).
+/// On a low-contrast banded page the *entire* tone range is 4-12 levels, so a
+/// dark band matched against the light one costs at most a few units and passes
+/// any absolute ceiling. The pixels still carry the discriminator the ladder
+/// threw away: the **direction** of each boundary. A dark-to-light edge stays
+/// dark-to-light under a correct offset (and under fractional-scale resampling,
+/// which is why a relative colour ceiling was measured to reject `real-4-4k`
+/// wholesale) and is inverted by a one-period tone swap. With a handful of
+/// readable rows it is also cheap: two rows per boundary, at most a few dozen
+/// rows.
+const EDGE_SIGN_CHECK_MAX_USED: u32 = 8;
+
 /// Positions closer than this to the winner are the same peak, not a rival.
 const EDGE_ADJACENT_ROWS: i32 = 2;
 /// Divisor that turns the frame height into the winner's basin width.
@@ -313,7 +328,19 @@ impl EdgeLadder {
     }
 
     pub(super) fn session_gain_on(frame: &dyn RgbSource, axis: SearchAxis) -> f32 {
-        let peak = Self::peak_delta_on(frame, axis);
+        Self::gain_for_peak(Self::peak_delta_on(frame, axis))
+    }
+
+    /// The strongest bin-mean delta of the frame along the vertical axis.
+    ///
+    /// Zero means the frame carries no boundary at all, so it cannot decide a
+    /// session scale (a flat frame is not low-contrast content, it is no
+    /// content).
+    fn peak_delta(frame: &dyn RgbSource) -> f32 {
+        Self::peak_delta_on(frame, SearchAxis::Vertical)
+    }
+
+    pub(super) fn gain_for_peak(peak: f32) -> f32 {
         if peak > 0.0 && peak < EDGE_LEVEL_ONE {
             (EDGE_LEVEL_ONE / peak).min(64.0)
         } else {
@@ -1048,6 +1075,13 @@ pub(super) struct WindowedEdgeMatcher {
     /// initialised. Every ladder is built with it, so a frame and the canvas
     /// rows it is compared against always share one scale.
     session_gain: f32,
+    /// Whether `session_gain` was measured. A first frame that is entirely
+    /// flat has no contrast to measure, and locking the neutral 1.0 there made
+    /// a page whose bands are lighter than `EDGE_LEVEL_ONE` boundary-less for
+    /// the rest of the session (measured: a page starting inside one long dark
+    /// band never stitched). Until a frame carries a boundary, each ladder is
+    /// scaled by its own peak — safe, because the canvas holds only zero rows.
+    gain_decided: bool,
 }
 
 impl WindowedEdgeMatcher {
@@ -1105,7 +1139,7 @@ impl WindowedEdgeMatcher {
                 costs.push((score.cost, top, score.used));
             }
         }
-        self.decide_from_costs(costs, tie_centre, request)
+        self.decide_from_costs(costs, tie_centre, request, ladder)
     }
 
     /// Scans `lo..=hi` row by row and applies the gates.
@@ -1140,7 +1174,7 @@ impl WindowedEdgeMatcher {
         // this pass: the impulse window centres on the prediction, the
         // horizontal window on the previous frame (ties then prefer the
         // smallest step, which keeps the canvas continuous).
-        self.decide_from_costs(costs, centre, request)
+        self.decide_from_costs(costs, centre, request, ladder)
     }
 
     /// The gate decision, given the scored candidates for one window.
@@ -1153,6 +1187,7 @@ impl WindowedEdgeMatcher {
         mut costs: Vec<(f64, i32, u32)>,
         centre: i32,
         request: &PlacementRequest<'_>,
+        ladder: &EdgeLadder,
     ) -> DecideOutcome {
         if costs.len() < 4 {
             return DecideOutcome::Reject(RejectReason::InsufficientEvidence);
@@ -1345,6 +1380,22 @@ impl WindowedEdgeMatcher {
             Some(_) => {}
         }
 
+        // Thin evidence cannot lean on a mean colour difference that is larger
+        // than the page's whole tone range. The boundary *directions* can still
+        // tell a correct offset from a tone-swapped one at the same cost.
+        if costs[0].2 <= EDGE_SIGN_CHECK_MAX_USED
+            && !self.boundary_directions_agree(request, ladder, chosen)
+        {
+            if crate::trace::edge_gate_trace_enabled() {
+                crate::trace_log!(
+                    "stitch: placement {chosen} rejected: boundary directions disagree \
+                     (used={})",
+                    costs[0].2
+                );
+            }
+            return DecideOutcome::Reject(RejectReason::NoCandidate);
+        }
+
         // Report the cost of the position actually accepted: the tie-break may
         // have picked a rival, and `best_cost` belongs to a different offset.
         let (chosen_cost, chosen_used) = costs
@@ -1469,6 +1520,89 @@ impl WindowedEdgeMatcher {
             return None;
         }
         Some(total as f64 / samples as f64)
+    }
+
+    /// Summed luminance of a packed RGB row, for the direction check below.
+    fn row_luminance(row: &[u8]) -> u64 {
+        row.as_chunks::<3>()
+            .0
+            .iter()
+            .map(|pixel| {
+                77 * u64::from(pixel[0]) + 150 * u64::from(pixel[1]) + 29 * u64::from(pixel[2])
+            })
+            .sum()
+    }
+
+    /// Whether the pixel canvas changes luminance in the same direction as the
+    /// frame at the boundary rows the winner actually compared.
+    ///
+    /// Only the vertical axis is checked: a horizontal placement's descriptor is
+    /// built from columns and the capture is vertical by construction, so the
+    /// boundaries that matter are the row edges. Rows the canvas did not write
+    /// whole (ragged coverage) are skipped — there is nothing to compare, and
+    /// an unverifiable row must not veto a placement.
+    ///
+    /// Returns `true` when nothing could be compared: this is an additional
+    /// check, not a second evidence floor.
+    fn boundary_directions_agree(
+        &self,
+        request: &PlacementRequest<'_>,
+        ladder: &EdgeLadder,
+        top: i32,
+    ) -> bool {
+        if self.axis != SearchAxis::Vertical {
+            return true;
+        }
+        let stitched = request.stitched;
+        let frame = request.frame;
+        let width = frame.width();
+        let x0 = request.previous_rect.x.max(0) as u32;
+        if width == 0 || x0.saturating_add(width) > stitched.width {
+            return true;
+        }
+        let mut frame_row = vec![0u8; width as usize * 3];
+        let mut canvas_row = vec![0u8; width as usize * 3];
+        for &row in ladder.scoring_rows.iter().take(EDGE_SIGN_CHECK_MAX_USED as usize) {
+            if row == 0 {
+                continue;
+            }
+            let canvas_along = top + row as i32;
+            let canvas_previous = canvas_along - 1;
+            if canvas_previous < 0 || canvas_along >= stitched.height as i32 {
+                continue;
+            }
+            let fully_covered = |y: i32| match stitched.row_coverage.get(y as usize) {
+                None => stitched.row_coverage.is_empty(),
+                Some(RowCoverage::Full) => true,
+                Some(_) => false,
+            };
+            if !fully_covered(canvas_previous) || !fully_covered(canvas_along) {
+                continue;
+            }
+            frame.row_rgb_into(0, row, width, &mut frame_row);
+            // The two frame rows use separate buffers: the previous row goes
+            // into the canvas scratch until the canvas rows are read.
+            frame.row_rgb_into(0, row - 1, width, &mut canvas_row);
+            let frame_changed = Self::row_luminance(&frame_row);
+            let frame_previous = Self::row_luminance(&canvas_row);
+            if !stitched.store.row_into(x0, canvas_along, &mut canvas_row) {
+                continue;
+            }
+            let canvas_changed = Self::row_luminance(&canvas_row);
+            if !stitched.store.row_into(x0, canvas_previous, &mut canvas_row) {
+                continue;
+            }
+            let canvas_previous_sum = Self::row_luminance(&canvas_row);
+            let frame_delta = frame_changed as i64 - frame_previous as i64;
+            let canvas_delta = canvas_changed as i64 - canvas_previous_sum as i64;
+            if frame_delta != 0
+                && canvas_delta != 0
+                && (frame_delta > 0) != (canvas_delta > 0)
+            {
+                return false;
+            }
+        }
+        true
     }
 
     fn basin_rows(&self) -> i32 {
@@ -1718,6 +1852,20 @@ impl WindowedEdgeMatcher {
         Some((best_top, best_cost))
     }
 
+    /// The gain a ladder built for `frame` must use.
+    ///
+    /// Once the session's scale is measured that is the session gain. Before
+    /// it is, the frame's own peak decides — a canvas that holds only zero
+    /// rows cannot disagree with any scale, and waiting for a declared gain
+    /// would leave low-contrast content forever unquantised.
+    fn effective_gain(&self, frame: &dyn RgbSource) -> f32 {
+        if self.gain_decided {
+            self.session_gain
+        } else {
+            EdgeLadder::session_gain(frame)
+        }
+    }
+
     fn impulse_half_width(&self) -> i32 {
         let scale = self
             .last_delta
@@ -1817,11 +1965,12 @@ impl PlacementEngine for WindowedEdgeMatcher {
                 && Some(prebuilt.layout) == BinLayout::for_across(request.frame.width())
                 && prebuilt.means.len() == prebuilt.along as usize * prebuilt.layout.bins() as usize
         });
+        let gain = self.effective_gain(request.frame);
         let ladder = match prebuilt {
             Some(prebuilt) => {
-                EdgeLadder::from_means(prebuilt.means, prebuilt.along, prebuilt.layout, self.session_gain)
+                EdgeLadder::from_means(prebuilt.means, prebuilt.along, prebuilt.layout, gain)
             }
-            None => match EdgeLadder::from_source(request.frame, self.session_gain) {
+            None => match EdgeLadder::from_source(request.frame, gain) {
                 Some(ladder) => ladder,
                 None => return EngineDecision::Reject { reason: RejectReason::Invalid },
             },
@@ -1955,6 +2104,9 @@ impl PlacementEngine for WindowedEdgeMatcher {
         // floor (a nearly blank page). A perfect, pixel-exact, strictly unique
         // answer near the predicted step is still an answer; see
         // `thin_continuation`.
+        // Stage 4 — thin continuation: a perfect, pixel-exact, strictly unique
+        // answer near the step the capture is taking is a *fact*, and it is
+        // tried before the guard's fuzzy fits.
         if let Some((top, cost)) = self.thin_continuation(&ladder, request, predicted_top) {
             return self.accept(request, ladder, top, cost);
         }
@@ -2052,8 +2204,14 @@ impl WindowedEdgeMatcher {
         // canvas, before that frame's own ladder is built: every ladder —
         // including the first — must share the scale the canvas is written
         // with.
-        if self.canvas.is_none() {
-            self.session_gain = EdgeLadder::session_gain(frame);
+        if !self.gain_decided {
+            // A frame with no boundary cannot measure the scale; the canvas
+            // rows written so far are all level 0, so deferring is free.
+            let peak = EdgeLadder::peak_delta(frame);
+            if peak > 0.0 {
+                self.session_gain = EdgeLadder::gain_for_peak(peak);
+                self.gain_decided = true;
+            }
         }
         let ladder = match self.pending_ladder.take() {
             Some(ladder) => ladder,

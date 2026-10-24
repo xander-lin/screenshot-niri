@@ -49,6 +49,9 @@ const KEY_UP: u32 = 103;
 const KEY_LEFT: u32 = 105;
 const KEY_RIGHT: u32 = 106;
 const KEY_R: u32 = 19;
+/// `0` (evdev keycode): capture every screen as one image. Sits next to the
+/// `1`-`9` full-output keys, which start at `KEY_DIGIT_FIRST`.
+const KEY_ZERO: u32 = 11;
 const KEY_DIGIT_FIRST: u32 = 2;
 const KEY_DIGIT_LAST: u32 = 10;
 /// Buffers per overlay: two — one on screen, one committed and awaiting display.
@@ -1658,6 +1661,8 @@ enum KeyAction {
     HintDirection(SearchDirection),
     ToggleDebugCanvas,
     CaptureOutputByIndex(usize),
+    /// `0`: the whole desktop, every output in one image.
+    CaptureAllOutputs,
     Ignore,
 }
 
@@ -1689,7 +1694,11 @@ fn resolve_key_action(state: &UiState, key: u32) -> KeyAction {
             _ => KeyAction::Ignore,
         }
     } else if !state.long_mode && state.drag == DragState::Idle {
-        digit_key_index(key).map_or(KeyAction::Ignore, KeyAction::CaptureOutputByIndex)
+        if key == KEY_ZERO {
+            KeyAction::CaptureAllOutputs
+        } else {
+            digit_key_index(key).map_or(KeyAction::Ignore, KeyAction::CaptureOutputByIndex)
+        }
     } else {
         KeyAction::Ignore
     }
@@ -1775,6 +1784,12 @@ fn apply_key_action(state: &mut UiState, action: KeyAction) -> Option<OverlayInp
         }
         KeyAction::CaptureOutputByIndex(index) => {
             if let Some(rect) = full_output_rect_by_index(&state.output_infos(), index) {
+                state.drag = DragState::Finished(rect);
+            }
+            None
+        }
+        KeyAction::CaptureAllOutputs => {
+            if let Some(rect) = selection_drag_bounds(&state.output_infos()) {
                 state.drag = DragState::Finished(rect);
             }
             None
@@ -4637,6 +4652,36 @@ mod tests {
         assert_eq!(digit_key_index(KEY_DIGIT_LAST), Some(8));
         assert_eq!(digit_key_index(KEY_DIGIT_LAST + 1), None);
         assert_eq!(digit_key_index(KEY_H), None);
+    }
+
+    /// `0` is the whole desktop: the union of every output rectangle. The
+    /// digit keys next to it stay per-output, and both only work before a
+    /// selection exists (a finished box is not replaced by a key press).
+    #[test]
+    fn zero_key_selects_every_screen_as_one_image() {
+        let mut state = ui_state();
+        assert_eq!(resolve_key_action(&state, KEY_ZERO), KeyAction::CaptureAllOutputs);
+        // Without outputs there is no rectangle to select; the state is left
+        // alone rather than finishing an empty selection.
+        apply_key_action(&mut state, KeyAction::CaptureAllOutputs);
+        assert_eq!(state.drag, DragState::Idle);
+        // The rect is the bounding box of the outputs, computed by the same
+        // union the edit-drag bounds use.
+        let left = OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 20, width: 100, height: 80 }, scale: 1 };
+        let right = OutputInfo { global_name: 2, logical: LogicalRect { x: 100, y: 0, width: 120, height: 90 }, scale: 1 };
+        assert_eq!(
+            selection_drag_bounds(&[right, left]),
+            Some(LogicalRect { x: 0, y: 0, width: 220, height: 100 })
+        );
+        // Long mode and an in-progress/finished selection reject it, exactly
+        // like the 1-9 keys.
+        state.long_mode = true;
+        assert_eq!(resolve_key_action(&state, KEY_ZERO), KeyAction::Ignore);
+        state.long_mode = false;
+        state.drag = DragState::Finished(SELECTED);
+        assert_eq!(resolve_key_action(&state, KEY_ZERO), KeyAction::Ignore);
+        state.drag = DragState::Dragging { origin_x: 1, origin_y: 1, current_x: 2, current_y: 2 };
+        assert_eq!(resolve_key_action(&state, KEY_ZERO), KeyAction::Ignore);
     }
 
     #[test]

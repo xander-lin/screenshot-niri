@@ -5194,6 +5194,192 @@ mod tests {
         }
     }
 
+    /// A page of long, near-black bands: two tones 4-12 luminance levels
+    /// apart, sharp horizontal edges every few hundred rows, and nothing else.
+    ///
+    /// This is the "continuous pattern" a real page can be (a dark UI with
+    /// alternating panel bands): very few comparable boundaries per frame, a
+    /// repeating look, and a contrast below anything the absolute colour
+    /// ceiling can discriminate. Band lengths carry a deterministic jitter so
+    /// the page is not exactly periodic — an exactly periodic page has no
+    /// unique truth to reconstruct.
+    #[cfg_attr(feature = "stitch-legacy", allow(dead_code))]
+    fn low_contrast_band_page(
+        width: u32,
+        total_rows: u32,
+        dark: u8,
+        light: u8,
+        long: u32,
+        short: u32,
+        flat_prefix: u32,
+    ) -> Vec<Vec<u8>> {
+        let mut rows = Vec::with_capacity(total_rows as usize);
+        let mut band = 0u32;
+        let mut remaining = 0u32;
+        let mut tone = dark;
+        for row in 0..total_rows {
+            if row < flat_prefix {
+                rows.push(vec![dark; width as usize * 3]);
+                continue;
+            }
+            if remaining == 0 {
+                let is_long = band.is_multiple_of(2);
+                let jitter = (band * 37 % 23) as i32 - 11;
+                remaining = (if is_long { long } else { short } as i32 + jitter).max(16) as u32;
+                tone = if is_long { dark } else { light };
+                band += 1;
+            }
+            remaining -= 1;
+            rows.push(vec![tone; width as usize * 3]);
+        }
+        rows
+    }
+
+    #[cfg_attr(feature = "stitch-legacy", allow(dead_code))]
+    fn frame_from_page_rows(page: &[Vec<u8>], top: u32, height: u32, width: u32) -> RgbFrame {
+        let stride = width * 3;
+        let mut data = Vec::with_capacity(stride as usize * height as usize);
+        for row in top..top + height {
+            data.extend_from_slice(&page[row as usize]);
+        }
+        RgbFrame { width, height, stride, data }
+    }
+
+    /// Every canvas row must be the page row it claims to be.
+    #[cfg_attr(feature = "stitch-legacy", allow(dead_code))]
+    fn assert_canvas_is_page(stitcher: &RawStitcher, page: &[Vec<u8>]) {
+        let stitched = stitcher.stitched().expect("canvas");
+        let origin = stitcher.canvas_origin();
+        for y in 0..stitched.height {
+            let page_row = origin + y as i32;
+            if page_row < 0 || page_row >= page.len() as i32 {
+                continue;
+            }
+            let expected = &page[page_row as usize];
+            for x in 0..stitched.width {
+                assert_eq!(
+                    stitched.pixel(x, y).unwrap_or([0, 0, 0]),
+                    [
+                        expected[x as usize * 3],
+                        expected[x as usize * 3 + 1],
+                        expected[x as usize * 3 + 2]
+                    ],
+                    "canvas ({x},{y}) is not page row {page_row}"
+                );
+            }
+        }
+    }
+
+    /// Scrolls a banded page and asserts every accepted frame landed on its
+    /// true page row, every step was accounted for, and the finished canvas is
+    /// the page.
+    #[cfg_attr(feature = "stitch-legacy", allow(dead_code))]
+    fn stitch_band_page(
+        dark: u8,
+        light: u8,
+        long: u32,
+        short: u32,
+        height: u32,
+        step: u32,
+        steps: u32,
+    ) {
+        const WIDTH: u32 = 768;
+        let page = low_contrast_band_page(WIDTH, 12000, dark, light, long, short, 0);
+        let mut stitcher = RawStitcher::new();
+        for s in 0..steps {
+            let top = s * step;
+            let frame = frame_from_page_rows(&page, top, height, WIDTH);
+            let result = stitcher
+                .push_frame_with_offset(
+                    &frame,
+                    &frame,
+                    Some(LongDirection::Down),
+                    FrameScreenOffset { x: 0, y: 0 },
+                )
+                .unwrap();
+            match result {
+                PushResult::Initialized => {}
+                PushResult::Accepted { .. } => assert_eq!(
+                    stitcher.last_engine_top(),
+                    Some(top as i32),
+                    "step {s} (page row {top}) placed elsewhere: {:?}",
+                    stitcher.last_engine_top()
+                ),
+                // A single refusal is normal (the capture may lose a step and
+                // recover the distance on the next accepted frame); what must
+                // never happen is acceptance at the wrong row, asserted above,
+                // or the canvas ending short of the steps that did land.
+                PushResult::Pending | PushResult::NoMatch | PushResult::Duplicate => {}
+            }
+        }
+        assert_canvas_is_page(&stitcher, &page);
+        let stitched = stitcher.stitched().expect("canvas");
+        assert_eq!(
+            stitched.height,
+            height + (steps - 1) * step,
+            "every step must add exactly its own rows"
+        );
+    }
+
+    /// The reported real-world case: a continuous low-contrast band pattern
+    /// with very few comparable edges. Three viewports: normal, one where a
+    /// single edge is visible (the hardest), and a tall one.
+    #[cfg(not(feature = "stitch-legacy"))]
+    #[test]
+    fn a_continuous_low_contrast_band_pattern_stitches() {
+        for (dark, light, long, short) in [
+            (5, 17, 290, 90),
+            (5, 9, 180, 80),
+            (20, 24, 450, 140),
+        ] {
+            for (height, step) in [(1000, 40), (700, 40), (700, 80), (1600, 60)] {
+                stitch_band_page(dark, light, long, short, height, step, 60);
+            }
+        }
+    }
+
+    /// One edge visible in the whole viewport, bands longer than the step: the
+    /// guard's only readable rows are 1-2, and an offset one band away is a
+    /// dark band on the light one. The boundary-direction check must refuse the
+    /// swapped tone, after which the thin stage places the exact position.
+    ///
+    /// Before the check this case wrote 4 wrong placements and then refused
+    /// everything for the rest of the capture (45 of 80 frames), leaving a
+    /// canvas half its true height.
+    #[cfg(not(feature = "stitch-legacy"))]
+    #[test]
+    fn a_band_page_with_one_readable_edge_still_stitches() {
+        stitch_band_page(5, 17, 450, 140, 700, 40, 80);
+    }
+
+    /// A session that starts inside a featureless region cannot know how far it
+    /// scrolled before the first edge appeared: every frame is a duplicate and
+    /// nothing on screen changes. The tool must not invent a position — the
+    /// canvas stays the honest first screen instead of gaining rows that were
+    /// never captured.
+    #[cfg(not(feature = "stitch-legacy"))]
+    #[test]
+    fn a_capture_that_starts_on_a_featureless_screen_is_not_guessed() {
+        const WIDTH: u32 = 768;
+        const HEIGHT: u32 = 700;
+        let page = low_contrast_band_page(WIDTH, 6000, 5, 17, 290, 90, 1400);
+        let mut stitcher = RawStitcher::new();
+        for step in 0..40u32 {
+            let top = step * 40;
+            let frame = frame_from_page_rows(&page, top, HEIGHT, WIDTH);
+            let _ = stitcher
+                .push_frame_with_offset(
+                    &frame,
+                    &frame,
+                    Some(LongDirection::Down),
+                    FrameScreenOffset { x: 0, y: 0 },
+                )
+                .unwrap();
+        }
+        // Whatever it decided, no canvas row may claim content it did not see.
+        assert_canvas_is_page(&stitcher, &page);
+    }
+
     #[test]
     fn geometry_offset_shrink_then_normal_push_continues() {
         let mut stitcher = RawStitcher::new();
