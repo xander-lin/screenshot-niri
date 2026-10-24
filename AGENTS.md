@@ -100,6 +100,8 @@ Concise boundaries for each module: what it owns, what it must not do, and how i
 - Trace logs: `--features trace-logs` (see `src/trace.rs` env gates).
 - Packaging: `PKGBUILD` (package `screenshot-niri`, conflicts with `screenshot-plain`).
 - Release binaries: x86_64 with `RUSTFLAGS="-C target-cpu=x86-64-v3"` (and a
-  `-x86_64-generic` fallback asset), aarch64 at the architecture default. PGO
-  is not used: measured neutral-to-negative (`docs/performance.md`,
-  "build-flag pass").
+  `-x86_64-generic` fallback asset), aarch64 at the architecture default. The
+  AUR PKGBUILD lists both x86_64 sources and extracts/installs only the one the
+  local CPU can run (`avx avx2 bmi1 bmi2 f16c fma movbe` plus `lzcnt` or AMD's
+  `abm`); one binary is installed either way. PGO is not used: measured
+  neutral-to-negative (`docs/performance.md`, "build-flag pass").

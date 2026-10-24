@@ -479,8 +479,12 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
   instruction) before any fallback could run. The compiler cannot emit a
   runtime check for the whole crate.
 - **Correction**: Publish the v3 asset as the default x86_64 build, plus an
-  `-x86_64-generic` asset and a README/AUR note stating the requirement
-  (Haswell 2013 / Excavator 2015 or later). aarch64 is unaffected.
+  `-x86_64-generic` asset and a README note stating the requirement (Haswell
+  2013 / Excavator 2015 or later). aarch64 is unaffected. The AUR package
+  (0.2.1-2) lists both x86_64 sources with their checksums, keeps `noextract`,
+  and lets `prepare()` extract the one the local CPU can run; `.SRCINFO` stays
+  honest because both sources are declared, and only one binary is installed.
+  Detection must accept AMD's `abm` in place of Intel's `lzcnt`.
 - **Prevention**: When changing `target-cpu`, treat it as a change to the
   supported CPU baseline, not as a compiler flag: ship a generic fallback, say
   the first supported generation in the README, and never claim `arch=('x86_64')`

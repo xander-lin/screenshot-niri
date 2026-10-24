@@ -30,7 +30,8 @@ The x86_64 release tarballs are built with `-C target-cpu=x86-64-v3`
 (AVX2/BMI/FMA: Intel Haswell, 2013, or AMD Excavator, 2015, and later). They
 will **not** run on older x86_64 CPUs — the kernel kills them with an illegal
 instruction. A `-x86_64-generic` asset is published alongside the v3 one for
-those machines; aarch64 assets use the architecture default.
+those machines; aarch64 assets use the architecture default. The AUR package
+picks the right one on the machine where it is built (next section).
 
 ### Arch Linux
 
@@ -38,8 +39,11 @@ those machines; aarch64 assets use the architecture default.
 paru -S screenshot-niri
 ```
 
-The AUR package ships the v3 x86_64 binary. On a CPU without AVX2, install from
-source instead (or use the generic tarball).
+The AUR package checks the CPU feature flags while building and installs the v3
+or generic x86_64 binary automatically — exactly one binary, no runtime
+launcher and no manual choice. On a CPU without AVX2 it falls back to generic;
+the GitHub generic tarball and a source build remain available for anything the
+package does not cover.
 
 ## Usage
 
