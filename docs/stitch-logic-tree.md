@@ -429,7 +429,7 @@ place_horizontally(stitched, previous_rect, frame, direction)
 ### 不够清楚、值得改的部分（按价值排序）
 
 1. **注释漂移**（本轮已修 4 处）：`pending_ladder` 的文档里混进了一段 `consecutive_refusals` 的说明；"Stage 4" 有一段自相矛盾的重复；`far_placement_supported` 还在用旧的 `used == scoring_rows` 说法；拒绝路径注释还写着"下面的 stale-edge recovery"（那段已删）。根因是"设计变更只改代码"。建议：闸门注释里不写具体数字，数字只进常量表。
-2. **两个长函数**：`push_frame_sources` 约 350 行、4 个早退出口；`place` 约 300 行。树是清楚的，但它是**读出来的**，不是**看出来的**。建议按阶段抽函数：`duplicate_gate` / `prepare_frame` / `choose_axis` / `apply_placement`，让 `push_frame_sources` 只剩一棵 30 行的树。
+2. **一个长函数**：`push_frame_sources` 约 550 行、6 个出口（初始化 / 重复 / 两个接受 / 两个拒绝）；`place` 反而是 160 行的五段式。树是清楚的，但它是**读出来的**，不是**看出来的**——`push_frame_sources` 里的"重复→转换→选轴→落盘"本可以是四行调用。建议按阶段抽函数：`duplicate_gate` / `prepare_frame` / `choose_axis` / `apply_placement`，让 `push_frame_sources` 只剩一棵 30 行的树。
 3. **隐式不变量**：`pending_top` 只写不读；`last_engine_top`/`canvas_origin` 主要给诊断与几何编辑；`previous_perceptual_*` 只服务 legacy。本文 §2 的字段表补上了这层说明，但代码里没有单一出处。
 4. **轴决策分居两处**：引擎会返回零位移的 `Place`，调用方再决定"要不要问另一轴"；规则靠两处注释 + 一个测试维系。建议收进 `choose_axis`，让"零位移不是答案"只出现一次。
 5. **recovery 的命名**：`find_dirty_overlap_recovery` 是活的脏边修复（在 `Place` 之后）；它曾经与死掉的 `find_nomatch_recovery` 成对，名字高度相似、行为完全不同。删除之后这一点已经缓解，但"recovery"仍值得在函数名里带出"dirty edge"。
