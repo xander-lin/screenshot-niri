@@ -4875,6 +4875,325 @@ mod tests {
         assert!(stitched.row_coverage.iter().all(|row| row != &RowCoverage::Empty));
     }
 
+    /// A 4K-scale selection shrink must not shear the canvas.
+    ///
+    /// The narrow frame has a different width from the one that built the
+    /// canvas, and the failure this pins looked like text rows smeared into
+    /// horizontal stripes after the shrink: a row written or read at another
+    /// row length. Every pixel of every accepted frame is checked against the
+    /// page, so a stride mistake cannot hide.
+    #[cfg(not(feature = "stitch-legacy"))]
+    #[test]
+    fn a_4k_selection_shrink_keeps_every_row_aligned() {
+        const PAGE_WIDTH: u32 = 3840;
+        const HEIGHT: u32 = 1200;
+        let page_row = |row: u32, x0: u32, width: u32| -> Vec<u8> {
+            let full = row_texture(PAGE_WIDTH, row);
+            full[(x0 * 3) as usize..((x0 + width) * 3) as usize].to_vec()
+        };
+        let frame_at = |x0: u32, width: u32, top: u32| -> RgbFrame {
+            let stride = width * 3;
+            let mut data = Vec::with_capacity((stride * HEIGHT) as usize);
+            for row in top..top + HEIGHT {
+                data.extend_from_slice(&page_row(row, x0, width));
+            }
+            RgbFrame { width, height: HEIGHT, stride, data }
+        };
+
+        let mut stitcher = RawStitcher::new();
+        let origin = FrameScreenOffset { x: 0, y: 0 };
+        let mut pushed: Vec<(i32, u32, u32, u32)> = Vec::new(); // canvas top, x0, width, page row
+        let wide = 3000u32;
+        let narrow = 1800u32;
+        let mut page_top = 0u32;
+        for _ in 0..4 {
+            let frame = frame_at(0, wide, page_top);
+            let result = stitcher
+                .push_frame_with_offset(&frame, &frame, Some(LongDirection::Down), origin)
+                .unwrap();
+            assert!(
+                matches!(result, PushResult::Initialized | PushResult::Accepted { .. }),
+                "wide frame at page row {page_top} must be accepted, got {result:?} reason {:?}",
+                stitcher.last_reject_reason()
+            );
+            if let Some(top) = stitcher.last_engine_top() {
+                pushed.push((top, 0, wide, page_top));
+            }
+            page_top += 600;
+        }
+        // The box is shrunk while the page is still: the next frame shows the
+        // same page rows through a narrower box, so its page top does not move.
+        page_top -= 600;
+        for step in 0..4 {
+            let frame = frame_at(0, narrow, page_top);
+            let result = stitcher
+                .push_frame_with_offset(&frame, &frame, Some(LongDirection::Down), origin)
+                .unwrap();
+            assert!(
+                matches!(result, PushResult::Initialized | PushResult::Accepted { .. }),
+                "narrow frame at page row {page_top} must be accepted, got {result:?} reason {:?}",
+                stitcher.last_reject_reason()
+            );
+            if let Some(top) = stitcher.last_engine_top() {
+                pushed.push((top, 0, narrow, page_top));
+            }
+            if step + 1 < 4 {
+                page_top += 600;
+            }
+        }
+
+        let stitched = stitcher.stitched().unwrap();
+        assert_eq!(stitched.stride, stitched.width * 3, "canvas stride must follow its width");
+        let origin = stitcher.canvas_origin();
+        for (top, x0, width, page) in pushed {
+            let row0 = top - origin;
+            for y in 0..HEIGHT {
+                let row = row0 + y as i32;
+                if row < 0 || row >= stitched.height as i32 {
+                    continue;
+                }
+                let expected = page_row(page + y, x0, width);
+                for x in 0..width {
+                    let got = stitched.pixel(x0 + x, row as u32).unwrap_or([0, 0, 0]);
+                    assert_eq!(
+                        got,
+                        [expected[(x * 3) as usize], expected[(x * 3 + 1) as usize], expected[(x * 3 + 2) as usize]],
+                        "frame page row {page} at canvas row {row}, column {x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Same as the 4K right-edge shrink, but the box's **left** edge moves
+    /// right: the frame lands at a different column and the canvas may have to
+    /// re-cut its rows (a width or x-extent change).
+    #[cfg(not(feature = "stitch-legacy"))]
+    #[test]
+    fn a_left_edge_shrink_at_4k_keeps_every_row_aligned() {
+        const PAGE_WIDTH: u32 = 3840;
+        const HEIGHT: u32 = 1200;
+        let page_row = |row: u32, x0: u32, width: u32| -> Vec<u8> {
+            let full = row_texture(PAGE_WIDTH, row);
+            full[(x0 * 3) as usize..((x0 + width) * 3) as usize].to_vec()
+        };
+        let frame_at = |x0: u32, width: u32, top: u32| -> RgbFrame {
+            let stride = width * 3;
+            let mut data = Vec::with_capacity((stride * HEIGHT) as usize);
+            for row in top..top + HEIGHT {
+                data.extend_from_slice(&page_row(row, x0, width));
+            }
+            RgbFrame { width, height: HEIGHT, stride, data }
+        };
+
+        let mut stitcher = RawStitcher::new();
+        let mut pushed: Vec<(i32, u32, u32, u32)> = Vec::new();
+        let mut page_top = 0u32;
+        let wide = 3000u32;
+        for step in 0..4 {
+            let offset = FrameScreenOffset { x: 0, y: 0 };
+            let frame = frame_at(0, wide, page_top);
+            let result = stitcher
+                .push_frame_with_offset(&frame, &frame, Some(LongDirection::Down), offset)
+                .unwrap();
+            assert!(matches!(result, PushResult::Initialized | PushResult::Accepted { .. }), "wide frame {step}: {result:?} {:?}", stitcher.last_reject_reason());
+            if let Some(top) = stitcher.last_engine_top() {
+                pushed.push((top, 0, wide, page_top));
+            }
+            page_top += 600;
+        }
+        page_top -= 600;
+        for step in 0..4 {
+            let offset = FrameScreenOffset { x: 600, y: 0 };
+            let frame = frame_at(600, 1800, page_top);
+            let result = stitcher
+                .push_frame_with_offset(&frame, &frame, Some(LongDirection::Down), offset)
+                .unwrap();
+            assert!(matches!(result, PushResult::Initialized | PushResult::Accepted { .. }), "narrow frame {step}: {result:?} {:?}", stitcher.last_reject_reason());
+            if let Some(top) = stitcher.last_engine_top() {
+                pushed.push((top, 600, 1800, page_top));
+            }
+            if step + 1 < 4 {
+                page_top += 600;
+            }
+        }
+
+        let stitched = stitcher.stitched().unwrap();
+        assert_eq!(stitched.stride, stitched.width * 3);
+        let origin = stitcher.canvas_origin();
+        for (top, x0, width, page) in pushed {
+            let row0 = top - origin;
+            for y in 0..HEIGHT {
+                let row = row0 + y as i32;
+                if row < 0 || row >= stitched.height as i32 {
+                    continue;
+                }
+                let expected = page_row(page + y, x0, width);
+                for x in 0..width {
+                    let got = stitched.pixel(x0 + x, row as u32).unwrap_or([0, 0, 0]);
+                    assert_eq!(
+                        got,
+                        [expected[(x * 3) as usize], expected[(x * 3 + 1) as usize], expected[(x * 3 + 2) as usize]],
+                        "frame page row {page}, x0 {x0}, canvas row {row}, column {x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The top edge moves down (height shrink): the frame's page row moves with
+    /// the box, and the canvas grows downward instead of upward.
+    #[cfg(not(feature = "stitch-legacy"))]
+    #[test]
+    fn a_top_edge_shrink_at_4k_keeps_every_row_aligned() {
+        const PAGE_WIDTH: u32 = 3840;
+        let page_row = |row: u32, x0: u32, width: u32| -> Vec<u8> {
+            let full = row_texture(PAGE_WIDTH, row);
+            full[(x0 * 3) as usize..((x0 + width) * 3) as usize].to_vec()
+        };
+        let frame_at = |x0: u32, width: u32, top: u32, height: u32| -> RgbFrame {
+            let stride = width * 3;
+            let mut data = Vec::with_capacity((stride * height) as usize);
+            for row in top..top + height {
+                data.extend_from_slice(&page_row(row, x0, width));
+            }
+            RgbFrame { width, height, stride, data }
+        };
+
+        let mut stitcher = RawStitcher::new();
+        let mut pushed: Vec<(i32, u32, u32, u32, u32)> = Vec::new(); // top, x0, width, height, page
+        let mut page_top = 0u32;
+        let wide = 3000u32;
+        let tall = 1200u32;
+        for step in 0..4 {
+            let offset = FrameScreenOffset { x: 0, y: 0 };
+            let frame = frame_at(0, wide, page_top, tall);
+            let result = stitcher
+                .push_frame_with_offset(&frame, &frame, Some(LongDirection::Down), offset)
+                .unwrap();
+            assert!(matches!(result, PushResult::Initialized | PushResult::Accepted { .. }), "tall frame {step}: {result:?} {:?}", stitcher.last_reject_reason());
+            if let Some(top) = stitcher.last_engine_top() {
+                pushed.push((top, 0, wide, tall, page_top));
+            }
+            page_top += 600;
+        }
+        page_top -= 600;
+        // Top edge down 300: the new frame shows page rows +300, at screen y 300.
+        let short = 900u32;
+        for step in 0..4 {
+            let offset = FrameScreenOffset { x: 0, y: 300 };
+            let frame = frame_at(0, wide, page_top + 300, short);
+            let result = stitcher
+                .push_frame_with_offset(&frame, &frame, Some(LongDirection::Down), offset)
+                .unwrap();
+            assert!(matches!(result, PushResult::Initialized | PushResult::Accepted { .. }), "short frame {step}: {result:?} {:?}", stitcher.last_reject_reason());
+            if let Some(top) = stitcher.last_engine_top() {
+                pushed.push((top, 0, wide, short, page_top + 300));
+            }
+            if step + 1 < 4 {
+                page_top += 600;
+            }
+        }
+
+        let stitched = stitcher.stitched().unwrap();
+        assert_eq!(stitched.stride, stitched.width * 3);
+        let origin = stitcher.canvas_origin();
+        for (top, x0, width, height, page) in pushed {
+            let row0 = top - origin;
+            for y in 0..height {
+                let row = row0 + y as i32;
+                if row < 0 || row >= stitched.height as i32 {
+                    continue;
+                }
+                let expected = page_row(page + y, x0, width);
+                for x in 0..width {
+                    let got = stitched.pixel(x0 + x, row as u32).unwrap_or([0, 0, 0]);
+                    assert_eq!(
+                        got,
+                        [expected[(x * 3) as usize], expected[(x * 3 + 1) as usize], expected[(x * 3 + 2) as usize]],
+                        "frame page row {page}, canvas row {row}, column {x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A width shrink while the canvas is growing **upward** (a scroll-back,
+    /// where every frame is prepended and the grid relabels): the shrink re-cuts
+    /// every band at the same moment.
+    #[cfg(not(feature = "stitch-legacy"))]
+    #[test]
+    fn a_4k_shrink_while_scrolling_up_keeps_every_row_aligned() {
+        const PAGE_WIDTH: u32 = 3840;
+        const HEIGHT: u32 = 1200;
+        let page_row = |row: u32, x0: u32, width: u32| -> Vec<u8> {
+            let full = row_texture(PAGE_WIDTH, row);
+            full[(x0 * 3) as usize..((x0 + width) * 3) as usize].to_vec()
+        };
+        let frame_at = |x0: u32, width: u32, top: u32| -> RgbFrame {
+            let stride = width * 3;
+            let mut data = Vec::with_capacity((stride * HEIGHT) as usize);
+            for row in top..top + HEIGHT {
+                data.extend_from_slice(&page_row(row, x0, width));
+            }
+            RgbFrame { width, height: HEIGHT, stride, data }
+        };
+
+        let mut stitcher = RawStitcher::new();
+        let origin = FrameScreenOffset { x: 0, y: 0 };
+        let mut pushed: Vec<(i32, u32, u32, u32)> = Vec::new();
+        let wide = 3000u32;
+        let narrow = 1800u32;
+        let mut page_top = 3600u32;
+        for step in 0..4 {
+            let frame = frame_at(0, wide, page_top);
+            let result = stitcher
+                .push_frame_with_offset(&frame, &frame, Some(LongDirection::Up), origin)
+                .unwrap();
+            assert!(matches!(result, PushResult::Initialized | PushResult::Accepted { .. }), "wide frame {step} at {page_top}: {result:?} {:?}", stitcher.last_reject_reason());
+            if let Some(top) = stitcher.last_engine_top() {
+                pushed.push((top, 0, wide, page_top));
+            }
+            page_top = page_top.saturating_sub(600);
+        }
+        page_top += 600;
+        for step in 0..4 {
+            let frame = frame_at(0, narrow, page_top);
+            let result = stitcher
+                .push_frame_with_offset(&frame, &frame, Some(LongDirection::Up), origin)
+                .unwrap();
+            assert!(matches!(result, PushResult::Initialized | PushResult::Accepted { .. }), "narrow frame {step} at {page_top}: {result:?} {:?}", stitcher.last_reject_reason());
+            if let Some(top) = stitcher.last_engine_top() {
+                pushed.push((top, 0, narrow, page_top));
+            }
+            if step + 1 < 4 {
+                page_top = page_top.saturating_sub(600);
+            }
+        }
+
+        let stitched = stitcher.stitched().unwrap();
+        assert_eq!(stitched.stride, stitched.width * 3);
+        let origin = stitcher.canvas_origin();
+        for (top, x0, width, page) in pushed {
+            let row0 = top - origin;
+            for y in 0..HEIGHT {
+                let row = row0 + y as i32;
+                if row < 0 || row >= stitched.height as i32 {
+                    continue;
+                }
+                let expected = page_row(page + y, x0, width);
+                for x in 0..width {
+                    let got = stitched.pixel(x0 + x, row as u32).unwrap_or([0, 0, 0]);
+                    assert_eq!(
+                        got,
+                        [expected[(x * 3) as usize], expected[(x * 3 + 1) as usize], expected[(x * 3 + 2) as usize]],
+                        "frame page row {page}, canvas row {row}, column {x}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn geometry_offset_shrink_then_normal_push_continues() {
         let mut stitcher = RawStitcher::new();

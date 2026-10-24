@@ -489,7 +489,10 @@ fn run_long_capture(
         }
         // Pause capture while an edit-mode edge drag is reshaping the box;
         // resume on release so the next frame captures the settled geometry.
-        worker.set_paused(selection_session.edit_drag_active());
+        // Pause while the box is reshaped *and* while it is showing the stitched
+        // canvas (R): the debug view paints inside the selection, so a capture
+        // taken with it up would photograph our own drawing.
+        worker.set_paused(selection_session.debug_view_active() || selection_session.edit_drag_active());
         match selection_session.long_status() {
             crate::wayland::selection::LongSessionStatus::Running => {}
             crate::wayland::selection::LongSessionStatus::FinishRequested => break,

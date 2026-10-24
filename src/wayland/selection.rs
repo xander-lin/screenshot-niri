@@ -48,6 +48,7 @@ const KEY_DOWN: u32 = 108;
 const KEY_UP: u32 = 103;
 const KEY_LEFT: u32 = 105;
 const KEY_RIGHT: u32 = 106;
+const KEY_R: u32 = 19;
 const KEY_DIGIT_FIRST: u32 = 2;
 const KEY_DIGIT_LAST: u32 = 10;
 /// Buffers per overlay: two — one on screen, one committed and awaiting display.
@@ -70,6 +71,10 @@ const MIN_SELECTION_SIZE: i32 = 8;
 const OVERLAY_OUTSIDE_MASK_BGRA: [u8; 4] = [0, 0, 0, 110];
 const OVERLAY_SELECTED_TRANSPARENT_BGRA: [u8; 4] = [0, 0, 0, 0];
 const OVERLAY_BORDER_WHITE_BGRA: [u8; 4] = [255, 255, 255, 255];
+/// Border colour while the debug canvas view is shown: the box is displaying the
+/// stitched canvas instead of the real screen, which is a state the user must be
+/// able to tell apart at a glance.
+const OVERLAY_DEBUG_BORDER_BGRA: [u8; 4] = [0, 220, 255, 255];
 /// Warning border: white mixed into red (50/50). Used for a selection the
 /// pointer is dragging across outputs and for stitcher refusals — lighter
 /// than pure red so it reads as "attention", distinct from the plain white
@@ -438,6 +443,11 @@ struct UiState {
     long_requested: bool,
     long_finish_requested: bool,
     long_direction: Option<SearchDirection>,
+    /// Long mode only: the selection box shows the stitched canvas instead of
+    /// the real screen, so a mis-stitch can be seen where it happens. Capture is
+    /// paused while it is on (nothing may be captured with our drawing inside
+    /// the box), and any other input leaves the view.
+    debug_canvas_view: bool,
     long_preview: Option<LongPreviewSnapshot>,
     /// Set while the stitcher is refusing frames: the new content could not be
     /// placed, so the border turns red and the user is asked to scroll back.
@@ -519,6 +529,7 @@ impl UiState {
             long_requested: false,
             long_finish_requested: false,
             long_direction: None,
+            debug_canvas_view: false,
             long_preview: None,
             stitch_warning: false,
             pending_render: None,
@@ -619,7 +630,15 @@ fn selection_spans_outputs(state: &UiState, rect: LogicalRect) -> bool {
 /// Border color for the live selection, honoring the spans-outputs warning.
 fn border_color_for_state(state: &UiState, rect: Option<LogicalRect>) -> [u8; 4] {
     let spans = rect.map_or(false, |rect| selection_spans_outputs(state, rect));
-    border_color_for(rect, spans, state.long_mode, state.stitch_warning)
+    let color = border_color_for(rect, spans, state.long_mode, state.stitch_warning);
+    // The debug canvas view gets its own border colour so "the box is showing
+    // the canvas" is visible at a glance. A stitch warning still wins: red means
+    // the content could not be placed, which matters more than the mode.
+    if state.debug_canvas_view && color == OVERLAY_BORDER_WHITE_BGRA {
+        OVERLAY_DEBUG_BORDER_BGRA
+    } else {
+        color
+    }
 }
 
 /// The colour decision, independent of Wayland state so it can be tested.
@@ -958,6 +977,13 @@ impl SelectionSession {
         self.state.edit_drag.is_some()
     }
 
+    /// True while the long-mode box is showing the stitched canvas instead of
+    /// the real screen. Capture pauses for as long as it is set: the box must
+    /// never be photographed with our own drawing inside it.
+    pub fn debug_view_active(&self) -> bool {
+        self.state.debug_canvas_view
+    }
+
     /// Advertised output geometry, for recomputing viewports after the
     /// selection rectangle changed in edit mode.
     pub fn output_infos(&self) -> Vec<OutputInfo> {
@@ -1175,6 +1201,14 @@ impl SelectionSession {
                 crate::trace_log!("prepare: skip edit_drag active");
                 return Ok(None);
             }
+            // The debug canvas view paints the stitched canvas *inside* the
+            // box, so a capture prepared now would photograph our own drawing.
+            // Skip instead: the worker is paused while the view is up, and it
+            // retries only after it is dismissed.
+            if self.state.debug_canvas_view {
+                crate::trace_log!("prepare: skip debug canvas view");
+                return Ok(None);
+            }
             if self.long_status() != LongSessionStatus::Running {
                 crate::trace_log!("prepare: skip status={:?}", self.long_status());
                 return Ok(None);
@@ -1357,6 +1391,12 @@ fn render_live_overlays(state: &mut UiState, output_name: Option<u32>) -> usize 
             buffer.base_key = Some(base_key);
             buffer.painted = Painted::default();
         }
+        // With the debug view on, the preview is drawn *inside* the box too:
+        // that is the whole point — the box shows what the stitcher built at
+        // this scroll position, so a wrong placement is visible where it
+        // happened. The base is still laid down with the real hole, so any
+        // canvas pixel that was never captured keeps showing the live screen.
+        let preview_hole = if state.debug_canvas_view { None } else { selection_local };
         let border_thickness = buffer_length(border_width, overlay.width, output.info.logical.width);
         let footprint = preview_footprint(
             state.long_preview.as_ref(),
@@ -1377,7 +1417,7 @@ fn render_live_overlays(state: &mut UiState, output_name: Option<u32>) -> usize 
         );
 
         draw_live_foreground(data, overlay.width, overlay.height, output.info.logical,
-            selection_local, border_local, state.long_preview.as_ref(), border_width, border_color);
+            preview_hole, border_local, state.long_preview.as_ref(), border_width, border_color);
         buffer.painted = next;
         overlay.surface.attach(Some(&buffer.buffer), 0, 0);
         // The damage is what was actually rewritten. A rebuilt base writes
@@ -1571,6 +1611,17 @@ fn invalidate_overlay_bases(state: &mut UiState) {
     }
 }
 
+/// Leaves the debug canvas view and restores the real screen in the box.
+fn leave_debug_canvas_view(state: &mut UiState) {
+    if !state.debug_canvas_view {
+        return;
+    }
+    state.debug_canvas_view = false;
+    invalidate_overlay_bases(state);
+    state.live_state_seq = state.live_state_seq.wrapping_add(1);
+    request_render(state, true);
+}
+
 /// Abandons the frozen screen images and switches every overlay to the live
 /// render path, so the real screen shows through the selection hole
 /// immediately. Called when long capture is requested: the user pressed L to
@@ -1605,6 +1656,7 @@ enum KeyAction {
     /// finish a running long capture.
     ConfirmSelection,
     HintDirection(SearchDirection),
+    ToggleDebugCanvas,
     CaptureOutputByIndex(usize),
     Ignore,
 }
@@ -1626,6 +1678,8 @@ fn resolve_key_action(state: &UiState, key: u32) -> KeyAction {
         && (state.editing || (state.long_mode && state.drag.is_finished()))
     {
         KeyAction::ConfirmSelection
+    } else if key == KEY_R && state.long_mode && state.drag.is_finished() && !state.editing {
+        KeyAction::ToggleDebugCanvas
     } else if state.long_mode && state.drag.is_finished() {
         match key {
             KEY_DOWN => KeyAction::HintDirection(SearchDirection::Down),
@@ -1658,6 +1712,16 @@ fn apply_key_action(state: &mut UiState, action: KeyAction) -> Option<OverlayInp
             None
         }
         KeyAction::ToggleEdit => toggle_edit_mode(state),
+        KeyAction::ToggleDebugCanvas => {
+            state.debug_canvas_view = !state.debug_canvas_view;
+            // The base is unchanged, but the hole has to go back to transparent
+            // (or be painted by the canvas) rather than keep the previous
+            // foreground, so the rebuilt-base path is the safe one.
+            invalidate_overlay_bases(state);
+            state.live_state_seq = state.live_state_seq.wrapping_add(1);
+            request_render(state, true);
+            None
+        }
         KeyAction::PromoteLong => {
             state.editing = false;
             state.edit_drag = None;
@@ -1933,6 +1997,18 @@ fn render_overlays(state: &mut UiState) -> usize {
         // step of an 800x500 box changes ~16 000 pixels, while the union of the
         // two rings is ~408 000. Compositing the box measured 93% of a drag's
         // CPU, almost all of it re-deriving pixels that were already correct.
+        // The bands are derived from the box mapped into buffer pixels (its
+        // edges floored), while the renderer classifies a buffer pixel by the
+        // *logical* pixel it covers. On a fractionally scaled output the two
+        // roundings can disagree by one buffer pixel at the box's edge, and a
+        // band one pixel too small leaves a line of the previous box on screen
+        // — the reported residue after moving the box in normal mode (the live
+        // path repaints the whole buffer, which is why long mode never showed
+        // it). One buffer pixel of outset costs the perimeter and makes the two
+        // agree; at an identity scale the two mappings cannot disagree.
+        let damage_outset = i32::from(
+            overlay.width != output.info.logical.width || overlay.height != output.info.logical.height,
+        );
         let damage: Vec<LogicalRect> = if buffer.initialized {
             changed_selection_rects(
                 buffer.last_selected,
@@ -1941,6 +2017,17 @@ fn render_overlays(state: &mut UiState) -> usize {
                 overlay.width,
                 overlay.height,
             )
+            .into_iter()
+            .map(|band| outset_rect(band, damage_outset))
+            .filter_map(|band| {
+                band.intersection(LogicalRect {
+                    x: 0,
+                    y: 0,
+                    width: overlay.width,
+                    height: overlay.height,
+                })
+            })
+            .collect()
         } else {
             vec![LogicalRect { x: 0, y: 0, width: overlay.width, height: overlay.height }]
         };
@@ -2895,6 +2982,16 @@ fn changed_selection_rects(
         .collect()
 }
 
+/// Grows a rectangle by `by` pixels on every side.
+fn outset_rect(rect: LogicalRect, by: i32) -> LogicalRect {
+    LogicalRect {
+        x: rect.x - by,
+        y: rect.y - by,
+        width: rect.width + by * 2,
+        height: rect.height + by * 2,
+    }
+}
+
 fn rect_union(a: LogicalRect, b: LogicalRect) -> LogicalRect {
     let x = a.x.min(b.x);
     let y = a.y.min(b.y);
@@ -3262,6 +3359,9 @@ impl Dispatch<WlPointer, ()> for UiState {
                 };
                 match button_state {
                     wl_pointer::ButtonState::Pressed => {
+                        // A click means the user is interacting with the box,
+                        // not reading the debug view.
+                        leave_debug_canvas_view(state);
                         if state.editing && state.drag.is_finished() {
                             // Edges have snap targets only in edit mode; the
                             // box interior drags the whole box around.
@@ -3348,6 +3448,12 @@ impl Dispatch<WlKeyboard, ()> for UiState {
             let action = resolve_key_action(state, key);
             if matches!(action, KeyAction::Ignore) {
                 return;
+            }
+            // The debug canvas view is modal: any other key (a scroll hint, an
+            // edit, confirm, cancel) means the user is moving on, so the box
+            // goes back to the real screen before that key does its work.
+            if state.debug_canvas_view && !matches!(action, KeyAction::ToggleDebugCanvas) {
+                leave_debug_canvas_view(state);
             }
             if let Some(mode) = apply_key_action(state, action) {
                 match mode {
@@ -4163,6 +4269,76 @@ mod tests {
     }
 
     #[test]
+    fn r_key_toggles_the_debug_canvas_only_in_long_mode() {
+        let mut state = ui_state();
+        state.drag = DragState::Finished(SELECTED);
+        assert_eq!(resolve_key_action(&state, KEY_R), KeyAction::Ignore, "normal mode has no canvas view");
+        state.long_mode = true;
+        assert_eq!(resolve_key_action(&state, KEY_R), KeyAction::ToggleDebugCanvas);
+        let seq = state.live_state_seq;
+        apply_key_action(&mut state, KeyAction::ToggleDebugCanvas);
+        assert!(state.debug_canvas_view);
+        assert_ne!(state.live_state_seq, seq, "every overlay must repaint");
+        apply_key_action(&mut state, KeyAction::ToggleDebugCanvas);
+        assert!(!state.debug_canvas_view);
+        // While the box is being edited, E owns the keyboard.
+        state.editing = true;
+        assert_eq!(resolve_key_action(&state, KEY_R), KeyAction::Ignore);
+    }
+
+    #[test]
+    fn leaving_the_debug_view_restores_the_real_screen() {
+        let mut state = ui_state();
+        state.long_mode = true;
+        state.drag = DragState::Finished(SELECTED);
+        apply_key_action(&mut state, KeyAction::ToggleDebugCanvas);
+        assert!(state.debug_canvas_view);
+        let seq = state.live_state_seq;
+        leave_debug_canvas_view(&mut state);
+        assert!(!state.debug_canvas_view);
+        assert_ne!(state.live_state_seq, seq);
+        // Idempotent: leaving twice does not churn the overlay.
+        let seq = state.live_state_seq;
+        leave_debug_canvas_view(&mut state);
+        assert_eq!(state.live_state_seq, seq);
+    }
+
+    /// With the debug view on, the preview is drawn inside the box as well, so
+    /// the user sees the stitched canvas where the capture happens. The border
+    /// is the debug colour and still wins over the preview.
+    #[test]
+    fn the_debug_canvas_view_paints_the_canvas_inside_the_box() {
+        let output = LogicalRect { x: 0, y: 0, width: 100, height: 100 };
+        let hole = LogicalRect { x: 30, y: 30, width: 40, height: 40 };
+        let preview_color = [40, 80, 120, 255];
+        let preview = LongPreviewSnapshot {
+            image: solid_image(100, 100, &[(0, 100, preview_color)]),
+            opaque: true,
+            current_origin_x: 0,
+            current_origin_y: 0,
+            viewport_rect: output,
+            capture_width: 100,
+            capture_height: 100,
+        };
+        let mut base = vec![0; 100 * 100 * 4];
+        draw_live_base(&mut base, 100, 100, Some(hole));
+        let mut normal = base.clone();
+        draw_live_foreground(&mut normal, 100, 100, output, Some(hole), Some(hole), Some(&preview), 3, OVERLAY_BORDER_WHITE_BGRA);
+        let mut debug = base.clone();
+        draw_live_foreground(&mut debug, 100, 100, output, None, Some(hole), Some(&preview), 3, OVERLAY_DEBUG_BORDER_BGRA);
+        let pixel = |data: &[u8], x: i32, y: i32| {
+            let offset = ((y * 100 + x) * 4) as usize;
+            [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]
+        };
+        assert_eq!(pixel(&normal, 50, 50), OVERLAY_SELECTED_TRANSPARENT_BGRA, "the box shows the real screen normally");
+        assert_eq!(pixel(&debug, 50, 50), preview_color, "the debug view shows the canvas in the box");
+        // Outside the box both show the canvas; the border still lands on top.
+        assert_eq!(pixel(&normal, 10, 10), preview_color);
+        assert_eq!(pixel(&debug, 10, 10), preview_color);
+        assert_eq!(pixel(&debug, 50, 29), OVERLAY_DEBUG_BORDER_BGRA);
+    }
+
+    #[test]
     fn live_border_is_above_preview_on_every_redraw() {
         let output = LogicalRect { x: 0, y: 0, width: 100, height: 100 };
         let hole = LogicalRect { x: 30, y: 30, width: 40, height: 40 };
@@ -4253,6 +4429,52 @@ mod tests {
         let mut expected = vec![0; data.len()];
         draw_overlay(&mut expected, &cache, output, &frozen, false, Some(new), 16, OVERLAY_BORDER_WHITE_BGRA);
         assert_eq!(data, expected);
+    }
+
+    /// The same dirty-redraw contract as `dirty_redraw_erases_old_border…`,
+    /// but on an output whose overlay buffer is denser than the logical grid
+    /// (a fractionally scaled 4K output: 1.5 buffer pixels per logical one).
+    ///
+    /// The damage bands are computed from the box mapped into *buffer* pixels
+    /// while the renderer classifies each buffer pixel by the *logical* pixel
+    /// it covers. Those two roundings can disagree by one pixel at the box's
+    /// edge, and a band that is one buffer pixel too small leaves a thin line
+    /// of the previous box on screen — the reported residue after moving the
+    /// selection box in normal mode (the live path repaints the whole buffer,
+    /// which is why long mode does not show it).
+    #[test]
+    fn dirty_redraw_erases_old_border_on_a_fractionally_scaled_output() {
+        let output = OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 0, width: 100, height: 80 }, scale: 2 };
+        let (buffer_w, buffer_h) = (150, 120);
+        let frozen = frozen_test_output(output, buffer_w, buffer_h, [20, 30, 40, 255]);
+        let cache = build_overlay_render_cache(buffer_w, buffer_h);
+        let thickness = 3;
+        let buffer_thickness = buffer_length(thickness, buffer_w, output.logical.width);
+        let old = LogicalRect { x: 20, y: 20, width: 30, height: 20 };
+        let new = LogicalRect { x: 27, y: 23, width: 31, height: 21 };
+        let old_local = selected_buffer_rect(output, old, buffer_w, buffer_h).unwrap();
+        let new_local = selected_buffer_rect(output, new, buffer_w, buffer_h).unwrap();
+        let mut data = vec![0u8; (buffer_w * buffer_h * 4) as usize];
+        draw_overlay(&mut data, &cache, output, &frozen, false, Some(old), thickness, OVERLAY_BORDER_WHITE_BGRA);
+        let clamp = LogicalRect { x: 0, y: 0, width: buffer_w, height: buffer_h };
+        for band in changed_selection_rects(Some(old_local), Some(new_local), buffer_thickness, buffer_w, buffer_h)
+            .into_iter()
+            .filter_map(|band| outset_rect(band, 1).intersection(clamp))
+        {
+            draw_overlay_region(&mut data, &cache, output, &frozen, false, Some(new), band, thickness, OVERLAY_BORDER_WHITE_BGRA);
+        }
+        let mut expected = vec![0u8; data.len()];
+        draw_overlay(&mut expected, &cache, output, &frozen, false, Some(new), thickness, OVERLAY_BORDER_WHITE_BGRA);
+        for y in 0..buffer_h {
+            for x in 0..buffer_w {
+                let offset = ((y * buffer_w + x) * 4) as usize;
+                assert_eq!(
+                    data[offset..offset + 4],
+                    expected[offset..offset + 4],
+                    "buffer pixel ({x},{y}) still shows the old box"
+                );
+            }
+        }
     }
 
     #[test]
