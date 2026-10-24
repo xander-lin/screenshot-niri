@@ -576,12 +576,13 @@ Unweighted mean of the per-corpus medians (push mean / push p95):
 
 **What this says.**
 
-* PGO is **neutral to slightly negative** here. The hot paths are pixel and
-  memory-bandwidth loops (conversion, luminance, descriptors, row copies) with
-  almost no unpredictable branches, so profile-guided block layout and inlining
-  hints have little left to win — and the layout it did choose costs a few
-  percent on `p95`. `lto = "thin"` + one codegen unit already inlines across
-  modules.
+* PGO is **neutral to slightly negative** here: push mean +0-5%, p95 +1-10%
+  on four of five corpora (synthetic 4K's p95 was 4% better). The hot paths are
+  pixel and memory-bandwidth loops (conversion, luminance, descriptors, row
+  copies) with almost no unpredictable branches, so profile-guided block layout
+  and inlining hints have little left to win — and the layout it did choose
+  costs a few percent on `p95`. `lto = "thin"` + one codegen unit already
+  inlines across modules.
 * `-C target-cpu` is the real lever: AVX2/AVX-512 auto-vectorisation cuts push
   cost by roughly **a quarter to a third**, and the small-corpus preview cost
   by up to half. `x86-64-v3` and `native` are within noise of each other, so

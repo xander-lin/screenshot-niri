@@ -456,7 +456,7 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
   inlines across modules. PGO can only improve layout/inlining; the available
   gain was SIMD width, which it does not change. Its block layout also cost a
   few percent of p95.
-- **Correction**: PGO was **not adopted** (`push` mean +2-5%, p95 +1-11%,
+- **Correction**: PGO was **not adopted** (`push` mean +0-5%, p95 +1-10%;
   preview unchanged). `-C target-cpu=x86-64-v3` / `native` was measured as the
   separate lever that does help (`push` −20 to −37%, p95 −15 to −33%), but it
   is not enabled for published builds because it raises the supported CPU
