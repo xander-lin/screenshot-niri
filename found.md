@@ -433,9 +433,21 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
   2. 尾延迟必须先归因到具体分支/阶段再优化；"最像的原因"在这条语料上完全错了，按它去改 anchor 只会白花时间。
   3. 测量工具的字段必须真的被生产路径填上：`StitchProfileBreakdown` 的多数阶段只在 legacy 路径里计时，这让 shipped 路径的分解长期全是 0，"没有热点"其实是"没有测量"。现在 `frame_prepare`/`canvas_match` 由 shipped 路径填写。
 
----
+### 40. 为了并行而先复制一遍，等于把要省掉的串行成本原样付回去
+
+预览窗口转换（`image_from_stitched_window_reusing`）是最后一个逐帧单线程 pass。最直觉的并行方案是「先把窗口的行快照到连续缓冲，再多线程转换」——但这一步拷贝本身就是 25 MB 的串行内存流量，恰好是并行要省掉的那部分，净收益接近零。
+
+- **做法**：让 `CanvasStore` 在**一次借用内**把整段 tile 解压好（`with_resident_rows`），再把 `&[Tile]`/`&[bool]` 切片交给调用者。这个视图是 `Sync` 的，scoped 线程可以直接读行切片——没有拷贝，也不需要给 `pixel` 热路径加锁（per-tile `Mutex` 会让重复判定的采样路径每像素一次加锁）。范围无法常驻时（窗口比工作集预算还大，touch 过程会驱逐自己）返回 `None`，调用者退回串行读，而不是悄悄输出透明行。
+- **实测**：3840x2160 预览 2.9 → 1.9–2.1 ms（1.45×），`real-5-4k` 0.36 → 0.24 ms。收益停在 1.5× 是因为这 pass 已经是内存带宽瓶颈：三种 `expand_row` 写法（逐字节展开、u32 store、12→16 字节 word swizzle）单线程实测 4.2 / 5.6 / 4.3 ms，说明字节重排不是瓶颈，继续换写法没有意义。
+- **Prevention**：
+  1. 并行化的第一步是问「这块数据能不能**不复制**地被多个线程读」，而不是「怎么把复制并行化」。所有权/借用设计（把只读切片交出去）通常比拷贝便宜一个数量级。
+  2. 加了线程之后先看带宽：如果单线程已经跑在十几 GB/s，线程数带来的收益会远低于核心数，别再为 1.2× 继续折腾。
+  3. 并行路径必须有逐字节等价测试和「不可并行时的确定性回退」，否则一个偏移错误会以"行列错位"的形式悄悄进入预览。
 
 ## Verification Memory
+
+- **Local install 0.1.0-44 (2026-10-24)**: HEAD `206a1f1` (preview window conversion on up to four helpers via `CanvasStore::with_resident_rows`) packaged with the local recipe, pkgrel 44, installed over 0.1.0-43. `makepkg` with `check()` passed (260 tests), `pacman -Qkk` reports 0 altered files (11 total), installed `/usr/bin/screenshot` sha256 `2c5efe0c…`. Preview: 3840x2160 2.9 → 2.0 ms, `real-5-4k` 0.36 → 0.24 ms, all 11 corpora unchanged. Awaiting a real-machine 4K long capture (preview + axis fixes should both show as a steadier UI thread).
+
 
 - **Local install 0.1.0-43 (2026-10-24)**: HEAD `ce758fa` (zero-delta acceptance no longer records an impulse; shipped-path profile stages filled; `stitch-bench` prints the slowest frames and their per-stage split; `verify-corpora`) packaged with the local recipe, pkgrel 43, installed over 0.1.0-42. `makepkg` with `check()` passed (259 tests), `pacman -Qkk` reports 0 altered files (11 total), installed `/usr/bin/screenshot` sha256 `9927ff4d…`. `real-5-4k`: push mean 2.50 → 0.84 ms, p95 12.14 → 1.57 ms, UI thread 2.86 → 1.19 ms; all 11 corpora still match their baselines. Awaiting a real-machine pass on a 4K long capture (the preview/axis changes should both show up as a steadier UI thread) and on a horizontal (snake) capture, which still pays ~8.7 ms per turn — recorded in `docs/backlog.md` P1.
 
