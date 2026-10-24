@@ -1,3 +1,4 @@
+pub mod corpus;
 pub mod geometry;
 pub mod image;
 pub mod config;
