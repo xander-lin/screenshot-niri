@@ -383,22 +383,33 @@ fn run_long_capture(
                 if matches!(outcome, PushResult::Initialized | PushResult::Accepted { .. }) {
                     if let Some(s) = stitcher.stitched() {
                         // Only the part of the canvas the overlay can reach.
-                        //
-                        // The overlay samples the screen through the capture's
-                        // own density, so at most one output's worth of canvas
-                        // is visible: the selection box plus the rows around it
-                        // that the box has already scrolled past. Handing it the
-                        // whole canvas meant a full RGBA copy of the entire
-                        // capture on every accepted frame — 22 MB on `real-1`,
-                        // 45 MB on `real-long` — of which the overlay read one
-                        // screenful.
+                        // Handing it the whole canvas meant a full RGBA copy of
+                        // the entire capture on every accepted frame — 22 MB on
+                        // `real-1`, 45 MB on `real-long` — of which the overlay
+                        // read one screenful.
+                        let output_infos = selection_session.output_infos();
+                        // Map the preview through the frame's own capture
+                        // region (the inset rectangle the stitched content
+                        // actually came from), not the un-inset selection box:
+                        // they differ by the one-pixel inset, and a preview
+                        // offset from the real screen content gets re-captured
+                        // after selection-box edits.
+                        let preview_viewport =
+                            crate::geometry::capture_region_logical_rect(region, &output_infos)
+                                .unwrap_or(live_rect);
+                        let output = output_infos
+                            .iter()
+                            .find(|info| info.global_name == region.output_name)
+                            .map(|info| info.logical)
+                            .unwrap_or(preview_viewport);
                         let window = preview_window(
                             s,
                             s.current_origin_x,
                             s.current_origin_y,
                             current_frame.width,
                             current_frame.height,
-                            live_rect,
+                            preview_viewport,
+                            output,
                         );
                         let recycled = std::mem::take(&mut preview_buffer);
                         if let Ok(rendered) = crate::stitch::image_from_stitched_window_reusing(
@@ -406,17 +417,6 @@ fn run_long_capture(
                             window,
                             recycled,
                         ) {
-                            // Map the preview through the frame's own capture
-                            // region (the inset rectangle the stitched content
-                            // actually came from), not the un-inset selection
-                            // box: they differ by the one-pixel inset, and a
-                            // preview offset from the real screen content
-                            // gets re-captured after selection-box edits.
-                            let preview_viewport = crate::geometry::capture_region_logical_rect(
-                                region,
-                                &selection_session.output_infos(),
-                            )
-                            .unwrap_or(live_rect);
                             let (capture_width, capture_height) = (
                                 current_frame.width,
                                 current_frame.height,
@@ -518,33 +518,63 @@ fn run_long_capture(
 
 /// The canvas region the overlay can display, as a [`CanvasWindow`].
 ///
-/// The overlay maps its own buffer onto the canvas through the capture's
-/// density, so the canvas pixels it can reach are the selection's own rectangle
-/// plus the screen area around it — everything the box has scrolled past and
-/// that is still on screen, up to one output's worth of canvas in each
-/// direction. Anything beyond that is not addressable from the overlay at all.
+/// The overlay maps each of its buffer pixels to the canvas pixel under it, so
+/// the canvas pixels it can reach are the capture's own rectangle plus the part
+/// of the output the box does not cover, on each side. That is an exact
+/// geometric bound, not a guess: for logical column `x` of the output the
+/// overlay reads canvas column `origin_x + (x - viewport.x) * density`.
 ///
-/// The window is generous by one viewport on every side: the mapping also draws
-/// the canvas rows *above* the box (that is the point of the live preview), and
-/// a selection-box edit can move the box while a frame is in flight.
+/// The window used to be three viewports tall whatever the box position — at 4K
+/// that is 25 MP converted per accepted frame, of which the overlay reads at
+/// most the screen. The reach is now the margin between the box and the output
+/// edge, which is what the preview actually paints.
 fn preview_window(
     canvas: &crate::stitch::StitchedFrame,
     origin_x: i32,
     origin_y: i32,
     capture_width: u32,
     capture_height: u32,
-    live_rect: crate::geometry::LogicalRect,
+    viewport: crate::geometry::LogicalRect,
+    output: crate::geometry::LogicalRect,
 ) -> crate::stitch::CanvasWindow {
-    let reach_x = capture_width.max(live_rect.width.max(0) as u32) as i32;
-    let reach_y = capture_height.max(live_rect.height.max(0) as u32) as i32;
+    let (left, top, right, bottom) = preview_reach(capture_width, capture_height, viewport, output);
     crate::stitch::CanvasWindow::clipped(
         canvas,
-        origin_x - reach_x,
-        origin_y - reach_y,
-        reach_x.saturating_mul(3),
-        reach_y.saturating_mul(3),
+        origin_x - left,
+        origin_y - top,
+        left.saturating_add(capture_width as i32).saturating_add(right),
+        top.saturating_add(capture_height as i32).saturating_add(bottom),
     )
     .unwrap_or_else(|| crate::stitch::CanvasWindow::full(canvas))
+}
+
+/// Canvas pixels the overlay can reach outside the capture, per side:
+/// `(left, top, right, bottom)`.
+///
+/// The overlay maps a screen pixel to the canvas pixel under it, so the reach is
+/// the part of the output the box does not cover, converted to canvas pixels by
+/// the capture's own density.
+fn preview_reach(
+    capture_width: u32,
+    capture_height: u32,
+    viewport: crate::geometry::LogicalRect,
+    output: crate::geometry::LogicalRect,
+) -> (i32, i32, i32, i32) {
+    let dx = f64::from(capture_width) / f64::from(viewport.width.max(1));
+    let dy = f64::from(capture_height) / f64::from(viewport.height.max(1));
+    // `ceil` plus one: the overlay floors its own division, and one canvas pixel
+    // of slack costs nothing while a missing column would show the dim base
+    // through the preview.
+    let reach = |from: i32, to: i32, density: f64| -> i32 {
+        let span = f64::from(to.saturating_sub(from)).max(0.0);
+        (span * density).ceil() as i32 + 1
+    };
+    (
+        reach(output.x, viewport.x, dx),
+        reach(output.y, viewport.y, dy),
+        reach(viewport.right(), output.right(), dx),
+        reach(viewport.bottom(), output.bottom(), dy),
+    )
 }
 
 /// Fast raw-frame similarity check. Samples every 8th pixel, 4px per row.
@@ -758,6 +788,38 @@ mod tests {
         );
         // Unknown output: unmappable.
         assert!(capture_region_logical_rect(region, &[]).is_none());
+    }
+
+    /// The preview window is the exact canvas range the overlay can address.
+    /// It used to be three viewports tall whatever the box position, so at 4K it
+    /// converted 25 MP per accepted frame where the overlay reads one screen.
+    #[test]
+    fn preview_reach_covers_exactly_the_margin_around_the_box() {
+        use crate::geometry::LogicalRect;
+        let output = LogicalRect { x: 0, y: 0, width: 1920, height: 1080 };
+        // A 400x300 box at (100,200), capture at the same density: the overlay
+        // addresses canvas columns origin-100 .. origin+1820 and rows
+        // origin-200 .. origin+880, plus one pixel of slack per side.
+        let viewport = LogicalRect { x: 100, y: 200, width: 400, height: 300 };
+        assert_eq!(preview_reach(400, 300, viewport, output), (101, 201, 1421, 581));
+        // The same box on a second output: only output-local offsets matter.
+        let second = LogicalRect { x: 1920, y: 0, width: 1920, height: 1080 };
+        let shifted = LogicalRect { x: 2020, y: 200, width: 400, height: 300 };
+        assert_eq!(preview_reach(400, 300, shifted, second), (101, 201, 1421, 581));
+        // A box that fills the output reaches nothing but the slack.
+        let full = LogicalRect { x: 0, y: 0, width: 1920, height: 1080 };
+        assert_eq!(preview_reach(1920, 1080, full, output), (1, 1, 1, 1));
+        // Fractional scale: the capture is denser than the logical grid, so the
+        // same logical margin is more canvas pixels.
+        let scaled = LogicalRect { x: 0, y: 0, width: 1280, height: 720 };
+        assert_eq!(
+            preview_reach(1920, 1080, scaled, output),
+            (1, 1, 961, 541),
+            "a full-output box on a 1.5x output"
+        );
+        // A box 100 logical px from the left edge, capture at 1.5x.
+        let inset = LogicalRect { x: 100, y: 200, width: 400, height: 300 };
+        assert_eq!(preview_reach(600, 450, inset, output), (151, 301, 2131, 871));
     }
 
     #[test]

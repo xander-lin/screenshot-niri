@@ -45,6 +45,25 @@ Memory at 4K, one output: overlay buffers 2 × 33.2 MB, preview image 33.2 MB,
 capture frame 33.2 MB (Vec) + 33.2 MB (shm mmap), channel queue up to
 4 × 33.2 MB, canvas packed separately.
 
+## Result after the six items
+
+| stage | before | after |
+|---|---|---|
+| `push` (4K) | 18.7 | **13.55** |
+| preview image (4K, one screenful) | 5.9 | **3.24** |
+| overlay: base copy | 1.6 | **0** (the base is uniform, item 2) |
+| overlay: preview draw | 3.2–10.0 | **0.01–2.1** |
+| overlay: border | 0.01 | 0.01 |
+| **UI thread (4K)** | **29.4–36.3** | **16.8–18.9** (50–57% of 33.3 ms) |
+| capture thread (1080p, real screencopy) | 6.82–6.91 | **1.87–1.93** |
+
+1080p: `push` 4.94 → **3.66 ms**, preview 1.36 → **0.58 ms**. All seven corpora
+unchanged at every step (204/97/7/3/7/7/78 accepted, 0 misplaced, 0 uncovered).
+
+The real session converts ~1.7 screenfuls of preview instead of three (see item
+6), so its per-frame preview is larger than the bench's one-screenful figure but
+still well under what it was.
+
 ## The six items
 
 Order is by (value ÷ risk), not by size. Each item is a separate commit with its
@@ -228,35 +247,53 @@ conversion pass:
 fused means and compares it with `EdgeLadder::from_source` for two gains —
 levels and scoring rows must be equal, not merely equivalent placements.
 
-### 6. Draw the preview from the canvas instead of through an RGBA image — 5.9 ms → ~2.0 ms
+### 6. Stop converting pixels the overlay never reads — done
 
-**Problem.** Every accepted frame builds a 33 MB RGBA image of the visible
-canvas (`image_from_stitched_window_reusing`, 5.9 ms), and the overlay then
-reads it back to paint (item 1's copy). The intermediate image exists only to
-carry pixels from the canvas to the overlay: 24.9 MB read + 33 MB written, then
-33 MB read again.
+**Problem.** `image_from_stitched_window_reusing` converted a window of the
+canvas to RGBA for the overlay. Three separate wastes:
 
-**Approach.** Give the overlay a pixel source it can sample directly
-(`trait PreviewPixels { fn width/height/stride; fn row_into(&self, y, x, dst) }`
-or an equivalent), implemented by the canvas window (RGB, converted to BGRA in
-the draw loop) and by the test mock. `LongPreviewSnapshot` holds that source
-instead of an `Image`. The draw then converts and writes in one pass: canvas →
-overlay, no intermediate buffer. The overlay still owns the density mapping,
-the hole, the border and the opacity fast path from item 1.
+1. **The window was three viewports tall whatever the box position.** The
+   overlay maps each buffer pixel to the canvas pixel under it, so it can only
+   address the capture plus the margin between the box and the output edge. The
+   old window was `origin - reach .. origin + 2*reach`; at 4K, once the canvas
+   had grown, that is 25 MP converted per accepted frame of which the overlay
+   reads one screen.
+2. **Every row was copied into a scratch buffer first.** 25 MB written plus
+   25 MB read per 4K screenful, on top of the 25 MB read and 33 MB write the
+   expansion already does — for a row the tile store can hand out directly.
+3. **The expansion was one pixel at a time.** Measured in isolation on this
+   machine (4K screenful): the `as_chunks::<3>` / `as_chunks_mut::<4>` zip
+   6.7 ms, the same expansion writing 16 bytes per four pixels 3.2 ms, a plain
+   memcpy of the same volume 1.6 ms.
 
-This is the one structural change: it crosses the `stitch` → `wayland::selection`
-boundary, so the interface goes in a neutral place (e.g. `src/stitch/canvas.rs`
-exports a `CanvasWindow`-backed `PreviewPixels`), and the overlay only ever sees
-the trait. Mock implementation required by the project's architecture rules.
+**Approach (as built).** No new trait and no ownership change: the snapshot is
+still an owned image, because the overlay renders on its own schedule and
+cannot borrow the canvas across the session boundary. What changed is what gets
+converted and how:
 
-**Files.** new trait + canvas impl, `src/wayland/selection.rs`
-(`draw_preview_on_overlay`, `LongPreviewSnapshot`), `src/app.rs`,
-`src/bin/stitch-bench.rs` (preview measurement moves to the draw).
+- `preview_reach` computes the exact canvas margin the overlay can address
+  (`origin ± (box margin × capture density)`, plus one pixel of slack for the
+  overlay's flooring), and `preview_window` is that rectangle clipped to the
+  canvas. A box that fills the output needs no margin at all; the old window
+  still converted three screens.
+- A whole row is expanded straight out of the tile that holds it
+  (`CanvasStore::with_row`), no scratch copy. The scratch is still there for
+  ragged (T/L/arch) rows, where the per-column coverage test needs it.
+- `expand_row` writes 16 bytes per four pixels.
 
-**Acceptance.** Overlay tests unchanged in behaviour (they can use a mock or an
-in-memory implementation). Preview correctness on the corpora (the stitched PNG
-path is untouched). Perf at 4K: the 5.9 ms preview stage disappears; the draw
-grows by ~2 ms; net ~4 ms.
+**Files.** `src/stitch/canvas.rs` (`image_from_stitched_window_reusing`,
+`expand_row`), `src/app.rs` (`preview_window`, `preview_reach`).
+
+**Measured (median of 3).** 4K preview 6.0 → **3.24 ms**; 1080p 1.36 →
+**0.58 ms**. Push unchanged (13.55). 4K UI thread (push + preview) 19.59 →
+**16.80 ms** (50% of the 33.3 ms budget). The real session converts ~1.7
+screenfuls instead of 3 (a 4K box of 3000×1600 at (400,300): 4917×2918 vs
+3840×6480), so the real per-frame saving is larger than the bench's.
+
+**Acceptance.** Overlay tests unchanged. A test pins the expansion against the
+per-pixel form for widths that are not multiples of four; a test pins
+`preview_reach` for a box inside the output, a box filling it, a second output
+and a fractional scale. Corpora unchanged.
 
 ## Verification for every item
 
@@ -280,4 +317,4 @@ grows by ~2 ms; net ~4 ms.
 | 3 capture buffer reuse | **done** | real screencopy 1080p p50 6.82–6.91 → **1.87–1.93 ms** (p95 8.1 → 3.2); at 4K the page cost is 4x. `to_vec` recycling skipped: a fresh 33 MB Vec is 1.42 ms and needs a return channel. Corpora unchanged. clippy 41. |
 | 4 canvas row sampling | **done** | 4K push 18.76 → **15.97 ms** (median of 3), 1080p 4.94 → **4.17**; preview unchanged. Corpora unchanged. Two equivalence tests. clippy 41. |
 | 5 fused conversion + descriptor | **done** | 4K push 15.97 → **13.55 ms** (median of 3), 1080p 4.17 → **3.70**; preview unchanged. UI thread at 4K (push + preview) 21.85 → **19.59 ms** (59%). Corpora unchanged. Ladder-equality test. clippy 41. |
-| 6 preview direct from canvas | not started | |
+| 6 preview window + expansion | **done** | 4K preview 6.0 → **3.24 ms** (median of 3), 1080p 1.36 → **0.58**; push unchanged. UI thread at 4K (push + preview) 19.59 → **16.80 ms** (50%). Window is the exact addressable margin, not three screens. Corpora unchanged. Two tests. clippy 41. |

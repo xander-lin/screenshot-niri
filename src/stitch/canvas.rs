@@ -208,24 +208,18 @@ pub fn image_from_stitched_window_reusing(
     // One row at a time: a per-pixel accessor would put a borrow check and a
     // working-set lookup on every one of them (measured: 3× the cost of the
     // whole rest of the frame).
+    //
+    // The scratch row is only for the ragged case. A whole row is expanded
+    // straight out of the tile it lives in: copying it into a scratch first
+    // cost a 25 MB write plus a 25 MB read per 4K screenful, on top of the
+    // 25 MB read and 33 MB write the expansion already does.
     let mut source = vec![0u8; window.width as usize * 3];
     let mut opaque = true;
     for row in 0..window.height {
         let canvas_y = window.y as u32 + row;
         let dst_row = row as usize * stride as usize;
+        let dst = &mut data[dst_row..dst_row + stride as usize];
         let covered = frame.row_coverage.get(canvas_y as usize);
-        let have_row = frame
-            .store
-            .row_into(window.x as u32, canvas_y as i32, &mut source);
-        if !have_row {
-            // Nothing was ever written here; the row stays transparent. The
-            // buffer is recycled, so "stays" has to be written down: without
-            // this the row would show the previous frame's pixels, and the
-            // overlay paints any pixel with a non-zero alpha.
-            data[dst_row..dst_row + stride as usize].fill(0);
-            opaque = false;
-            continue;
-        }
         // Coverage is decided per row, not per pixel. The common canvas is
         // rectangular and every row is `Full`, so this branch settles the whole
         // row at once instead of asking `contains` 1920 times — the per-pixel
@@ -238,25 +232,38 @@ pub fn image_from_stitched_window_reusing(
             Some(RowCoverage::Spans(_)) => covered.is_some_and(|row| row.covers(first, last)),
         };
         if whole_row {
-            // Whole row visible: one pass, channel-swapped and opaque.
-            for (source_pixel, destination) in source
-                .as_chunks::<3>()
-                .0
-                .iter()
-                .zip(data[dst_row..dst_row + stride as usize].as_chunks_mut::<4>().0.iter_mut())
-            {
-                destination[0] = source_pixel[2];
-                destination[1] = source_pixel[1];
-                destination[2] = source_pixel[0];
-                destination[3] = 255;
+            // Nothing was ever written here, or the window starts past the
+            // canvas: the row stays transparent. The buffer is recycled, so
+            // "stays" has to be written down — without this the row would show
+            // the previous frame's pixels, and the overlay paints any pixel
+            // with a non-zero alpha.
+            let drawn = frame.store.with_row(canvas_y as i32, |line| {
+                let start = window.x as usize * 3;
+                match line.get(start..start + window.width as usize * 3) {
+                    Some(source_row) => {
+                        expand_row(dst, source_row);
+                        true
+                    }
+                    None => false,
+                }
+            });
+            if drawn != Some(true) {
+                dst.fill(0);
+                opaque = false;
             }
             continue;
         }
         // Ragged row (T/L/arch shapes): only the captured extents are opaque,
         // so the gaps stay transparent rather than being filled with black.
         // Clearing first is what makes that true for a recycled buffer.
-        data[dst_row..dst_row + stride as usize].fill(0);
+        dst.fill(0);
         opaque = false;
+        if !frame
+            .store
+            .row_into(window.x as u32, canvas_y as i32, &mut source)
+        {
+            continue;
+        }
         for column in 0..window.width {
             let filled = covered.is_none_or(|row| row.contains(first + column));
             if !filled {
@@ -280,6 +287,48 @@ pub fn image_from_stitched_window_reusing(
         },
         opaque,
     })
+}
+
+/// Expands one packed-RGB row into the overlay's ARGB8888 pixels.
+///
+/// Four pixels at a time, 12 source bytes to one 16-byte store. The obvious
+/// `as_chunks::<3>` / `as_chunks_mut::<4>` zip is a per-pixel shuffle that LLVM
+/// does not vectorise; grouping the writes gives it a 16-byte store per four
+/// pixels, which is what the preview's cost is made of.
+fn expand_row(dst: &mut [u8], src: &[u8]) {
+    let pixels = src.len() / 3;
+    let dst = &mut dst[..pixels * 4];
+    let mut x = 0;
+    while x + 4 <= pixels {
+        let s = &src[x * 3..x * 3 + 12];
+        let d = &mut dst[x * 4..x * 4 + 16];
+        d[0] = s[2];
+        d[1] = s[1];
+        d[2] = s[0];
+        d[3] = 255;
+        d[4] = s[5];
+        d[5] = s[4];
+        d[6] = s[3];
+        d[7] = 255;
+        d[8] = s[8];
+        d[9] = s[7];
+        d[10] = s[6];
+        d[11] = 255;
+        d[12] = s[11];
+        d[13] = s[10];
+        d[14] = s[9];
+        d[15] = 255;
+        x += 4;
+    }
+    while x < pixels {
+        let s = &src[x * 3..x * 3 + 3];
+        let d = &mut dst[x * 4..x * 4 + 4];
+        d[0] = s[2];
+        d[1] = s[1];
+        d[2] = s[0];
+        d[3] = 255;
+        x += 1;
+    }
 }
 
 /// `crop_rgb_frame` unless the crop is the whole frame, in which case the
@@ -792,4 +841,28 @@ fn first_frame_store(frame: &RgbFrame) -> CanvasStore {
         store.write_spans(y as i32, &spans, &frame.data, frame.stride, 0, y);
     }
     store
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_row;
+
+    /// The preview's expansion is written four pixels at a time for speed. It
+    /// must produce exactly the ARGB8888 the per-pixel form did, including for
+    /// widths that are not a multiple of four.
+    #[test]
+    fn expand_row_matches_the_per_pixel_conversion() {
+        for width in [1usize, 2, 3, 4, 5, 7, 8, 9, 16, 3839] {
+            let src: Vec<u8> = (0..width * 3).map(|i| (i * 37 % 251) as u8).collect();
+            let mut dst = vec![0u8; width * 4];
+            expand_row(&mut dst, &src);
+            for x in 0..width {
+                assert_eq!(
+                    &dst[x * 4..x * 4 + 4],
+                    &[src[x * 3 + 2], src[x * 3 + 1], src[x * 3], 255],
+                    "width {width}, pixel {x}"
+                );
+            }
+        }
+    }
 }
