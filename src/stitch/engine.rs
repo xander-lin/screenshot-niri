@@ -58,6 +58,16 @@ const EDGE_MAX_SCORING_ROWS: usize = 192;
 /// enough to trust is decided by the gates below (winner cost, runner-up ratio,
 /// colour), which are normalised and do not reward or punish density.
 const EDGE_MIN_COMPARABLE_ROWS: u32 = 3;
+/// Boundary rows a *far* placement must show.
+///
+/// A placement beyond the previous frame's own height has no overlap with it,
+/// so the only evidence is how much of this frame the canvas can confirm. A
+/// sliver of a dense frame matching far away is how a repeated patch captures
+/// a jump frame; a frame with fewer than this many boundary rows carries too
+/// little content to identify a place without continuity. Local placements are
+/// not held to it: there the frame still overlaps the previous one, and that
+/// overlap is itself the evidence.
+const EDGE_FAR_MIN_SCORING_ROWS: u32 = 5;
 /// Absolute ceiling on the winner's cost.
 ///
 /// The cost is already an average over the boundary cells that carried
@@ -976,6 +986,7 @@ impl WindowedEdgeMatcher {
     /// The guard calls this once with `inner = 0` and `outer = rows`; only the
     /// anchor walks a ladder.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn decide_ring(
         &self,
         cache: &mut ScoreCache,
@@ -985,6 +996,7 @@ impl WindowedEdgeMatcher {
         outer: i32,
         bounds: (i32, i32),
         exclude: &[(i32, i32)],
+        tie_centre: i32,
         request: &PlacementRequest<'_>,
     ) -> DecideOutcome {
         let lo = (centre - outer).max(bounds.0);
@@ -1010,7 +1022,7 @@ impl WindowedEdgeMatcher {
                 costs.push((score.cost, top, score.used));
             }
         }
-        self.decide_from_costs(costs, centre, request)
+        self.decide_from_costs(costs, tie_centre, request)
     }
 
     /// Scans `lo..=hi` row by row and applies the gates.
@@ -1124,11 +1136,13 @@ impl WindowedEdgeMatcher {
 
         if crate::trace::edge_gate_trace_enabled() {
             crate::trace_log!(
-                "stitch: edge gate window={}..={} best={best_cost:.4}@{best_top} \
+                "stitch: edge gate n={} window={}..={} best={best_cost:.4}@{best_top} used={} \
                  second={second:?} rivals={} second_over_best={second_over_best:.2} \
                  max_accept={EDGE_MAX_ACCEPT_COST}",
+                costs.len(),
                 costs.iter().map(|c| c.1).min().unwrap_or(0),
                 costs.iter().map(|c| c.1).max().unwrap_or(0),
+                costs[0].2,
                 rival_tops.len()
             );
         }
@@ -1249,11 +1263,11 @@ impl WindowedEdgeMatcher {
 
         // Report the cost of the position actually accepted: the tie-break may
         // have picked a rival, and `best_cost` belongs to a different offset.
-        let chosen_cost = costs
+        let (chosen_cost, chosen_used) = costs
             .iter()
             .find(|(_, top, _)| *top == chosen)
-            .map_or(best_cost, |(cost, _, _)| *cost);
-        DecideOutcome::Accept { top: chosen, cost: chosen_cost }
+            .map_or((best_cost, 0), |(cost, _, used)| (*cost, *used));
+        DecideOutcome::Accept { top: chosen, cost: chosen_cost, used: chosen_used }
     }
 
     /// Mean absolute colour difference between the frame and the pixel canvas
@@ -1409,7 +1423,7 @@ impl WindowedEdgeMatcher {
         bounds: (i32, i32),
         exclude: &[(i32, i32)],
         request: &PlacementRequest<'_>,
-    ) -> Option<(i32, f64)> {
+    ) -> Option<(i32, f64, u32)> {
         let (lo, hi) = bounds;
         if lo > hi {
             return None;
@@ -1421,10 +1435,10 @@ impl WindowedEdgeMatcher {
         let mut ring_inner = 0;
         let mut radius = (ladder.rows() as i32).min(max_radius);
         loop {
-            if let DecideOutcome::Accept { top, cost } = self.decide_ring(
-                cache, ladder, centre, ring_inner, radius, bounds, exclude, request,
+            if let DecideOutcome::Accept { top, cost, used } = self.decide_ring(
+                cache, ladder, centre, ring_inner, radius, bounds, exclude, centre, request,
             ) {
-                return Some((top, cost));
+                return Some((top, cost, used));
             }
             if radius >= max_radius {
                 return None;
@@ -1432,6 +1446,30 @@ impl WindowedEdgeMatcher {
             ring_inner = radius;
             radius = radius.saturating_mul(EDGE_RING_GROWTH).min(max_radius);
         }
+    }
+
+    /// Whether a placement may be accepted outside the previous frame's reach.
+    ///
+    /// The guard's evidence is continuity: the frame still overlaps the one
+    /// before it. A far placement has none, so it must be supported by the
+    /// frame's own content: at least `EDGE_FAR_MIN_SCORING_ROWS` boundary rows,
+    /// and at least a quarter of them actually compared against the canvas.
+    /// Without this, a nearly blank frame is placed on the first repeated patch
+    /// the anchor can see — measured on `real-2`: 2–4 boundary rows matched at
+    /// 3 rows of a 383-row frame, hundreds of pixels from the truth, some with
+    /// a cost of 0.25 that the "confident" ratio escape let through.
+    fn far_placement_supported(&self, ladder: &EdgeLadder, top: i32, used: u32) -> bool {
+        let Some(pos) = self.pos else {
+            return true;
+        };
+        if (top - pos).abs() < ladder.rows() as i32 {
+            return true;
+        }
+        let scoring = ladder.scoring_rows.len() as u32;
+        if scoring < EDGE_FAR_MIN_SCORING_ROWS {
+            return false;
+        }
+        used >= scoring.div_ceil(4).max(EDGE_FAR_MIN_SCORING_ROWS)
     }
 
     fn impulse_half_width(&self) -> i32 {
@@ -1502,7 +1540,7 @@ impl WindowedEdgeMatcher {
 }
 
 enum DecideOutcome {
-    Accept { top: i32, cost: f64 },
+    Accept { top: i32, cost: f64, used: u32 },
     Reject(RejectReason),
 }
 
@@ -1564,7 +1602,7 @@ impl PlacementEngine for WindowedEdgeMatcher {
         // Stage 1 — impulse: the neighbourhood of where the last step points.
         // Almost every frame is decided here, and it costs one narrow window.
         if impulse_reach > 0 {
-            if let DecideOutcome::Accept { top, cost } = self.decide(
+            if let DecideOutcome::Accept { top, cost, used } = self.decide(
                 &mut cache,
                 &ladder,
                 predicted_top - impulse_reach,
@@ -1572,7 +1610,9 @@ impl PlacementEngine for WindowedEdgeMatcher {
                 predicted_top,
                 request,
             ) {
-                return self.accept(request, ladder, top, cost);
+                if self.far_placement_supported(&ladder, top, used) {
+                    return self.accept(request, ladder, top, cost);
+                }
             }
         }
 
@@ -1592,7 +1632,10 @@ impl PlacementEngine for WindowedEdgeMatcher {
         // The guard band is centred on the previous frame, not on the
         // prediction, so it cannot exclude the impulse window the way two
         // concentric rings would: their centres differ. It searches its whole
-        // band, ordered from the prediction. The rows the impulse window
+        // band, and only *ties* prefer the prediction (`tie_centre`): a large
+        // prediction must not shrink the band, or a frame whose last step was
+        // a flick has no local search at all exactly when it needs one. The
+        // rows the impulse window
         // already tried are re-*judged* (each stage applies the gates to its
         // own candidate set, and that is what decides the answer) but not
         // re-*computed*: the score cache below returns the cost already paid
@@ -1601,14 +1644,15 @@ impl PlacementEngine for WindowedEdgeMatcher {
         // a position it rejected for want of one would be lost for good.
         let radius = self.adjacency_radius(&ladder);
         let guard = (pos - radius, pos + radius);
-        if let DecideOutcome::Accept { top, cost } = self.decide_ring(
+        if let DecideOutcome::Accept { top, cost, .. } = self.decide_ring(
             &mut cache,
             &ladder,
-            predicted_top,
+            pos,
             0,
             radius,
             guard,
             &[],
+            predicted_top,
             request,
         ) {
             return self.accept(request, ladder, top, cost);
@@ -1637,10 +1681,12 @@ impl PlacementEngine for WindowedEdgeMatcher {
         // stage above already scored.
         let anchor = self.anchor.unwrap_or(pos);
         if let Some(bounds) = self.canvas_bounds(&ladder) {
-            if let Some((top, cost)) =
+            if let Some((top, cost, used)) =
                 self.search_rings(&mut cache, &ladder, anchor, bounds, &[guard], request)
             {
-                return self.accept(request, ladder, top, cost);
+                if self.far_placement_supported(&ladder, top, used) {
+                    return self.accept(request, ladder, top, cost);
+                }
             }
         }
 
@@ -1921,7 +1967,7 @@ pub(super) fn place_horizontally(
         previous_x,
         &request,
     ) {
-        DecideOutcome::Accept { top, cost } => {
+        DecideOutcome::Accept { top, cost, .. } => {
             let delta = top - previous_x;
             EngineDecision::Place {
                 rect: ViewportRect {
@@ -2961,6 +3007,53 @@ mod tests {
         }
     }
 
+    /// The guard band is `pos ± frame height`; the prediction may only order
+    /// ties inside it. It used to be intersected with `prediction ± radius`:
+    /// a flick last frame plus a runaway trend made the two disjoint, so the
+    /// guard searched nothing and the anchor — which never looks inside the
+    /// band — wrote a repeated patch hundreds of rows away (`real-2`).
+    #[test]
+    fn a_far_prediction_does_not_shrink_the_guard_band() {
+        let height = 60;
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
+        let first = frame_from(0, height);
+        let rect = ViewportRect { x: 0, y: 0, width: W, height };
+        engine.commit(rect, 0, &first);
+        engine.last_delta = Some(740);
+        engine.trend = 537.0;
+
+        // An ordinary +17 step, although the prediction points at +1277.
+        let next = frame_from(17, height);
+        let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first)];
+        let req = request_on_canvas(&next, rect, &committed);
+        match engine.place(&req) {
+            EngineDecision::Place { rect: placed, match_info } => {
+                assert_eq!(placed.y, 17, "the local step must still be found");
+                assert_eq!(match_info.delta_y, 17);
+            }
+            other => panic!("the local step must be placeable: {other:?}"),
+        }
+    }
+
+    /// A far placement has no overlap with the previous frame, so only the
+    /// frame's own content can justify it. A dense frame matching a sliver, or
+    /// a nearly blank one, must not be written hundreds of rows away.
+    #[test]
+    fn a_far_placement_needs_more_than_a_sliver_of_evidence() {
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
+        engine.pos = Some(0);
+        let dense = frame_from(0, 60);
+        let ladder = EdgeLadder::from_source(&dense, EdgeLadder::session_gain(&dense)).unwrap();
+        assert!(ladder.scoring_rows.len() >= 59);
+        assert!(!engine.far_placement_supported(&ladder, 600, 3));
+        assert!(engine.far_placement_supported(&ladder, 600, 15));
+        assert!(engine.far_placement_supported(&ladder, 17, 1));
+
+        let flat = flat_frame(60);
+        let ladder = EdgeLadder::from_source(&flat, EdgeLadder::session_gain(&flat)).unwrap();
+        assert!(!engine.far_placement_supported(&ladder, 600, 0));
+    }
+
     /// Both directions are ordinary. A capture that scrolls back up must be
     /// predicted, guarded and placed exactly like one that scrolls down: the
     /// impulse window extrapolates a negative step, the guard band is symmetric
@@ -3029,7 +3122,7 @@ mod tests {
         let req = request_on_canvas(&same, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
         let ladder = EdgeLadder::from_source(&same, engine.session_gain).unwrap();
         let mut cache = ScoreCache::default();
-        match engine.decide_ring(&mut cache, &ladder, 0, 0, 40, (-40, 40), &[], &req) {
+        match engine.decide_ring(&mut cache, &ladder, 0, 0, 40, (-40, 40), &[], 0, &req) {
             DecideOutcome::Accept { top, .. } => assert_eq!(top, 0, "the centre must win"),
             DecideOutcome::Reject(_) => panic!("the centre must be a candidate at all"),
         }
