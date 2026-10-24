@@ -64,7 +64,7 @@ pub fn composite_captured_region(
     Ok(composite)
 }
 
-fn to_rgba(image: &Image) -> Result<Vec<u8>, Box<dyn Error>> {
+pub fn to_rgba(image: &Image) -> Result<Vec<u8>, Box<dyn Error>> {
     validate_image(image)?;
     if image.format != Format::Argb8888 && image.format != Format::Xrgb8888 {
         return Err(format!("unsupported shm format: {:?}", image.format).into());

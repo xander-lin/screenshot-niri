@@ -74,8 +74,12 @@ cargo build --release --bins
 
 ```bash
 ./target/release/capture-frames --out testdata/frames/real-1
-# 拖选区，手动滚动，Enter 结束
+# 拖选区（或按 L），手动滚动，Enter/Space 结束，Esc 取消
 ```
+
+操作流程与正式工具完全一致：`E` 进入/退出编辑模式（边缘缩放、整框拖动，拖动期间不抓帧，松手后按新矩形继续）、方向键给滚动方向提示、`--fps` 缺省读配置文件的 `max_fps`、选区边框宽度读 `border_width`。只有两件事不同：不拼接、不显示拼接预览。
+
+每帧都走正式的 `prepare_capture_clean` → 抓帧 → `complete_capture` 握手，所以边框不会进画面、编辑中的中间矩形不会被抓、几何在抓帧期间变化的那一帧会被丢弃（并在终端说明）。抓到的帧**不做去重**（重复帧是正常输入，拼接器自己会判 `Duplicate`）。PNG 由写盘线程用 `Compression::Fast` + `Filter::Sub` 编码（4K 一帧约 27 ms），抓帧循环不会因为编码掉速；`session.json` 每帧重写但不 `fsync`，结束时才落盘。输出目录里若已有 `frame-*.png` 会直接报错，避免两次抓帧混在一起。
 
 然后重算真值：
 
