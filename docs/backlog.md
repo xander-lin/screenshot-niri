@@ -28,6 +28,12 @@ measurement that closed them.
   offsets/direction, corpus PNG loader shared.
 - **Store write path** — `write_spans` copies a span at a time. Measured: no
   change on `real-5` (the write is not the bottleneck); kept for simplicity.
+- **One-command verification** — `src/bin/verify-corpora.rs` owns the 11 corpus
+  baselines, runs them with bounded concurrency, prints a table and exits
+  non-zero on any mismatch. It found immediate drift: `real-4-4k` was documented
+  as 447/0 while the stitcher has reported 438/2 since the direction check
+  landed (lesson 38), and `real-2` as 303 ambiguous / 241 refusals instead of
+  296 / 238. 46 s wall at `--jobs 2` (real-5 alone is 40 s).
 
 ## P0 — next
 
@@ -46,13 +52,10 @@ measurement that closed them.
    warning frame rate sooner (the border already does after 5 refusals). Measure
    before changing gates.
 
-3. **A single verification runner.** Verification is still a shell loop over
-   corpora with counts read by eye. Wanted: one command that runs
-   `replay-frames` for every corpus, compares accepted / MISPLACED / bands /
-   uncovered against the recorded baselines, runs them **in parallel** (each
-   replay is internally parallel), and exits non-zero on any mismatch. Baselines
-   live in AGENTS.md and testdata/frames/README.md today; move them into the
-   runner and have the docs point at it.
+3. **Verification runner follow-ups** (the runner itself is delivered): a
+   `--record` mode that prints a new baseline table after an intentional change,
+   and running `truth-frames` alongside when a change could move the pixel-level
+   ground truth. Neither is needed today.
 
 ## P1 — measured, smaller, or risky
 
@@ -95,6 +98,13 @@ measurement that closed them.
   every gate calibration; do not attempt without a concrete user report.
 - **`stitch-bench --synthetic` has no geometry changes** by construction; use
   `--dir` for the production path.
+- **Architectural options, deliberately unscheduled** (moved here from
+  `found.md`'s old list): (a) strip the overlay into four bands around the box
+  instead of one full-screen surface — the memory win is large at 4K/multi-output
+  but it multiplies surfaces, configures and input regions; (b) a dmabuf/GPU
+  path — zero-copy but drags in EGL/GBM and a driver matrix, against the
+  minimal-dependency principle; (c) deciding whether the health-baseline stress
+  client and uinput scripts should live in `tools/`.
 
 ## Pending real-machine confirmation
 
@@ -119,9 +129,9 @@ measurement that closed them.
 
 ```
 cargo test                                   # 258 tests, ~1.3 s warm
-./target/release/replay-frames --dir testdata/frames/real-1
-./target/release/replay-frames --dir testdata/frames/real-5-4k   # ~30 s
-./target/release/stitch-bench --dir testdata/frames/real-5-4k     # push p50 0.86 ms
+cargo build --release --bins
+./target/release/verify-corpora --jobs 2     # 11 corpora, ~46 s, non-zero on drift
+./target/release/stitch-bench --dir testdata/frames/real-5-4k   # push p50 0.86 ms
 ```
 
 Expected acceptance counts are in `AGENTS.md` and
