@@ -325,6 +325,11 @@ pub(super) struct EdgeLadder {
     levels: Vec<u8>,
     /// Row indices that contain at least one boundary, ascending.
     scoring_rows: Vec<u32>,
+    /// Non-zero levels per row. The cost's denominator is the count of non-zero
+    /// bins on both sides; keeping it here lets the scoring loop sum
+    /// `abs_diff` alone and stay vectorisable instead of carrying two
+    /// conditional increments per bin.
+    row_mass: Vec<u16>,
 }
 
 impl EdgeLadder {
@@ -555,6 +560,7 @@ impl EdgeLadder {
             bins: layout.bins,
             levels,
             scoring_rows: order,
+            row_mass,
         }
     }
 
@@ -603,6 +609,8 @@ pub(super) struct EdgeCanvas {
     bins: u32,
     levels: Vec<u8>,
     filled: Vec<bool>,
+    /// Non-zero levels per row, parallel to `filled`.
+    nonzero: Vec<u16>,
     /// Canvas row of `filled[0]`.
     origin_row: i32,
     filled_lo: i32,
@@ -615,6 +623,7 @@ impl EdgeCanvas {
             bins,
             levels: Vec::new(),
             filled: Vec::new(),
+            nonzero: Vec::new(),
             origin_row,
             filled_lo: i32::MAX,
             filled_hi: i32::MIN,
@@ -638,8 +647,11 @@ impl EdgeCanvas {
         levels[shift * bins..].copy_from_slice(&self.levels);
         let mut filled = vec![false; self.filled.len() + shift];
         filled[shift..].copy_from_slice(&self.filled);
+        let mut nonzero = vec![0u16; self.nonzero.len() + shift];
+        nonzero[shift..].copy_from_slice(&self.nonzero);
         self.levels = levels;
         self.filled = filled;
+        self.nonzero = nonzero;
         // `origin_row` is the logical row of buffer index 0, so prepending
         // moves it up by `shift`. The *covered logical extent* does not move:
         // the content stayed where it was, only its buffer indices grew.
@@ -684,6 +696,7 @@ impl EdgeCanvas {
         if needed > self.filled.len() {
             self.levels.resize(needed * bins, 0);
             self.filled.resize(needed, false);
+            self.nonzero.resize(needed, 0);
         }
         for row in 0..ladder.rows as usize {
             let index = start + row as i32;
@@ -697,15 +710,11 @@ impl EdgeCanvas {
             let dst = index * bins;
             self.levels[dst..dst + bins].copy_from_slice(ladder.row_levels(row as u32));
             self.filled[index] = true;
+            self.nonzero[index] = ladder.row_mass[row];
             let logical = self.origin_row + index as i32;
             self.filled_lo = self.filled_lo.min(logical);
             self.filled_hi = self.filled_hi.max(logical);
         }
-    }
-
-    fn row_filled(&self, row: i32) -> bool {
-        let index = row - self.origin_row;
-        index >= 0 && (index as usize) < self.filled.len() && self.filled[index as usize]
     }
 
     /// Cheap geometric overlap: how many of the frame's rows land on verified
@@ -754,23 +763,22 @@ impl EdgeCanvas {
         let mut used = 0u32;
         for &row in &ladder.scoring_rows {
             let canvas_row = top + row as i32;
-            if !self.row_filled(canvas_row) {
+            let index = canvas_row - self.origin_row;
+            if index < 0 || index as usize >= self.filled.len() || !self.filled[index as usize] {
                 continue;
             }
-            let offset = (canvas_row - self.origin_row) as usize * bins;
+            let index = index as usize;
+            let offset = index * bins;
             let canvas_levels = &self.levels[offset..offset + bins];
             let frame_levels = ladder.row_levels(row);
-            for b in 0..bins {
-                let a = canvas_levels[b];
-                let f = frame_levels[b];
-                difference += u32::from(a.abs_diff(f));
-                if a > 0 {
-                    denominator += 1;
-                }
-                if f > 0 {
-                    denominator += 1;
-                }
+            let mut row_difference = 0u32;
+            for (a, f) in canvas_levels.iter().zip(frame_levels.iter()) {
+                row_difference += u32::from(a.abs_diff(*f));
             }
+            difference += row_difference;
+            // Exactly the count the per-bin loop used to accumulate: the
+            // non-zero canvas levels plus the non-zero frame levels of this row.
+            denominator += u32::from(self.nonzero[index]) + u32::from(ladder.row_mass[row as usize]);
             used += 1;
         }
         // A frame cannot be asked for more boundary rows than it has. A page
@@ -1190,9 +1198,21 @@ impl WindowedEdgeMatcher {
                 }
             }
         }
+        let trace = std::env::var_os("BENCH_PLACE_TRACE").is_some() && tops.len() > 500;
+        let started = std::time::Instant::now();
         if !missing.is_empty() {
             let missing_tops: Vec<i32> = missing.iter().map(|&index| tops[index]).collect();
             let scored = score_tops(canvas, ladder, &missing_tops, min_overlap, floor);
+            if trace {
+                eprintln!(
+                    "place-window: positions={} scoring_rows={} bins={} missing={} score={:.2}ms",
+                    tops.len(),
+                    ladder.scoring_rows.len(),
+                    ladder.bins,
+                    missing.len(),
+                    started.elapsed().as_secs_f64() * 1e3,
+                );
+            }
             for (&index, score) in missing.iter().zip(scored) {
                 cache.insert(tops[index], score);
                 scores[index] = score;
@@ -1215,7 +1235,6 @@ impl WindowedEdgeMatcher {
     ///
     /// The guard calls this once with `inner = 0` and `outer = rows`; only the
     /// anchor walks a ladder.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn decide_ring(
         &self,

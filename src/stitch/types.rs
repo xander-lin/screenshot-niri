@@ -384,6 +384,11 @@ pub enum StitchDecisionPath {
 pub struct StitchProfileBreakdown {
     pub path: Option<StitchDecisionPath>,
     pub duplicate_check: Duration,
+    /// Frame conversion + descriptor build in the shipped path. Separate from
+    /// `perceptual_prepare`, which belongs to the legacy pipeline's perceptual
+    /// frame; conflating them made a test that asserts "no perceptual time" see
+    /// the conversion instead.
+    pub frame_prepare: Duration,
     pub perceptual_prepare: Duration,
     pub fixed_bands: Duration,
     pub canvas_match: Duration,

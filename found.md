@@ -422,6 +422,17 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
   2. 改动如果按设计改变接受数（例如方向检查让 9 帧被拒），必须同一次改动里更新那张表——表的 diff 是这类变化的唯一审计点。
   3. 验收脚本要打印「实际 (期望)」并给非零退出码，否则它在 CI 或习惯里都等于不存在。
 
+### 39. 零位移的「接受」被当成了一次方向观测，导致停顿期每帧都跑一遍水平搜索
+
+`real-5-4k` 的 push p95 是 12.1 ms，先按最像的原因（拒绝路径的 anchor 整幅扫描）去查，但该语料 **0 次拒绝**。新的 benchtop 归因（最慢 5 帧 + 逐阶段分解 + 逐轴 trace）显示：115 个**被接受**的帧，每个都在 `axis Horizontal primary` 上花了 8.7 ms，答案全是 `delta (0,0)`。
+
+- **根因**：`commit_accepted` 无条件把 `match_info.direction` 写进方向记忆。`real-5` 在第 317 帧把选区横向挪了一下（合法地记为水平冲量），此后画面进入停顿（像素在原地变化：光标/重绘），每帧都被水平轴"接受于 0 位移"；而 0 位移的方向仍被记录为水平，于是下一帧又问水平轴。水平匹配器每次要从像素重建两份描述子（`session_gain_on` + `from_source_on` + 画布条带），8.7 ms 全部花在这里。
+- **纠正**：零位移不是冲量——`commit_accepted` 收到 `moved`，为 false 时清空方向记忆（与「resize delta 0 清空记忆」同一条规则）。放置结果、接受数、全部 11 个语料基线不变；push mean 2.50 → 0.83 ms、p95 12.14 → 1.54 ms、UI 线程 2.86 → 1.17 ms。测试 `a_zero_delta_acceptance_clears_the_direction_memory` 在去掉修复后失败。
+- **Prevention**：
+  1. 一个观测若不含某维信息（0 位移不含方向、resize 不含方向），就不能把它写进那一维的状态。写之前先问「这次观测真的关于它吗」。
+  2. 尾延迟必须先归因到具体分支/阶段再优化；"最像的原因"在这条语料上完全错了，按它去改 anchor 只会白花时间。
+  3. 测量工具的字段必须真的被生产路径填上：`StitchProfileBreakdown` 的多数阶段只在 legacy 路径里计时，这让 shipped 路径的分解长期全是 0，"没有热点"其实是"没有测量"。现在 `frame_prepare`/`canvas_match` 由 shipped 路径填写。
+
 ---
 
 ## Verification Memory

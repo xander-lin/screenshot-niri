@@ -36,7 +36,7 @@ use std::time::Instant;
 use screenshot_rs_rebuild::image::Image;
 use screenshot_rs_rebuild::stitch::{
     image_from_stitched_window_reusing, CanvasMemoryReport, CanvasWindow, FrameScreenOffset,
-    ImageRgbView, PushResult, RawStitcher,
+    ImageRgbView, PushResult, RawStitcher, StitchProfileBreakdown,
 };
 use screenshot_rs_rebuild::wayland::selection::LongDirection;
 use wayland_client::protocol::wl_shm::Format;
@@ -179,6 +179,13 @@ struct Report {
     steady_allocated: usize,
     /// The finished canvas's footprint: the tile budget is chosen against it.
     canvas: Option<CanvasMemoryReport>,
+    /// The slowest pushes, so a p95 tail can be attributed to a frame instead
+    /// of only sized. (ms, frame index, outcome, per-stage breakdown).
+    ///
+    /// The breakdown is only filled when the stitcher is built with
+    /// `--features trace-logs` and `SCREENSHOT_TRACE_PROFILE=1`; otherwise it
+    /// stays default and is not printed.
+    slow: Vec<(f64, usize, &'static str, StitchProfileBreakdown)>,
     steady_allocations: usize,
     frames_measured: usize,
 }
@@ -204,9 +211,10 @@ fn measure(frames: &[BenchFrame], with_preview: bool) -> Result<Report, Box<dyn 
         steady_allocated: 0,
         steady_allocations: 0,
         canvas: None,
+        slow: Vec::new(),
         frames_measured: 0,
     };
-    for frame in &frames[1..] {
+    for (index, frame) in frames[1..].iter().enumerate() {
         let view = ImageRgbView::new(&frame.image)?;
         reset_allocation_counters();
         let started = Instant::now();
@@ -216,7 +224,14 @@ fn measure(frames: &[BenchFrame], with_preview: bool) -> Result<Report, Box<dyn 
             frame.direction,
             frame.offset,
         )?;
-        report.push.push(started.elapsed().as_secs_f64() * 1e3);
+        let push_ms = started.elapsed().as_secs_f64() * 1e3;
+        report.push.push(push_ms);
+        report.slow.push((
+            push_ms,
+            index + 1,
+            outcome_label(&outcome),
+            stitcher.last_profile_breakdown(),
+        ));
         let allocated = ALLOCATED.load(Ordering::Relaxed);
         let allocations = ALLOCATIONS.load(Ordering::Relaxed);
         report.worst_allocated = report.worst_allocated.max(allocated);
@@ -266,6 +281,16 @@ fn measure(frames: &[BenchFrame], with_preview: bool) -> Result<Report, Box<dyn 
     Ok(report)
 }
 
+fn outcome_label(outcome: &PushResult) -> &'static str {
+    match outcome {
+        PushResult::Initialized => "first",
+        PushResult::Accepted { .. } => "accepted",
+        PushResult::Duplicate => "duplicate",
+        PushResult::Pending => "pending",
+        PushResult::NoMatch => "no-match",
+    }
+}
+
 fn percentile(sorted: &[f64], fraction: f64) -> f64 {
     if sorted.is_empty() {
         return f64::NAN;
@@ -312,6 +337,37 @@ fn summarize(label: &str, mut report: Report) {
         total,
         total / 33.3 * 100.0,
     );
+    report.slow.sort_by(|a, b| b.0.total_cmp(&a.0));
+    println!(
+        "  slowest pushes: {}",
+        report
+            .slow
+            .iter()
+            .take(5)
+            .map(|(ms, index, outcome, _)| format!("#{index} {ms:.2} ms {outcome}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    // With trace-logs + SCREENSHOT_TRACE_PROFILE the stitcher fills this; the
+    // tail can then be attributed instead of only measured.
+    for (ms, index, outcome, breakdown) in report.slow.iter().take(3) {
+        if breakdown.path.is_none() {
+            break;
+        }
+        let stage = |duration: std::time::Duration| duration.as_secs_f64() * 1e3;
+        println!(
+            "    #{index} {ms:.2} ms {outcome}: dup {:.2} prep {:.2} bands {:.2} \
+             canvas {:.2} perceptual {:.2} fallback {:.2} apply {:.2} append {:.2}",
+            stage(breakdown.duplicate_check),
+            stage(breakdown.frame_prepare),
+            stage(breakdown.fixed_bands),
+            stage(breakdown.canvas_match),
+            stage(breakdown.perceptual_match),
+            stage(breakdown.fallback_match),
+            stage(breakdown.apply_match),
+            stage(breakdown.append_frame),
+        );
+    }
     if let Some(canvas) = report.canvas {
         let mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
         println!(

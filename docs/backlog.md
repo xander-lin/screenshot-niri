@@ -34,6 +34,17 @@ measurement that closed them.
   as 447/0 while the stitcher has reported 438/2 since the direction check
   landed (lesson 38), and `real-2` as 303 ambiguous / 241 refusals instead of
   296 / 238. 46 s wall at `--jobs 2` (real-5 alone is 40 s).
+- **The `real-5-4k` push tail** — it was not the refusal path (that corpus has
+  none): 115 accepted frames ran a full horizontal search to answer "nothing
+  moved", because a zero-delta acceptance recorded the horizontal axis as the
+  impulse. Clearing the direction memory on a zero-delta step (lesson 39) took
+  push mean 2.50 → 0.83 ms, p95 12.14 → 1.54 ms, UI thread 2.86 → 1.17 ms, with
+  every corpus baseline unchanged.
+- **Tail attribution** — `stitch-bench` prints the slowest frames with their
+  outcome and canvas footprint; with `--features trace-logs` +
+  `SCREENSHOT_TRACE_PROFILE=1` it prints the per-stage breakdown, and the
+  shipped path now fills `frame_prepare` / `canvas_match` (they were legacy-only,
+  which is why the tail could not be attributed before).
 
 ## P0 — next
 
@@ -45,12 +56,13 @@ measurement that closed them.
    convert outside it, or a per-tile read handle. A plain `Mutex<Vec<Tile>>`
    would serialise the lz4 decode and is not worth it. Measure after.
 
-2. **Refusal-path tail on wide 4K.** `real-5-4k` push p95 12.1 ms / max 14.7 ms
-   (a refused frame scans the whole anchor window). Fits 33 ms today, but a
-   3840-wide selection with dense content could exceed it. Levers: shorter anchor
-   ring ladder, cap the anchor window on very tall canvases, or drop to the
-   warning frame rate sooner (the border already does after 5 refusals). Measure
-   before changing gates.
+2. **Geometry-edit cost (~10-12 ms per edit).** The five edits in `real-5-4k`
+   are now the slowest frames: `reseed_from_canvas` rebuilds the descriptor rows
+   from the canvas in 512-row bands. It happens once per edit (not per frame), so
+   it does not threaten 30 fps, but it is the largest single burst left. Next
+   step: measure the band cost and consider skipping bands whose rows cannot
+   affect the next search (the engine only needs the rows the guard/anchor can
+   reach), which must keep every corpus baseline identical.
 
 3. **Verification runner follow-ups** (the runner itself is delivered): a
    `--record` mode that prints a new baseline table after an intentional change,
@@ -59,30 +71,38 @@ measurement that closed them.
 
 ## P1 — measured, smaller, or risky
 
-4. **`replay-frames` reprojection check** — 26 s of the 30 s `real-5-4k` replay.
+4. **A genuine horizontal placement costs ~8.7 ms.** `place_horizontally` builds
+   three descriptors from pixels per call: the frame's ladder (session gain +
+   levels), the canvas strip's ladder, and the search. The zero-delta fix removed
+   the *spurious* calls; a real snake capture still pays this on every turn.
+   Next step: measure a snake corpus (or synthesise one with `--synthetic` plus
+   a horizontal path), then build the ladders from one contiguous strip copy
+   instead of per-pixel store reads. Keep the pixels identical.
+
+5. **`replay-frames` reprojection check** — 26 s of the 30 s `real-5-4k` replay.
    It locates each accepted frame's content in the canvas the stitcher just
    built, so it is not cacheable across stitcher changes (it *is* the independent
    measurement). Options: leave it; add an opt-in `--fast` (local search ±2 frame
    heights around the recorded row, full scan as fallback) documented as a
    different verdict; or run corpora concurrently.
 
-5. **Overlay commit/damage cost** — the preview *draw* is now measured and
+6. **Overlay commit/damage cost** — the preview *draw* is now measured and
    parallel; the commit and damage path at 4K is not in any benchmark. Measure in
    a live session (or a probe that exercises `render_live_overlays` on a 4K
    buffer). If material, damage only the changed rows/border.
 
-6. **`truth-frames` consensus** — `Mosaic::loo_cost` walks each frame twice (fit
+7. **`truth-frames` consensus** — `Mosaic::loo_cost` walks each frame twice (fit
    gain/offset, then median). Fusing needs an approximate gain first. Verdicts
    are cached, so only a first run on a new corpus pays it; low value.
 
-7. **`capture-frames` writes `session.json` every frame** — O(n²) bytes (813
+8. **`capture-frames` writes `session.json` every frame** — O(n²) bytes (813
    frames ≈ 10 MB). Flush every N frames + on exit if corpora get much longer.
 
-8. **Preview draw thread spawn per redraw** — four scoped spawns per accepted
+9. **Preview draw thread spawn per redraw** — four scoped spawns per accepted
    frame (~0.1 ms). A persistent pool would remove it; not worth the lifecycle
    until something else needs a pool.
 
-9. **Code hygiene** — `draw_preview_rows` takes 16 arguments; a small context
+10. **Code hygiene** — `draw_preview_rows` takes 16 arguments; a small context
    struct would read better. No behaviour change, low priority.
 
 ## P2 — known limitations, documented, not scheduled
@@ -128,7 +148,7 @@ measurement that closed them.
 ## Reproduce the baselines
 
 ```
-cargo test                                   # 258 tests, ~1.3 s warm
+cargo test                                   # 259 tests, ~1.3 s warm
 cargo build --release --bins
 ./target/release/verify-corpora --jobs 2     # 11 corpora, ~46 s, non-zero on drift
 ./target/release/stitch-bench --dir testdata/frames/real-5-4k   # push p50 0.86 ms

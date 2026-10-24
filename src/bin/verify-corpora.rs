@@ -191,7 +191,6 @@ fn parse(stdout: &str) -> Result<Measured, String> {
 
 /// A corpus whose run finished, with the child's output kept for failures.
 struct Run {
-    dir: &'static str,
     measured: Result<Measured, String>,
     output: String,
     seconds: f64,
@@ -220,14 +219,12 @@ fn run_one(
                 Err(format!("replay-frames exited with {}", output.status))
             };
             Run {
-                dir,
                 measured,
                 output: format!("{stdout}{stderr}"),
                 seconds,
             }
         }
         Err(error) => Run {
-            dir,
             measured: Err(format!("could not run {replay:?}: {error}")),
             output: String::new(),
             seconds,
@@ -416,7 +413,10 @@ fn main() {
                 continue;
             }
             println!();
-            println!("--- {} (showing the tail of its output) ---", expectation.dir);
+            println!(
+                "--- {} — {} (showing the tail of its output) ---",
+                expectation.dir, expectation.note
+            );
             let lines: Vec<&str> = run.as_ref().unwrap().output.lines().collect();
             for line in lines.iter().skip(lines.len().saturating_sub(20)) {
                 println!("{line}");

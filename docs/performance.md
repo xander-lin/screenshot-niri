@@ -370,6 +370,46 @@ or part of one. The auto count needs 500 k footprint pixels (small overlays stay
 serial), and a hole covering the whole footprint returns before deciding
 threads — the full-screen-box redraw paints nothing and must not pay a fan-out.
 
+## 2026-10-24, seventh pass: the tail was a stale axis, not a refusal
+
+`real-5-4k` reported push p95 12.1 ms. The guess in the backlog (the refusal
+path's anchor scan) was wrong: that corpus has **zero** refusals. The tail was
+115 accepted frames that each ran a full horizontal search and accepted a
+**zero-delta** answer.
+
+Attribution came from two new instruments rather than from guessing:
+
+* `stitch-bench` prints the five slowest pushes with their frame index and
+  outcome, and — built with `--features trace-logs`, run with
+  `SCREENSHOT_TRACE_PROFILE=1` — the per-stage breakdown of the three slowest.
+  The shipped path now fills `frame_prepare` and `canvas_match`, which used to
+  stay at zero (they were only wired into the legacy pipeline).
+* The breakdown put 10.5 of 13 ms in `canvas_match`; a per-axis trace then put
+  all of it in **`axis Horizontal primary`, delta (0,0)**, 8.7 ms each.
+
+Why it ran: `real-5` nudges the box sideways at frame 317, which records a
+horizontal impulse. The screen then pauses while pixels change in place, so each
+frame is *accepted* at delta zero — and a zero-delta acceptance recorded its
+match direction again, which was horizontal, so the next frame asked the
+horizontal axis first. The horizontal matcher builds two descriptors from
+pixels (`session_gain_on`, `from_source_on`, plus the canvas strip) and is not
+cheap, so a pause cost 8.7 ms per frame.
+
+Fix: a step that moved nothing is not an impulse — `commit_accepted` clears the
+direction memory on a zero-delta acceptance, exactly as a zero-delta box resize
+already did. Same placements, same corpus counts.
+
+| `real-5-4k` | before | after |
+|---|---|---|
+| push mean | 2.50 ms | **0.83 ms** |
+| push p95 | 12.14 ms | **1.54 ms** |
+| UI thread per frame | 2.86 ms | **1.17 ms** |
+
+The remaining slow frames are the five geometry edits (~10-12 ms, the
+`reseed_from_canvas` rebuild) and the first frame after each nudge, which pays
+the horizontal search once. `real-1`'s push mean also fell 0.28 → 0.23 ms.
+All 11 corpora keep their baselines (`verify-corpora`).
+
 ## What remains
 
 * **The descriptor's arithmetic — 26% at 1080p.** Fused into the conversion row

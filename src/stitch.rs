@@ -863,6 +863,7 @@ impl RawStitcher {
         // Recycle the buffer of the frame we are about to replace. The stitcher
         // keeps exactly two frames alive, so this makes the pair of 6.2 MB
         // allocations cycle instead of being freed and re-faulted every push.
+        let prepare_started_at = profile_enabled.then(Instant::now);
         let recycled = std::mem::take(&mut self.spare_compose_buffer);
         // The descriptor's bins are accumulated while the frame is converted.
         // Building the ladder from the finished frame read it again — another
@@ -905,6 +906,9 @@ impl RawStitcher {
         // allocation per push. Crop only when the crop is not the whole frame.
         let cropped_compose = crop_rgb_frame_if_needed(&compose_frame, active_crop)?;
         let active_compose_frame: &RgbFrame = cropped_compose.as_ref().unwrap_or(&compose_frame);
+        if let Some(started_at) = prepare_started_at {
+            self.last_profile_breakdown.frame_prepare += started_at.elapsed();
+        }
 
         // The impulse decides which axis is asked first.
         //
@@ -920,6 +924,7 @@ impl RawStitcher {
         // refused.
         let primary_axis = self.impulse_axis(search_direction);
         let mut placed_axis = primary_axis;
+        let place_started_at = profile_enabled.then(Instant::now);
         let mut decision = self.place_on_axis(
             primary_axis,
             previous_rect,
@@ -966,6 +971,9 @@ impl RawStitcher {
                 placed_axis = primary_axis.other();
                 decision = attempt;
             }
+        }
+        if let Some(started_at) = place_started_at {
+            self.last_profile_breakdown.canvas_match += started_at.elapsed();
         }
         let horizontal = placed_axis == SearchAxis::Horizontal;
 
@@ -1036,6 +1044,7 @@ impl RawStitcher {
                 Some(StitchDecisionPath::CanvasAccepted),
                 None,
                 recovery.match_info.direction,
+                recovery.match_info.delta_x != 0 || recovery.match_info.delta_y != 0,
             );
             return Ok(PushResult::Accepted {
                 match_info: recovery.match_info,
@@ -1081,6 +1090,7 @@ impl RawStitcher {
                 Some(StitchDecisionPath::CanvasAccepted),
                 None,
                 match_info.direction,
+                match_info.delta_x != 0 || match_info.delta_y != 0,
             );
             return Ok(PushResult::Accepted { match_info });
         }
@@ -1112,6 +1122,7 @@ impl RawStitcher {
                 Some(StitchDecisionPath::CanvasAccepted),
                 None,
                 recovery.match_info.direction,
+                recovery.match_info.delta_x != 0 || recovery.match_info.delta_y != 0,
             );
             return Ok(PushResult::Accepted {
                 match_info: recovery.match_info,
@@ -1300,6 +1311,7 @@ impl RawStitcher {
         path: Option<StitchDecisionPath>,
         fast_motion_trace: Option<FastMotionTrace>,
         direction: AppendDirection,
+        moved: bool,
     ) {
         self.viewport_rect = Some(new_rect);
         self.previous_perceptual_frame = Self::perceptual_frame_for(analysis_frame);
@@ -1308,7 +1320,18 @@ impl RawStitcher {
         }
         self.last_profile_breakdown.path = path;
         self.last_fast_motion_trace = fast_motion_trace;
-        self.accepted_direction.record(direction);
+        // A step that moved nothing is not an impulse. Recording one lets
+        // whichever axis happened to answer keep the memory: after a box nudge
+        // pointed it horizontally, every paused frame (content changing in
+        // place: a caret, a repaint) recorded "horizontal" again and each paid
+        // a full horizontal search whose only possible answer was zero —
+        // measured on `real-5-4k` at 8.7 ms on 115 frames. Clearing falls back
+        // to the user's hint, exactly as a zero-delta geometry edit does.
+        if moved {
+            self.accepted_direction.record(direction);
+        } else {
+            self.accepted_direction = AcceptedDirectionMemory::default();
+        }
         self.consecutive_refusals = 0;
     }
 
@@ -5706,6 +5729,55 @@ mod tests {
         assert_eq!(
             stitcher.accepted_direction.vertical_direction(),
             Some(AppendDirection::Bottom)
+        );
+    }
+
+    /// A zero-delta acceptance must not become the impulse.
+    ///
+    /// `real-5-4k` paid for this: after a box nudge the axis memory pointed
+    /// horizontally, every paused frame (pixels changing in place) accepted at
+    /// delta zero recorded "horizontal" again, and each paid a full horizontal
+    /// search whose only possible answer was zero — 8.7 ms on 115 of 812
+    /// frames. A step that moved nothing says nothing about direction, exactly
+    /// like a zero-delta box resize, which already clears the memory.
+    #[test]
+    fn a_zero_delta_acceptance_clears_the_direction_memory() {
+        let width = 64;
+        let height = 200;
+        let mut stitcher = RawStitcher::new();
+        let mut last_top = 0;
+        for top in [0u32, 40, 80] {
+            let frame = frame_from_world_rows(width, &(top..top + height).collect::<Vec<_>>());
+            stitcher.push_frame(frame, None).unwrap();
+            last_top = top;
+        }
+        assert_eq!(
+            stitcher.accepted_direction.axis(),
+            Some(SearchAxis::Vertical),
+            "the session must have a direction before the zero step is tested"
+        );
+        let mut frame =
+            frame_from_world_rows(width, &(last_top..last_top + height).collect::<Vec<_>>());
+        // A band repainted in place: enough to clear the duplicate check, while
+        // the frame still belongs exactly where it already is.
+        for y in 100..120u32 {
+            for x in 0..width {
+                let offset = pixel_offset(&frame, x, y);
+                frame.data[offset..offset + 3].fill(200);
+            }
+        }
+        match stitcher.push_frame(frame, None).unwrap() {
+            PushResult::Accepted { match_info } => assert_eq!(
+                (match_info.delta_x, match_info.delta_y),
+                (0, 0),
+                "the repaint must be accepted at the same place"
+            ),
+            other => panic!("expected a zero-delta acceptance, got {other:?}"),
+        }
+        assert_eq!(
+            stitcher.accepted_direction,
+            AcceptedDirectionMemory::default(),
+            "a step that moved nothing must not stay the impulse"
         );
     }
 
