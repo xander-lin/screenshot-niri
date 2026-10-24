@@ -1089,15 +1089,6 @@ pub(super) struct WindowedEdgeMatcher {
     frame_rows: u32,
     /// Row the last `Place` asked for, consumed by `commit`.
     pending_top: Option<i32>,
-    /// Consecutive refusals since the last accepted frame.
-    ///
-    /// The displacement guard exists to stop a single bad match from jumping
-    /// the canvas across the page. Once the engine has already refused, that
-    /// guard has nothing left to protect: the canvas is frozen at the last
-    /// verified row while the content keeps scrolling, so every further frame
-    /// is legitimately further away. Without widening, one blurred frame
-    /// (a scroll animation between two wheel steps) freezes the capture
-    /// permanently.
     /// The ladder built by the most recent `place`, reused by `commit`.
     ///
     /// Building it costs about half of the per-frame time, and `place` is
@@ -1204,21 +1195,9 @@ impl WindowedEdgeMatcher {
                 }
             }
         }
-        let trace = std::env::var_os("BENCH_PLACE_TRACE").is_some() && tops.len() > 500;
-        let started = std::time::Instant::now();
         if !missing.is_empty() {
             let missing_tops: Vec<i32> = missing.iter().map(|&index| tops[index]).collect();
             let scored = score_tops(canvas, ladder, &missing_tops, min_overlap, floor);
-            if trace {
-                eprintln!(
-                    "place-window: positions={} scoring_rows={} bins={} missing={} score={:.2}ms",
-                    tops.len(),
-                    ladder.scoring_rows.len(),
-                    ladder.bins,
-                    missing.len(),
-                    started.elapsed().as_secs_f64() * 1e3,
-                );
-            }
             for (&index, score) in missing.iter().zip(scored) {
                 cache.insert(tops[index], score);
                 scores[index] = score;
@@ -1836,9 +1815,10 @@ impl WindowedEdgeMatcher {
     /// before it, so whatever boundary rows it has are read against known
     /// content. A far placement has no overlap, so it must carry its own — and
     /// the demand is *relative*, exactly like the local floor: a frame cannot
-    /// be asked for more rows than it has, but a far answer must use **every**
-    /// row it does have (`used == scoring_rows`; a page whose only feature is
-    /// one boundary row is held to that row). The pixels must also be able to
+    /// be asked for more rows than it has: a far answer must explain as many of
+    /// the frame's boundary rows as any plausible candidate in the same window
+    /// (`used >= window_used`; a page whose only feature is one boundary row is
+    /// held to that row). The pixels must also be able to
     /// **refute the runner-up**: when the alternative matches the canvas just
     /// as well in pixels, the content cannot tell the two offsets apart — the
     /// blank-patch signature measured on `real-2` (3 boundary rows, cost 0.0,
@@ -2250,9 +2230,6 @@ impl PlacementEngine for WindowedEdgeMatcher {
         // floor (a nearly blank page). A perfect, pixel-exact, strictly unique
         // answer near the predicted step is still an answer; see
         // `thin_continuation`.
-        // Stage 4 — thin continuation: a perfect, pixel-exact, strictly unique
-        // answer near the step the capture is taking is a *fact*, and it is
-        // tried before the guard's fuzzy fits.
         if let Some((top, cost)) = self.thin_continuation(&ladder, request, predicted_top) {
             return self.accept(request, ladder, top, cost);
         }

@@ -194,6 +194,7 @@ impl AcceptedDirectionMemory {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // asserted by the refusal test
     fn vertical_direction(self) -> Option<AppendDirection> {
         match (self.direction, self.streak) {
             (Some(AppendDirection::Bottom | AppendDirection::Top), streak) if streak > 0 => {
@@ -993,11 +994,11 @@ impl RawStitcher {
         }
         let horizontal = placed_axis == SearchAxis::Horizontal;
 
-        // A refusal is not the end of the pipeline: the stale-edge recovery
-        // below handles a canvas edge that changed underneath us (a refreshed
-        // footer, a late-loading image), which the matcher cannot see because
-        // the canvas itself is wrong there. It only runs when the engine has
-        // nothing, and it validates the overlap it writes.
+        // A refusal is the end of the pipeline for this frame. The stale-edge
+        // recovery that rewrites a canvas edge (a refreshed footer, a
+        // late-loading image) is an *accept*-side path
+        // (`find_dirty_overlap_recovery`): it only runs when the matcher did
+        // produce a candidate, and it validates the overlap it writes.
         let (candidate_rect, match_info) = match decision {
             EngineDecision::Place { rect, match_info } => (rect, match_info),
             EngineDecision::Reject { reason } => {
@@ -1109,40 +1110,6 @@ impl RawStitcher {
                 match_info.delta_x != 0 || match_info.delta_y != 0,
             );
             return Ok(PushResult::Accepted { match_info });
-        }
-
-        if let Some(recovery) = self.find_nomatch_recovery(previous_rect, active_compose_frame) {
-            let append_started_at = profile_enabled.then(Instant::now);
-            let stitched = self.stitched.as_mut().ok_or("missing stitched frame")?;
-            let new_rect = append_frame_at_position_overwriting_overlap_rows(
-                stitched,
-                previous_rect,
-                active_compose_frame,
-                recovery.match_info,
-                recovery.overwrite_frame_y,
-                recovery.overwrite_rows,
-            )?;
-            if let Some(started_at) = append_started_at {
-                self.last_profile_breakdown.append_frame += started_at.elapsed();
-            }
-            // The engine commit runs first: `active_compose_frame` may borrow
-            // `compose_frame`, which `commit_accepted` takes ownership of.
-            self.last_engine_top = Some(candidate_rect.y);
-            self.canvas_origin = candidate_rect.y - new_rect.y;
-            self.engine
-                .commit(new_rect, candidate_rect.y, active_compose_frame);
-            self.commit_accepted(
-                new_rect,
-                compose_frame,
-                analysis_frame,
-                Some(StitchDecisionPath::CanvasAccepted),
-                None,
-                recovery.match_info.direction,
-                recovery.match_info.delta_x != 0 || recovery.match_info.delta_y != 0,
-            );
-            return Ok(PushResult::Accepted {
-                match_info: recovery.match_info,
-            });
         }
 
         self.last_reject_reason = Some(RejectReason::NoCandidate);
@@ -1351,70 +1318,6 @@ impl RawStitcher {
         self.consecutive_refusals = 0;
     }
 
-    fn find_nomatch_recovery(
-        &self,
-        previous_rect: ViewportRect,
-        frame: &RgbFrame,
-    ) -> Option<NoMatchRecovery> {
-        let direction = self.accepted_direction.vertical_direction()?;
-        let stitched = self.stitched.as_ref()?;
-        if previous_rect.x != 0
-            || frame.width != stitched.width
-            || frame.width != previous_rect.width
-        {
-            return None;
-        }
-        let recovery = match direction {
-            AppendDirection::Bottom => recover_stale_bottom_edge(stitched, previous_rect, frame),
-            AppendDirection::Top => recover_stale_top_edge(stitched, previous_rect, frame),
-            AppendDirection::Right | AppendDirection::Left => None,
-        }?;
-        // Final gate on the recovery path.
-        //
-        // The recovery exists for one situation: the canvas edge changed
-        // underneath us (a refreshed footer, a late-loading image) while the
-        // rest of the frame still matches. It runs only after every matcher
-        // gate has already refused, so it must not be able to place a frame on
-        // weak evidence — that would silently undo those gates.
-        //
-        // Measured: without this, `burst`-style jumps were accepted at offsets
-        // hundreds of rows off, with stable-prefix scores of 6.8-12.0 against
-        // `MATCH_LINE_MAX_AVERAGE_DIFF` of 3.0.
-        // The recovery exists for one situation: the canvas edge changed
-        // underneath us (a refreshed footer, a late-loading image) while the
-        // rest of the frame still matches. It runs only after every matcher
-        // gate has already refused, so it must not be able to place a frame on
-        // weak evidence — that would silently undo those gates.
-        //
-        // The gate is the *proven* overlap, not the average difference: a
-        // refreshed strip legitimately scores high on the dirty rows, so a
-        // difference threshold here would reject the very case the path exists
-        // for. What it may not do is place a frame off a handful of rows.
-        // Scope, not a threshold.
-        //
-        // The stale-edge recovery exists for one situation: the canvas edge
-        // changed underneath us (a refreshed footer, a late-loading image)
-        // while the rest of the frame still matches, so the displacement is
-        // small. It was written for the old matcher, whose failure mode was
-        // "no candidate at all".
-        //
-        // Under the windowed edge matcher it is a *bypass*: the engine has
-        // already refused the frame on its own evidence, and this path then
-        // places it using row-prefix similarity, which on repeated content
-        // (cards, tables, code) reports 70-250 "stable" rows at offsets
-        // hundreds of rows wrong. Measured: 11 silently misplaced frames per
-        // 480 with no gate, 29 with a stable-row threshold.
-        //
-        // So the recovery is confined to the displacement it was designed for:
-        // at most one viewport of travel. Anything larger is a jump, and a jump
-        // must stay refused so the user can scroll back.
-        let displacement = recovery.match_info.delta_y.unsigned_abs();
-        let max_displacement = frame.height.max(1);
-        if displacement > max_displacement {
-            return None;
-        }
-        Some(recovery)
-    }
 
     fn find_dirty_overlap_recovery(
         &self,
@@ -1948,70 +1851,6 @@ fn no_match() -> FrameMatch {
     }
 }
 
-fn recover_stale_bottom_edge(
-    stitched: &StitchedFrame,
-    previous_rect: ViewportRect,
-    frame: &RgbFrame,
-) -> Option<NoMatchRecovery> {
-    // Dirty-canvas recovery is a last-resort path after normal placement fails.
-    // Search locally first to avoid global false positives, then fall back to a
-    // full prefix search for cases where stale stitched content displaced the
-    // previous viewport relation.
-    let local_radius = i32::try_from(frame.height).ok()?.saturating_mul(2);
-    let local_start = previous_rect.y.saturating_sub(local_radius).max(0);
-    let local_end = previous_rect
-        .y
-        .saturating_add(local_radius)
-        .min(i32::try_from(stitched.height).ok()?.saturating_sub(1));
-    find_bottom_recovery_in_range(stitched, previous_rect, frame, local_start, local_end).or_else(
-        || {
-            find_bottom_recovery_in_range(
-                stitched,
-                previous_rect,
-                frame,
-                0,
-                i32::try_from(stitched.height).ok()?.saturating_sub(1),
-            )
-        },
-    )
-}
-
-fn find_bottom_recovery_in_range(
-    stitched: &StitchedFrame,
-    previous_rect: ViewportRect,
-    frame: &RgbFrame,
-    start_y: i32,
-    end_y: i32,
-) -> Option<NoMatchRecovery> {
-    let mut best: Option<BottomRecoveryCandidate> = None;
-    for frame_y in start_y..=end_y {
-        let Some(candidate) = bottom_recovery_candidate(stitched, previous_rect, frame, frame_y)
-        else {
-            continue;
-        };
-        if best.as_ref().is_none_or(|best| {
-            candidate.stable_rows > best.stable_rows
-                || (candidate.stable_rows == best.stable_rows && candidate.score < best.score)
-        }) {
-            best = Some(candidate);
-        }
-    }
-    let candidate = best?;
-    if candidate.score > NOMATCH_RECOVERY_STABLE_MAX_AVERAGE_DIFF {
-        return None;
-    }
-    Some(NoMatchRecovery {
-        match_info: FrameMatch {
-            direction: AppendDirection::Bottom,
-            overlap: candidate.overlap,
-            delta_x: 0,
-            delta_y: candidate.frame_y.checked_sub(previous_rect.y)?,
-            score: candidate.score + f64::from(candidate.overwrite_rows),
-        },
-        overwrite_frame_y: candidate.stable_rows,
-        overwrite_rows: candidate.overwrite_rows,
-    })
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct BottomRecoveryCandidate {
@@ -2067,50 +1906,6 @@ fn bottom_recovery_candidate(
     })
 }
 
-fn recover_stale_top_edge(
-    stitched: &StitchedFrame,
-    previous_rect: ViewportRect,
-    frame: &RgbFrame,
-) -> Option<NoMatchRecovery> {
-    let min_frame_y = -(frame.height as i32) + 1;
-    let max_frame_y = previous_rect.y.saturating_sub(1).min(-1);
-    let mut best: Option<(i32, u32, u32, f64)> = None;
-    for frame_y in min_frame_y..=max_frame_y {
-        let existing_overlap = u32::try_from(frame.height as i32 + frame_y).ok()?;
-        if existing_overlap == 0 || existing_overlap > stitched.height {
-            continue;
-        }
-        let stable_rows = matching_bottom_suffix_rows(stitched, frame, existing_overlap);
-        if !dirty_canvas_recovery_shape_for_rows(stable_rows, existing_overlap, frame.height)
-            || bottom_dirty_average_difference(stitched, frame, existing_overlap, stable_rows)
-                < NOMATCH_RECOVERY_DIRTY_MIN_AVERAGE_DIFF
-        {
-            continue;
-        }
-        let score = average_bottom_row_score(stitched, frame, existing_overlap, stable_rows)?;
-        if best.is_none_or(|(_, best_stable, _, best_score)| {
-            stable_rows > best_stable || (stable_rows == best_stable && score < best_score)
-        }) {
-            best = Some((frame_y, stable_rows, existing_overlap, score));
-        }
-    }
-    let (frame_y, stable_rows, existing_overlap, score) = best?;
-    if score > NOMATCH_RECOVERY_STABLE_MAX_AVERAGE_DIFF {
-        return None;
-    }
-    let overwrite_rows = existing_overlap - stable_rows;
-    Some(NoMatchRecovery {
-        match_info: FrameMatch {
-            direction: AppendDirection::Top,
-            overlap: existing_overlap,
-            delta_x: 0,
-            delta_y: frame_y.checked_sub(previous_rect.y)?,
-            score: score + f64::from(existing_overlap - stable_rows),
-        },
-        overwrite_frame_y: frame.height - existing_overlap,
-        overwrite_rows,
-    })
-}
 
 fn direct_top_recovery(
     stitched: &StitchedFrame,
