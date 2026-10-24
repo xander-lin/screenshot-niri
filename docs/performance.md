@@ -452,7 +452,11 @@ sample one pixel in sixteen of them.
 
 `average_difference_same_source` already takes any `RgbSource`, so the score now
 runs on the two views (`CanvasRegion` and `CroppedRgbSource`). The sampled
-pixels, their order and the result are identical; the copies are gone. Per edit
+pixels, their order and the result are identical; the copies are gone. One
+corner case changes with it: `extract_stitched_region` *failed* when the overlap
+touched a row the capture never wrote (a ragged canvas), so such an edit
+returned an error; the view reads those pixels as zeros, exactly as every other
+comparison does, and the edit completes. Per edit
 the score fell from ~6 ms to **0.06-0.52 ms**, and the worst frame's allocation
 dropped from 34.6 MB to 31.3 MB.
 
