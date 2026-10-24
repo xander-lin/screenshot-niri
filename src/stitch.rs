@@ -54,12 +54,15 @@ use placement::{canvas_search_axis, find_canvas_placement_match};
 // in a `stitch-legacy` one, where `new_placement_engine` returns `LegacyPipeline`
 // instead.
 #[cfg_attr(feature = "stitch-legacy", allow(unused_imports))]
-use engine::{CanvasRegion, EngineDecision, PlacementEngine, PlacementRequest, WindowedEdgeMatcher};
+use engine::{
+    BinLayout, CanvasRegion, EngineDecision, PlacementEngine, PlacementRequest, PrebuiltMeans,
+    WindowedEdgeMatcher,
+};
 use rgb::{
     average_difference_same_source, average_luminance_difference_source, crop_rgb_frame,
     luminance_range_source,
     pixel_difference_source, pixel_offset, rgb_frame_from_source,
-    rgb_frame_from_source_reusing, validate_rgb_frame,
+    rgb_frame_from_source_reusing, rgb_frame_from_source_reusing_with, validate_rgb_frame,
     validate_rgb_source, CroppedRgbSource,
 };
 
@@ -815,7 +818,38 @@ impl RawStitcher {
         // keeps exactly two frames alive, so this makes the pair of 6.2 MB
         // allocations cycle instead of being freed and re-faulted every push.
         let recycled = std::mem::take(&mut self.spare_compose_buffer);
-        let compose_frame = rgb_frame_from_source_reusing(compose_frame, recycled)?;
+        // The descriptor's bins are accumulated while the frame is converted.
+        // Building the ladder from the finished frame read it again — another
+        // 25 MB pass at 4K, over memory that had just left the cache — and the
+        // conversion already has every pixel in hand.
+        //
+        // The ladder describes the *cropped* frame, so the fusion is only exact
+        // when the active crop is the whole frame (the shipped configuration;
+        // the fixed-band detector is trace-only). A real crop falls back to the
+        // engine reading the cropped frame below.
+        let fused_layout = (active_crop.x == 0
+            && active_crop.y == 0
+            && active_crop.width == compose_frame.width()
+            && active_crop.height == compose_frame.height())
+        .then(|| BinLayout::for_across(compose_frame.width()))
+        .flatten();
+        let mut fused_means = fused_layout
+            .map(|layout| vec![0f32; compose_frame.height() as usize * layout.bins() as usize]);
+        let compose_frame = rgb_frame_from_source_reusing_with(compose_frame, recycled, |y, row| {
+            if let (Some(layout), Some(means)) = (fused_layout.as_ref(), fused_means.as_mut()) {
+                let bins = layout.bins() as usize;
+                let start = y as usize * bins;
+                layout.means_into(row, &mut means[start..start + bins]);
+            }
+        })?;
+        let prebuilt_means = match (fused_layout, fused_means.as_deref()) {
+            (Some(layout), Some(means)) => Some(PrebuiltMeans {
+                along: compose_frame.height(),
+                layout,
+                means,
+            }),
+            _ => None,
+        };
         // The active crop is the whole frame in the shipped configuration (the
         // fixed-band detector is trace-only, so its top/bottom are zero), and
         // copying a whole 1080p frame to obtain an identical one cost 6.2 MB of
@@ -843,6 +877,7 @@ impl RawStitcher {
             &active_compose,
             search_direction,
             true,
+            prebuilt_means,
         );
         let primary_reason = match &decision {
             EngineDecision::Reject { reason } => Some(*reason),
@@ -870,6 +905,7 @@ impl RawStitcher {
                 &active_compose,
                 search_direction,
                 false,
+                prebuilt_means,
             );
             let improved = match &attempt {
                 EngineDecision::Place { match_info, .. } => {
@@ -1089,6 +1125,7 @@ impl RawStitcher {
         frame: &impl RgbSource,
         search_direction: Option<SearchDirection>,
         primary: bool,
+        prebuilt_means: Option<PrebuiltMeans<'_>>,
     ) -> EngineDecision {
         // The hint is a sign, not an axis: passing "down" to the horizontal
         // matcher (or "left" to the vertical engine) would filter out every
@@ -1112,6 +1149,7 @@ impl RawStitcher {
                     } else {
                         0
                     },
+                    prebuilt_means,
                 }),
                 None => EngineDecision::Reject {
                     reason: RejectReason::Uninitialised,
@@ -4291,6 +4329,7 @@ mod tests {
             frame: &target,
             search_direction: Some(SearchDirection::Down),
             refusals: 0,
+            prebuilt_means: None,
         };
         let first = engine.place(&request);
         let second = engine.place(&request);

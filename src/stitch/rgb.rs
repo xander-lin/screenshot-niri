@@ -387,8 +387,28 @@ pub(super) fn rgb_frame_from_source(source: &impl RgbSource) -> Result<RgbFrame,
 /// buffers cycle forever once the session is warm.
 pub(super) fn rgb_frame_from_source_reusing(
     source: &impl RgbSource,
-    mut buffer: Vec<u8>,
+    buffer: Vec<u8>,
 ) -> Result<RgbFrame, Box<dyn Error>> {
+    rgb_frame_from_source_reusing_with(source, buffer, |_, _| {})
+}
+
+/// Builds a frame, reusing `buffer`, and hands each converted row to `row_hook`.
+///
+/// The stitcher's descriptor is binned luminance along the scroll axis, and it
+/// used to be built by reading the finished frame a second time — another 25 MB
+/// pass at 4K, over memory that had just left the cache. The hook lets the
+/// caller accumulate its bins from the row that was just written, while that row
+/// is still hot, so the frame is converted and described in one pass. The hook
+/// sees exactly the bytes the frame holds: a fused descriptor is the same
+/// descriptor.
+pub(super) fn rgb_frame_from_source_reusing_with<F>(
+    source: &impl RgbSource,
+    mut buffer: Vec<u8>,
+    mut row_hook: F,
+) -> Result<RgbFrame, Box<dyn Error>>
+where
+    F: FnMut(u32, &[u8]),
+{
     validate_rgb_source(source)?;
     let stride = source.width().checked_mul(3).ok_or("RGB stride overflow")?;
     let size = (stride as usize)
@@ -404,12 +424,9 @@ pub(super) fn rgb_frame_from_source_reusing(
     // recycled buffer never carries a stale pixel into the new frame.
     for y in 0..source.height() {
         let start = y as usize * stride as usize;
-        source.row_rgb_into(
-            0,
-            y,
-            source.width(),
-            &mut data[start..start + stride as usize],
-        );
+        let row = &mut data[start..start + stride as usize];
+        source.row_rgb_into(0, y, source.width(), row);
+        row_hook(y, row);
     }
     Ok(RgbFrame {
         width: source.width(),

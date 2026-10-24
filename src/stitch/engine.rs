@@ -136,6 +136,94 @@ const EDGE_IMPULSE_SCALE_DENOMINATOR: i32 = 20;
 /// interval — so rings exist only here.
 const EDGE_RING_GROWTH: i32 = 4;
 
+/// Where a descriptor's bins sit across the scroll axis.
+///
+/// Derived from the frame's width alone, which is what lets the conversion pass
+/// accumulate the same bins while it converts the pixels: the ladder no longer
+/// has to read the finished frame a second time. Both paths go through
+/// [`BinLayout::means_into`], so a fused descriptor is the same descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct BinLayout {
+    bins: u32,
+    body_start: u32,
+    body_end: u32,
+    bin_width: u32,
+}
+
+impl BinLayout {
+    /// The layout for a frame `across` pixels wide along the binning axis.
+    ///
+    /// `None` when there is no body to bin: a frame narrower than the margin
+    /// has no column the matcher may read.
+    pub(super) fn for_across(across: u32) -> Option<Self> {
+        if across == 0 {
+            return None;
+        }
+        let margin = across * EDGE_MARGIN_NUMERATOR / EDGE_MARGIN_DENOMINATOR;
+        let body_start = margin.min(across);
+        let body_end = across.saturating_sub(margin).max(body_start);
+        let body_width = body_end - body_start;
+        if body_width == 0 {
+            return None;
+        }
+        let bins = EDGE_BINS.min(body_width as usize) as u32;
+        Some(Self {
+            bins,
+            body_start,
+            body_end,
+            bin_width: body_width / bins,
+        })
+    }
+
+    pub(super) fn bins(&self) -> u32 {
+        self.bins
+    }
+
+    /// One line's luminance means, one per bin.
+    ///
+    /// `line` is packed RGB across the binning axis and `out` receives `bins`
+    /// values. This is the single definition of the descriptor's evidence: the
+    /// two-pass builder and the fused conversion both call it.
+    pub(super) fn means_into(&self, line: &[u8], out: &mut [f32]) {
+        for b in 0..self.bins {
+            let a0 = self.body_start + b * self.bin_width;
+            let a1 = if b + 1 == self.bins {
+                self.body_end
+            } else {
+                a0 + self.bin_width
+            };
+            let mut sum = 0u32;
+            for a in a0..a1 {
+                let pixel = a as usize * 3;
+                sum += 77 * u32::from(line[pixel])
+                    + 150 * u32::from(line[pixel + 1])
+                    + 29 * u32::from(line[pixel + 2]);
+            }
+            let count = a1 - a0;
+            out[b as usize] = if count == 0 {
+                0.0
+            } else {
+                (sum >> 8) as f32 / count as f32
+            };
+        }
+    }
+}
+
+/// Bin means a caller accumulated while it was producing a frame, so the engine
+/// can build the ladder without reading the frame again.
+///
+/// The caller does not quantise them: the gain belongs to the session and lives
+/// in the engine, and a ladder built on another gain would disagree with the
+/// canvas scale. It only supplies the raw evidence.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PrebuiltMeans<'a> {
+    /// Positions along the axis (frame height for the vertical axis).
+    pub along: u32,
+    pub layout: BinLayout,
+    /// `along * layout.bins()` values, row-major.
+    pub means: &'a [f32],
+}
+
 /// A frame reduced to "where does luminance change, per row".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct EdgeLadder {
@@ -271,17 +359,8 @@ impl EdgeLadder {
         if along == 0 || across == 0 {
             return None;
         }
-
-        let margin = across * EDGE_MARGIN_NUMERATOR / EDGE_MARGIN_DENOMINATOR;
-        let body_start = margin.min(across);
-        let body_end = across.saturating_sub(margin).max(body_start);
-        let body_width = body_end - body_start;
-        if body_width == 0 {
-            return None;
-        }
-        let bins = EDGE_BINS.min(body_width as usize) as u32;
-        let bin_width = body_width / bins;
-        let bins_usize = bins as usize;
+        let layout = BinLayout::for_across(across)?;
+        let bins_usize = layout.bins as usize;
 
         // Per-position, per-bin luminance means.
         //
@@ -289,25 +368,34 @@ impl EdgeLadder {
         // that buffer. Reading a pixel at a time through the trait cost a
         // virtual call, a bounds check and a strided access per pixel — 14.6% of
         // a 1080p frame — to add one luminance to an accumulator.
+        //
+        // The shipped path does not get here for the vertical axis: the
+        // conversion pass accumulates the same means while the frame is still
+        // hot, and the engine quantises those. This remains the definition of
+        // the descriptor for the horizontal axis (a column cannot be gathered
+        // while converting rows) and for the mocks.
         let mut means = vec![0f32; along as usize * bins_usize];
         let mut row = vec![0u8; across as usize * 3];
         for position in 0..along {
             Self::read_across_on(frame, axis, position, &mut row);
-            for b in 0..bins {
-                let a0 = body_start + b * bin_width;
-                let a1 = if b + 1 == bins { body_end } else { a0 + bin_width };
-                let mut sum = 0u32;
-                for a in a0..a1 {
-                    let pixel = a as usize * 3;
-                    sum += 77 * u32::from(row[pixel])
-                        + 150 * u32::from(row[pixel + 1])
-                        + 29 * u32::from(row[pixel + 2]);
-                }
-                let count = a1 - a0;
-                let mean = if count == 0 { 0.0 } else { (sum >> 8) as f32 / count as f32 };
-                means[position as usize * bins_usize + b as usize] = mean;
-            }
+            let start = position as usize * bins_usize;
+            layout.means_into(&row, &mut means[start..start + bins_usize]);
         }
+        Some(Self::from_means(&means, along, layout, gain))
+    }
+
+    /// Quantises bin means into levels and picks the rows that carry them.
+    ///
+    /// Split from the reading above so the conversion pass can supply the means
+    /// instead of the frame: the gain is applied here, where the session's scale
+    /// lives.
+    pub(super) fn from_means(
+        means: &[f32],
+        along: u32,
+        layout: BinLayout,
+        gain: f32,
+    ) -> Self {
+        let bins_usize = layout.bins as usize;
 
         // Contrast-relative quantisation: see gain below.
         // The gain comes from the *session*, not from this frame. It exists so
@@ -358,12 +446,12 @@ impl EdgeLadder {
         order.truncate(EDGE_MAX_SCORING_ROWS);
         order.sort_unstable();
 
-        Some(Self {
+        Self {
             rows: along,
-            bins,
+            bins: layout.bins,
             levels,
             scoring_rows: order,
-        })
+        }
     }
 
     pub(super) fn rows(&self) -> u32 {
@@ -673,6 +761,15 @@ pub(super) struct PlacementRequest<'a> {
     /// this: it exists to recover from a red border, not to run on every frame
     /// whose immediate neighbourhood did not match.
     pub refusals: u32,
+    /// Bin means the caller accumulated while it produced `frame`.
+    ///
+    /// The conversion pass already has every pixel in hand, so accumulating the
+    /// descriptor's bins there saves a second read of the finished frame —
+    /// another 25 MB pass at 4K, over memory that has just left the cache. The
+    /// engine quantises these with its own session gain, so the caller never
+    /// needs to know the scale the canvas was built on. Ignored when it does not
+    /// describe `frame` (see `place`).
+    pub prebuilt_means: Option<PrebuiltMeans<'a>>,
 }
 
 /// Wraps a borrowed frame as an `RgbSource` for the legacy canvas scan, which
@@ -1377,8 +1474,22 @@ impl PlacementEngine for WindowedEdgeMatcher {
 
     fn place(&mut self, request: &PlacementRequest<'_>) -> EngineDecision {
         self.pending_ladder = None;
-        let Some(ladder) = EdgeLadder::from_source(request.frame, self.session_gain) else {
-            return EngineDecision::Reject { reason: RejectReason::Invalid };
+        // The descriptor comes from the caller when it accumulated the bins
+        // during conversion, and from the frame otherwise. Either way the gain
+        // is applied here: a ladder must share the canvas's scale.
+        let prebuilt = request.prebuilt_means.filter(|prebuilt| {
+            prebuilt.along == request.frame.height()
+                && Some(prebuilt.layout) == BinLayout::for_across(request.frame.width())
+                && prebuilt.means.len() == prebuilt.along as usize * prebuilt.layout.bins() as usize
+        });
+        let ladder = match prebuilt {
+            Some(prebuilt) => {
+                EdgeLadder::from_means(prebuilt.means, prebuilt.along, prebuilt.layout, self.session_gain)
+            }
+            None => match EdgeLadder::from_source(request.frame, self.session_gain) {
+                Some(ladder) => ladder,
+                None => return EngineDecision::Reject { reason: RejectReason::Invalid },
+            },
         };
         let Some(pos) = self.pos else {
             return EngineDecision::Reject { reason: RejectReason::Uninitialised };
@@ -1690,6 +1801,7 @@ pub(super) fn place_horizontally(
         frame,
         search_direction: direction,
         refusals: 0,
+        prebuilt_means: None,
     };
     let mut cache = ScoreCache::default();
     match matcher.decide(
@@ -2181,6 +2293,7 @@ mod tests {
             frame,
             search_direction: None,
             refusals: 0,
+            prebuilt_means: None,
         }
     }
 
@@ -2968,6 +3081,27 @@ mod tests {
             for (index, pixel) in row.as_chunks::<3>().0.iter().enumerate() {
                 assert_eq!(*pixel, region.pixel_rgb(index as u32 * 4, y), "({},{y})", index * 4);
             }
+        }
+    }
+
+    /// The conversion pass accumulates the descriptor's bins while it converts,
+    /// and the engine quantises those means. That is only an access-path change
+    /// if it produces exactly the ladder the two-pass builder produces.
+    #[test]
+    fn fused_bin_means_build_the_same_ladder() {
+        let frame = frame_from(0, 40);
+        let layout = BinLayout::for_across(frame.width()).unwrap();
+        let bins = layout.bins() as usize;
+        let mut means = vec![0f32; frame.height() as usize * bins];
+        for y in 0..frame.height() as usize {
+            let start = y * frame.stride as usize;
+            let line = &frame.data[start..start + frame.width() as usize * 3];
+            layout.means_into(line, &mut means[y * bins..(y + 1) * bins]);
+        }
+        for gain in [1.0f32, 3.5] {
+            let fused = EdgeLadder::from_means(&means, frame.height(), layout, gain);
+            let direct = EdgeLadder::from_source(&frame, gain).unwrap();
+            assert_eq!(fused, direct, "gain {gain}");
         }
     }
 }

@@ -184,29 +184,49 @@ decision is unchanged.
 so any decision change is a bug); two tests compare the row accessor against
 `pixel_rgb` for `RgbFrame`, `ImageRgbView` and `CanvasRegion`.
 
-### 5. Build the RGB frame and the boundary descriptor in one pass — 10.0 ms → ~7.0 ms
+### 5. Build the RGB frame and the boundary descriptor in one pass — done
 
 **Problem.** The RGBA→RGB conversion reads the 33 MB capture and writes 24.9 MB
-(5.5–6.0 ms); `EdgeLadder::from_source_on` then re-reads the same content to
-build the 48-bin descriptor (4.3 ms). Two passes over the same pixels.
+(5.5–6.0 ms); `EdgeLadder::from_source_on` then re-read the same content to
+build the 48-bin descriptor (4.3 ms). Two passes over the same pixels, and the
+second one started after the first had pushed 25 MB out of the cache.
 
-**Approach.** Fuse them: while converting each row, accumulate the per-row
-`|dL/dy|` bin sums the ladder needs (it is a luminance derivative between
-adjacent rows, which the converter can keep as the previous row's luminance).
-`EdgeLadder::from_source_on` then consumes the precomputed bins instead of
-re-reading. The ladder is built on the *compose* frame (possibly cropped), so
-the fusion must live where the RGB frame is built from the same crop — likely
-`rgb_frame_from_source_reusing` returning `(RgbFrame, Option<RowBins>)`, or a
-new `frame_and_bins_from_source` used by `push_frame_sources`.
-The horizontal axis builds its ladder from a *canvas region* (previous frame's
-rect), which is not the frame being converted — keep the existing path there.
+**Approach (as built).** The descriptor's evidence is now accumulated by the
+conversion pass:
 
-**Files.** `src/stitch/rgb.rs`, `src/stitch/engine.rs`
-(`EdgeLadder::from_bins`), `src/stitch.rs` (`push_frame_sources`).
+- `BinLayout` (`engine.rs`) owns where the bins sit across the axis
+  (`margin = 5%`, 48 bins, the last one absorbing the remainder) and
+  `means_into(line, out)` is the single definition of one line's bin means. The
+  two-pass builder and the fused path both call it, so they cannot drift.
+- `EdgeLadder::from_means(&means, along, layout, gain)` quantises and picks the
+  scoring rows. The *gain* stays in the engine: it belongs to the session and
+  the canvas was written on that scale, so a caller that only has the raw
+  evidence cannot produce a ladder that disagrees with the canvas.
+- `rgb_frame_from_source_reusing_with(source, buffer, row_hook)` hands each
+  converted row to the caller while it is still hot. The plain
+  `rgb_frame_from_source_reusing` is the same function with an empty hook.
+- `push_frame_sources` computes the layout from the source width, accumulates
+  the means in the hook, and passes `PrebuiltMeans` in `PlacementRequest`. The
+  engine verifies the prebuilt describes the frame (`along`, layout, length)
+  and otherwise falls back to reading it, so a mismatch is never a wrong ladder.
+- The fusion is only exact when the active crop is the whole frame (the shipped
+  configuration; the fixed-band detector is trace-only). A real crop keeps the
+  old path — the ladder describes the cropped frame, the conversion the
+  uncropped source.
+- The horizontal axis is unchanged: its ladder is built from the previous
+  frame's rectangle in the canvas, not from the frame being converted.
 
-**Acceptance.** Corpora unchanged. Perf: `EdgeLadder::from_source_on` drops out
-of the top 3 at 4K; `push` falls by ~2.5–3 ms. A unit test pins that the fused
-bins equal the bins built by the old path for the same frame.
+**Files.** `src/stitch/rgb.rs` (`_with` variant), `src/stitch/engine.rs`
+(`BinLayout`, `PrebuiltMeans`, `from_means`, `place`), `src/stitch.rs`
+(`push_frame_sources`, `place_on_axis`).
+
+**Measured (median of 3).** 4K `push` 15.97 → **13.55 ms** (13.55 / 13.67 /
+13.51); 1080p `push` 4.17 → **3.70 ms**. Preview unchanged. 4K UI thread
+(push + preview) 21.85 → **19.59 ms** (59% of the 33.3 ms budget).
+
+**Acceptance.** All seven corpora unchanged. A unit test builds a ladder from
+fused means and compares it with `EdgeLadder::from_source` for two gains —
+levels and scoring rows must be equal, not merely equivalent placements.
 
 ### 6. Draw the preview from the canvas instead of through an RGBA image — 5.9 ms → ~2.0 ms
 
@@ -259,5 +279,5 @@ grows by ~2 ms; net ~4 ms.
 | 2 overlay base copy | **done** | the 33 MB cache is gone (uniform base): steady-state restore **0.00 ms**, old copy 2.08–2.27 ms; moved footprint 0.74–1.03 ms; mask rebuild 1.18–1.27 ms (was 1.6). UI thread at 4K 26.2–28.3 → **24.0–26.1 ms**. 1080p bench unchanged. Corpora unchanged. clippy 41 (one fewer than baseline). |
 | 3 capture buffer reuse | **done** | real screencopy 1080p p50 6.82–6.91 → **1.87–1.93 ms** (p95 8.1 → 3.2); at 4K the page cost is 4x. `to_vec` recycling skipped: a fresh 33 MB Vec is 1.42 ms and needs a return channel. Corpora unchanged. clippy 41. |
 | 4 canvas row sampling | **done** | 4K push 18.76 → **15.97 ms** (median of 3), 1080p 4.94 → **4.17**; preview unchanged. Corpora unchanged. Two equivalence tests. clippy 41. |
-| 5 fused conversion + descriptor | not started | |
+| 5 fused conversion + descriptor | **done** | 4K push 15.97 → **13.55 ms** (median of 3), 1080p 4.17 → **3.70**; preview unchanged. UI thread at 4K (push + preview) 21.85 → **19.59 ms** (59%). Corpora unchanged. Ladder-equality test. clippy 41. |
 | 6 preview direct from canvas | not started | |
