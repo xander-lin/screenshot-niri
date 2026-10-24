@@ -47,14 +47,16 @@ screenshot [OPTIONS] [PATH]
 | Key / action | Behaviour |
 |---|---|
 | Drag | Select a region; release saves and copies to the clipboard |
-| `1`–`9` | Capture a full screen; screens are numbered left to right |
-| `0` | Capture every screen as one image |
-| `H` | Toggle the cursor in the capture (hidden by default) |
+| `1`–`9` | Capture a full screen; screens are numbered left to right (before a drag starts) |
+| `0` | Capture every screen as one image (before a drag starts) |
+| `H` | Toggle the cursor in the capture; press while selecting, before release (hidden by default) |
 | `Esc` | Cancel at any time |
 
-A selection spanning several outputs is supported: each output's piece is
-captured and they are laid out end to end, so a gap between outputs is closed
-rather than painted black.
+The digit keys and `0` work before the first mouse press; once a drag has
+started the box is what is being selected. Releasing the mouse finishes the
+capture. A selection spanning several outputs is supported: each output's piece
+is captured and they are laid out end to end, so a gap between outputs is
+closed rather than painted black.
 
 ### Output Path
 

@@ -140,11 +140,13 @@ capture, the stitcher, and the corpus verification tooling.
 
 ## Verification Memory
 
-- **Plain branch verification (2026-10-24)**: HEAD of the plain branch derived
-  from `niri` `e5bc1ba`. `cargo test --release` → 48 passed;
-  `cargo clippy --release --all-targets` → zero warnings; `cargo build --release`
-  produces `target/release/screenshot`. Source size 3,987 lines across the
-  retained modules (the `niri` branch's stitcher and tools removed).
+- **Plain branch verification (2026-10-24, v0.2.0)**: derived from `niri`
+  `e5bc1ba`; `cargo test --release` → 48 passed; `cargo clippy --release
+  --all-targets` → zero warnings; `cargo build --release` produces
+  `target/release/screenshot`. Source size 3,987 lines across the retained
+  modules (the `niri` branch's stitcher and tools removed). Release `v0.2.0-plain`
+  ships x86_64 and aarch64 tarballs under
+  `screenshot-niri-0.2.0/` (binary, README, LICENSE).
 - **Packaging**: `PKGBUILD` builds `screenshot-plain` and conflicts with
   `screenshot-niri`. It was **not installed** on this machine: the installed
   `screenshot-niri-local 0.1.0-48` owns `/usr/bin/screenshot`, and replacing it
