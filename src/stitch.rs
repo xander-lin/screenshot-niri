@@ -699,15 +699,33 @@ impl RawStitcher {
             self.accepted_direction = AcceptedDirectionMemory::default();
         }
         self.last_screen_offset = Some(new_offset);
-        // The canvas geometry changed underneath the engine; re-seed it from
-        // the new viewport instead of letting it search a stale ladder.
-        self.engine.reset();
+        // A box edit does not invalidate what the matcher has already learned
+        // unless it changed the *descriptor's* geometry. Every stored row is
+        // 48 bins across the frame's width, so the rows stay comparable while
+        // the width and the horizontal extent are unchanged — a height resize,
+        // a vertical move. Resetting in those cases threw the whole canvas
+        // away, and with it the anchor's only evidence: a box shrunk below the
+        // scroll step then refused every frame for good, because the guard's
+        // reach is one frame tall and the anchor had nothing left to match.
+        //
+        // A width change or a horizontal move re-cuts the bins (or compares
+        // different columns), so only those re-seed.
+        let layout_changed = new_crop.width != crop.width || delta_x != 0;
+        if layout_changed {
+            self.engine.reset();
+        }
+        // The engine's rows are the *crop's*, and its positions are logical
+        // canvas rows, never the pixel canvas's re-based row: `new_rect.y` is
+        // `frame_y - min_y` once the canvas has grown upward.
+        let engine_top = frame_y + new_crop.y as i32;
+        self.last_engine_top = Some(engine_top);
+        self.canvas_origin = frame_y - new_rect.y;
         let previous = self
             .previous_compose_frame
             .as_ref()
             .ok_or("missing compose frame")?;
         self.engine
-            .commit(new_rect, new_rect.y, &CroppedRgbSource::new(previous, new_crop)?);
+            .commit_known_step(new_rect, engine_top, &CroppedRgbSource::new(previous, new_crop)?);
         self.last_profile_breakdown.path = Some(StitchDecisionPath::CanvasAccepted);
         Ok(PushResult::Accepted { match_info })
     }
@@ -1144,11 +1162,6 @@ impl RawStitcher {
                     previous_rect,
                     frame,
                     search_direction: hint,
-                    refusals: if primary {
-                        self.consecutive_refusals
-                    } else {
-                        0
-                    },
                     prebuilt_means,
                 }),
                 None => EngineDecision::Reject {
@@ -4328,7 +4341,6 @@ mod tests {
             previous_rect,
             frame: &target,
             search_direction: Some(SearchDirection::Down),
-            refusals: 0,
             prebuilt_means: None,
         };
         let first = engine.place(&request);
@@ -5975,6 +5987,41 @@ mod tests {
                 );
                 session.assert_canvas(&label, 4, 8);
             }
+        }
+
+        /// A box shrunk below the scroll step must keep stitching.
+        ///
+        /// The resize used to reset the matcher's canvas. A step taller than the
+        /// new box overlaps nothing, so the guard had no position it could even
+        /// score, and the anchor — the only stage that can answer a jump — had
+        /// no history left to match against. The capture then stalled for good:
+        /// every frame pending, the preview frozen. The whole scroll-back is
+        /// replayed here because the first accepted step is not the point; every
+        /// one of them must land on its true delta.
+        #[test]
+        fn a_shrunk_box_still_follows_a_scroll_back_longer_than_itself() {
+            let label = "shrunk box, scroll back";
+            let mut session = RandomSession::new(7, 1200, 20_000);
+            session.x = 150;
+            session.y = 5000;
+            session.width = 900;
+            session.height = 900;
+            session.screen_x = 120;
+            session.screen_y = 120;
+            session.push(Some(LongDirection::Down), &format!("{label}: first frame"));
+            for step in 0..12 {
+                session.scroll(0, 300);
+                session.push(Some(LongDirection::Up), &format!("{label}: up {step}"));
+            }
+            // The bottom edge dragged up: same origin, a box shorter than the
+            // 300 px the content moves between frames.
+            session.resize(0, 0, 900, 260);
+            session.push(None, &format!("{label}: shrink"));
+            for step in 0..11 {
+                session.scroll(0, -300);
+                session.push(Some(LongDirection::Down), &format!("{label}: back {step}"));
+            }
+            session.assert_canvas(label, 0, 1);
         }
     }
 }

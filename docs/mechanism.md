@@ -321,8 +321,10 @@ seconds-long action.
 
 * **Three searches, then refusal**: impulse (where the last step points), guard
   (does this frame still overlap the previous one), anchor (does it appear
-  anywhere the canvas can see — only after the border has been red for
-  `REFUSAL_PATIENCE = 8` frames).
+  anywhere the canvas can see — tried whenever the guard has nothing, because a
+  frame that shares no rows with the previous one has no local answer at all).
+  `REFUSAL_PATIENCE = 8` governs the border and the frame-rate drop, not the
+  search.
 * **Every acceptance gets a colour verification** against the pixel canvas,
   because the boundary descriptor is colour-blind by design.
 * **Axis routing**: the axis is the capture's impulse, not the arrow key; the

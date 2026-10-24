@@ -757,10 +757,6 @@ pub(super) struct PlacementRequest<'a> {
     /// shipped matcher derives the axis from the capture's own impulse).
     #[cfg_attr(not(feature = "stitch-legacy"), allow(dead_code))]
     pub search_direction: Option<SearchDirection>,
-    /// Consecutive refusals before this frame. The anchor stage is gated on
-    /// this: it exists to recover from a red border, not to run on every frame
-    /// whose immediate neighbourhood did not match.
-    pub refusals: u32,
     /// Bin means the caller accumulated while it produced `frame`.
     ///
     /// The conversion pass already has every pixel in hand, so accumulating the
@@ -807,6 +803,18 @@ pub(super) trait PlacementEngine {
     /// (possibly negative); `rect` is where the pixel canvas actually put it
     /// after any prepend.
     fn commit(&mut self, rect: ViewportRect, requested_top: i32, frame: &dyn RgbSource);
+
+    /// Records a frame whose canvas position is *known* rather than matched — an
+    /// edit-mode geometry change.
+    ///
+    /// The rows are written exactly like [`commit`](Self::commit), but the
+    /// scroll-step memory is left alone: a box edit is not a scroll, and folding
+    /// it in would point the next frame's prediction at the box's own move
+    /// (a resize reports zero, which would flatten the trend to nothing).
+    fn commit_known_step(&mut self, rect: ViewportRect, requested_top: i32, frame: &dyn RgbSource) {
+        self.commit(rect, requested_top, frame);
+    }
+
     fn reset(&mut self);
 
     /// Descriptor of the frame most recently passed to `place`, as a grayscale
@@ -1575,33 +1583,33 @@ impl PlacementEngine for WindowedEdgeMatcher {
             return self.accept(request, ladder, top, cost);
         }
 
-        // Stage 3 — anchor: recovery, and only recovery.
+        // Stage 3 — anchor: does this frame appear anywhere the canvas can see?
         //
-        // This stage answers a different question from the guard: not "is this
-        // frame the next step?" but "is this frame somewhere we have already
-        // seen?". That is a much weaker claim, so it must not be tried on every
-        // frame — a frame that merely failed to continue the capture would
-        // otherwise be matched against unrelated content somewhere up the page
-        // and appended there.
+        // A different question from the guard's "is this the next step?": that
+        // one needs the frame to still overlap the frame before it, and a frame
+        // that does not overlap has *no* local answer at all — no position in
+        // the guard band can even be scored. So this stage is not "recovery
+        // before continuation"; when the guard has nothing, it is the only
+        // question that can still be answered.
         //
-        // It runs only once the border is already red, i.e. after
-        // `REFUSAL_PATIENCE` consecutive refusals have shown that this is not a
-        // one-frame seam but a real loss of the scroll position. The engine
-        // shares that count with the UI rather than keeping its own: two
-        // counters for one decision drift apart.
+        // It used to run only once the border was red (`refusals >=
+        // REFUSAL_PATIENCE`). That wait does not make the answer safer — the
+        // frame is further from where it was captured, not closer — and it
+        // never ends for a box shorter than the scroll step: every frame is
+        // then a jump, so the capture stalls for eight frames, recovers one,
+        // and stalls again. The patience still belongs to the *border* and the
+        // frame-rate drop (`PushResult::NoMatch`), which is a UI promise about
+        // how long "nothing is happening" may last before the user is told.
         //
         // Ordered from the last confirmed position, because the prediction has
         // just been shown to be wrong, and it skips the guard band, which the
         // stage above already scored.
-        let recovering = request.refusals >= crate::stitch::REFUSAL_PATIENCE;
-        if recovering {
-            let anchor = self.anchor.unwrap_or(pos);
-            if let Some(bounds) = self.canvas_bounds(&ladder) {
-                if let Some((top, cost)) =
-                    self.search_rings(&mut cache, &ladder, anchor, bounds, &[guard], request)
-                {
-                    return self.accept(request, ladder, top, cost);
-                }
+        let anchor = self.anchor.unwrap_or(pos);
+        if let Some(bounds) = self.canvas_bounds(&ladder) {
+            if let Some((top, cost)) =
+                self.search_rings(&mut cache, &ladder, anchor, bounds, &[guard], request)
+            {
+                return self.accept(request, ladder, top, cost);
             }
         }
 
@@ -1612,6 +1620,34 @@ impl PlacementEngine for WindowedEdgeMatcher {
     }
 
     fn commit(&mut self, _rect: ViewportRect, requested_top: i32, frame: &dyn RgbSource) {
+        self.write_committed(requested_top, frame, true);
+    }
+
+    fn commit_known_step(&mut self, _rect: ViewportRect, requested_top: i32, frame: &dyn RgbSource) {
+        self.write_committed(requested_top, frame, false);
+    }
+
+    fn reset(&mut self) {
+        let axis = self.axis;
+        *self = Self::default();
+        self.axis = axis;
+    }
+
+    fn last_descriptor(&self) -> Option<(u32, u32, Vec<u8>)> {
+        self.pending_ladder
+            .as_ref()
+            .or(self.last_committed_ladder.as_ref())
+            .map(|ladder| ladder.as_grayscale())
+    }
+}
+
+impl WindowedEdgeMatcher {
+    /// Writes one frame's descriptor rows into the canvas at `requested_top`.
+    ///
+    /// `record_step` decides whether this placement is a *scroll step* the next
+    /// frame should be predicted from. Matched frames are; a known geometry step
+    /// is not (see [`PlacementEngine::commit_known_step`]).
+    fn write_committed(&mut self, requested_top: i32, frame: &dyn RgbSource, record_step: bool) {
         // The session's one gain is decided by the frame that initialises the
         // canvas, before that frame's own ladder is built: every ladder —
         // including the first — must share the scale the canvas is written
@@ -1654,27 +1690,16 @@ impl PlacementEngine for WindowedEdgeMatcher {
         self.frame_rows = ladder.rows();
         self.pos = Some(requested_top);
         self.anchor = Some(requested_top);
-        if let Some(previous) = previous {
-            let delta = requested_top - previous;
-            let last = self.last_delta.unwrap_or(0);
-            self.trend = 0.5 * self.trend + 0.5 * f64::from(delta - last);
-            self.last_delta = Some(delta);
+        if record_step {
+            if let Some(previous) = previous {
+                let delta = requested_top - previous;
+                let last = self.last_delta.unwrap_or(0);
+                self.trend = 0.5 * self.trend + 0.5 * f64::from(delta - last);
+                self.last_delta = Some(delta);
+            }
         }
         self.pending_top = None;
         self.last_committed_ladder = Some(ladder);
-    }
-
-    fn reset(&mut self) {
-        let axis = self.axis;
-        *self = Self::default();
-        self.axis = axis;
-    }
-
-    fn last_descriptor(&self) -> Option<(u32, u32, Vec<u8>)> {
-        self.pending_ladder
-            .as_ref()
-            .or(self.last_committed_ladder.as_ref())
-            .map(|ladder| ladder.as_grayscale())
     }
 }
 
@@ -1800,7 +1825,6 @@ pub(super) fn place_horizontally(
         previous_rect,
         frame,
         search_direction: direction,
-        refusals: 0,
         prebuilt_means: None,
     };
     let mut cache = ScoreCache::default();
@@ -2292,7 +2316,6 @@ mod tests {
             previous_rect: ViewportRect { y: prev_rect_y, ..rect },
             frame,
             search_direction: None,
-            refusals: 0,
             prebuilt_means: None,
         }
     }
@@ -2703,9 +2726,8 @@ mod tests {
 
         let next = frame_from(90, height);
         let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first), (60, &second)];
-        let mut req =
+        let req =
             request_on_canvas(&next, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
-        req.refusals = crate::stitch::REFUSAL_PATIENCE;
         match engine.place(&req) {
             EngineDecision::Place { rect, .. } => assert_eq!(rect.y, 90),
             other => panic!("the continuation must be placed: {other:?}"),
@@ -2813,17 +2835,22 @@ mod tests {
         }
     }
 
-    /// The anchor stage is recovery, not a second opinion: it must not run
-    /// until the border is already red.
+    /// A frame that shares no rows with the previous one is answered by the
+    /// anchor immediately.
     ///
-    /// Two frames 60 rows apart, so the guard band (`pos ± (rows -
-    /// minimum_overlap)`, 34 rows here) excludes row 10 while the canvas still
-    /// covers it. With no refusal streak the frame is refused — it is not a
-    /// continuation of the previous one — and the same frame is placed once the
-    /// streak reaches `REFUSAL_PATIENCE`, which is the moment the UI turns the
-    /// border red.
+    /// The guard can only score positions that still overlap the frame before
+    /// them, so a jump has no local answer at all. Waiting for the border to
+    /// turn red does not make that answer safer — the frame is further from
+    /// where it was captured, not closer — and the wait never ends when the box
+    /// is shorter than the scroll step: every frame is then a jump, so the
+    /// capture would stall for `REFUSAL_PATIENCE` frames, recover one, and
+    /// stall again. The patience still governs the *border* (`NoMatch`), not
+    /// the search.
+    ///
+    /// Two frames 60 rows apart, so the guard band (`pos ± rows`, 60..180 here)
+    /// excludes row 10 while the canvas still covers it.
     #[test]
-    fn the_anchor_stage_waits_for_the_red_border() {
+    fn a_jump_without_local_evidence_is_placed_by_the_anchor() {
         let height = 60;
         let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
         // A canvas three viewports tall: rows 0..180.
@@ -2840,19 +2867,12 @@ mod tests {
         // one, it is content from further up the page.
         let back = frame_from(10, height);
         let committed: Vec<(i32, &RgbFrame)> = vec![(0, &first), (60, &second), (120, &third)];
-        let mut req =
+        let req =
             request_on_canvas(&back, ViewportRect { x: 0, y: 0, width: W, height }, &committed);
 
-        req.refusals = 0;
-        assert!(
-            matches!(engine.place(&req), EngineDecision::Reject { .. }),
-            "the anchor must not run before the border is red"
-        );
-
-        req.refusals = crate::stitch::REFUSAL_PATIENCE;
         match engine.place(&req) {
             EngineDecision::Place { rect, .. } => assert_eq!(rect.y, 10),
-            other => panic!("recovery must place the frame: {other:?}"),
+            other => panic!("a jump the canvas covers must be placed at once: {other:?}"),
         }
     }
 
