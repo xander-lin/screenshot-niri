@@ -47,17 +47,19 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut verbose = false;
     let mut save: Option<PathBuf> = None;
     let mut dump_ladder: Option<PathBuf> = None;
+    let mut exact = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dir" | "-d" => dir = Some(PathBuf::from(args.next().ok_or("--dir needs a path")?)),
             "--verbose" | "-v" => verbose = true,
+            "--exact" => exact = true,
             "--save" => save = Some(PathBuf::from(args.next().ok_or("--save needs a path")?)),
             "--dump-ladder" => {
                 dump_ladder = Some(PathBuf::from(args.next().ok_or("--dump-ladder needs a directory")?))
             }
             "--help" | "-h" => {
-                println!("replay-frames --dir DIR [--verbose] [--save OUT.png] [--dump-ladder DIR]");
+                println!("replay-frames --dir DIR [--verbose] [--exact] [--save OUT.png] [--dump-ladder DIR]");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument: {other}").into()),
@@ -82,6 +84,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut oracle_failed = 0u32;
     let mut ambiguous_pairs = 0u32;
     let mut delta_mismatch = 0u32;
+    let mut strict_refusals = 0u32;
     let mut canvas_top = 0i32;
     let mut placements: Vec<(usize, i32)> = Vec::new();
     let mut blended_pair_costs: Vec<(usize, f64)> = Vec::new();
@@ -122,7 +125,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         let image = load_image(&entry.path)?;
 
         // Ground truth: exhaustive search between this frame and the last one.
-        let oracle = oracle_delta(&previous, &image);
+        let oracle = oracle_delta(&previous, &image, if exact { 1 } else { ORACLE_STEP });
         let oracle_delta = match &oracle {
             Some(o) => o.delta,
             None => {
@@ -199,10 +202,15 @@ fn run() -> Result<(), Box<dyn Error>> {
                     match_info.delta_y - oracle_delta
                 };
                 // A disagreement on content that matches at several offsets is
-                // not a misplacement: the frame carries no answer. Nor is a
-                // delta that absorbs a refusal gap: the canvas position is what
-                // matters, and `reprojection check` verifies that directly.
-                if err != i32::MIN && err.abs() > 1 && !oracle_ambiguous {
+                // not a misplacement: the frame carries no answer. The tie set
+                // is what decides that, not a flag: an offset inside it is one
+                // of the answers the pixels allow. Nor is a delta that absorbs
+                // a refusal gap — the canvas position is what matters, which
+                // the reprojection check verifies directly.
+                let outside_ties = oracle
+                    .as_ref()
+                    .is_some_and(|o| !o.ties.iter().any(|t| (t - match_info.delta_y).abs() <= 1));
+                if err != i32::MIN && err.abs() > 1 && outside_ties {
                     delta_mismatch += 1;
                 }
                 (
@@ -215,10 +223,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                         } else {
                             String::new()
                         }
-                    } else if oracle_ambiguous {
-                        format!("differs by {err:+} on ambiguous content")
+                    } else if !outside_ties {
+                        format!("differs by {err:+}, still inside the tie set")
                     } else {
-                        format!("off by {err:+}")
+                        format!(
+                            "off by {err:+} (pixels allow {:?})",
+                            oracle.as_ref().map(|o| &o.ties)
+                        )
                     },
                     match_info.score,
                     err,
@@ -226,6 +237,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             PushResult::Pending => {
                 pending += 1;
+                if oracle.as_ref().is_some_and(|o| !o.ambiguous && o.cost <= 1.0) {
+                    strict_refusals += 1;
+                }
                 (
                     "pending",
                     stitcher
@@ -238,6 +252,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             PushResult::NoMatch => {
                 refused += 1;
+                if oracle.as_ref().is_some_and(|o| !o.ambiguous && o.cost <= 1.0) {
+                    strict_refusals += 1;
+                }
                 (
                     "no-match",
                     stitcher
@@ -320,41 +337,42 @@ fn run() -> Result<(), Box<dyn Error>> {
                 })
                 .collect();
 
-            // Check 1: does the frame's pixels match the canvas where the
-            // stitcher put it? Blurred transition frames fit poorly *everywhere*
-            // (their content is smeared), so a placement is only judged against
-            // the frame's own floor — otherwise every blurred frame is a false
-            // accusation.
-            let mut bad: Vec<(usize, i32, f64)> = Vec::new();
-            for (i, located) in &searched {
-                if located.claimed_cost > REPROJECTION_MAX_COST
-                    && located.claimed_cost > located.floor + REPROJECTION_MARGIN
-                {
-                    bad.push((*i, located.claimed, located.claimed_cost));
-                }
-            }
-            misplaced = bad.len() as u32;
-
-            // Check 2: where did each frame *actually* end up? A blurred frame
-            // fits badly everywhere, so its own fit cannot judge it — but its
-            // neighbours can. A frame whose found row sits far from the rows
-            // around it was placed on a repeated-looking patch of canvas.
-            let located: Vec<(usize, i32, f64)> = searched
+            // The stitcher's own recorded row is not usable as an absolute
+            // reference: a recovery re-bases the engine's page coordinate, so
+            // the number is in a different coordinate system from the canvas
+            // rows (measured on `real-2`: a frame recorded at row 683 sits at
+            // 3203 with a perfect fit). Every check below therefore uses the
+            // row the frame's *pixels* fit best, and the divergence is reported
+            // on its own line so a re-basing stays visible.
+            let misplaced_rows: Vec<(usize, i32, f64)> = searched
                 .iter()
+                .filter(|(_, l)| l.floor <= REPROJECTION_MAX_COST)
                 .map(|(i, l)| (*i, l.row, l.cost))
                 .collect();
-            let jumps = find_isolation(&located);
+            let jumps = find_isolation(&misplaced_rows);
+            misplaced = jumps.len() as u32;
 
             // Check 3: band consistency. A frame captured mid-jump — part of
             // the buffer at the old position, part at the new one — has no
             // single placement, and whatever rows it writes land displaced
             // from its own top. Locate each horizontal band independently and
-            // compare with the claimed row. Bands that fit nowhere are not
-            // evidence (low texture fits nothing tightly); a band that fits
-            // well *elsewhere* is content the canvas holds at the wrong rows.
+            // compare with the frame's content row (never the stitcher's
+            // recorded row: that number is in another coordinate system). Bands
+            // that fit nowhere are not evidence (low texture fits nothing
+            // tightly); a band that fits well *elsewhere* is content the canvas
+            // holds at the wrong rows.
+            // Bands are located against the frame's *content row*, not the
+            // stitcher's claimed one, and only frames the canvas can verify are
+            // judged (a blurred frame has no honest band position).
+            let rows_by_frame: std::collections::HashMap<usize, i32> = searched
+                .iter()
+                .filter(|(_, l)| l.floor <= REPROJECTION_MAX_COST)
+                .map(|(i, l)| (*i, l.row))
+                .collect();
             let band_work: Vec<(usize, i32, i32, i32)> = {
                 let mut work = Vec::new();
-                for (k, (_, claimed, image, _)) in loaded.iter().enumerate() {
+                for (k, (i, _, image, _)) in loaded.iter().enumerate() {
+                    let Some(&claimed) = rows_by_frame.get(i) else { continue };
                     let height = image.height as i32;
                     let band = (height + BAND_COUNT - 1) / BAND_COUNT;
                     for b in 0..BAND_COUNT {
@@ -369,7 +387,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                             && claimed + lo >= 0
                             && claimed + hi <= canvas.height as i32
                         {
-                            work.push((k, *claimed, lo, hi));
+                            work.push((k, claimed, lo, hi));
                         }
                     }
                 }
@@ -436,9 +454,21 @@ fn run() -> Result<(), Box<dyn Error>> {
             torn_written = by_frame.len() as u32;
 
             println!("\nreprojection check: {} accepted frames ({:?})", placements.len(), started.elapsed());
-            println!("  placements whose pixels do not fit the canvas: {}", bad.len());
-            for (i, top, cost) in bad.iter().take(20) {
-                println!("    frame {i} at logical row {top}: mean |diff| = {cost:.2}");
+            let diverged: Vec<(usize, i32, i32)> = searched
+                .iter()
+                .filter(|(_, l)| (l.row - l.claimed).abs() > ROW_DIVERGENCE_REPORT)
+                .map(|(i, l)| (*i, l.claimed, l.row))
+                .collect();
+            println!(
+                "  placements whose recorded row is not the content row: {}",
+                diverged.len()
+            );
+            for (i, claimed, row) in diverged.iter().take(10) {
+                let located = searched.iter().find(|(k, _)| k == i).map(|(_, l)| l.claimed_cost);
+                println!(
+                    "    frame {i}: recorded {claimed}, content sits at {row}{}",
+                    located.map(|cost| format!(" (claimed fit {cost:.2})")).unwrap_or_default()
+                );
             }
             println!("  placements far from their neighbours: {}", jumps.len());
             for (i, row, claimed, gap) in jumps.iter().take(20) {
@@ -519,7 +549,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!("  pending   {pending}");
     println!("  no-match  {refused}");
     println!("  duplicate {duplicate}");
-    println!("  MISPLACED {misplaced}  (frame pixels do not match the canvas where they were put)");
+    println!("  MISPLACED {misplaced}  (placements whose content sits far from their neighbours' content)");
     println!("  frames with displaced bands {torn_written}  (jump-transition frames whose content sits rows away from their own top)");
     println!("  UNCOVERED {uncovered}  (canvas rows no accepted frame ever contained)");
     println!("  pairwise-outlier frames written {blended_written}  (cost > {blend_threshold:.2}; whether their rows land correctly is decided by the band criterion)");
@@ -532,8 +562,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             final_drift.unwrap_or(0)
         );
     }
-    println!("  delta differs from the pairwise truth {delta_mismatch}  (a recovery gap, not a misplacement)");
-    println!("  ambiguous pairs {ambiguous_pairs}  (content matched at several offsets)");
+    println!("  delta outside the pixels' tie set {delta_mismatch}  (a recovery gap or a wrong offset; an ambiguity class is not counted)");
+    println!("  ambiguous pairs {ambiguous_pairs}  (content matched at several offsets; the tie set is what the delta is judged against)");
+    println!("  refusals on a uniquely resolvable pair {strict_refusals}  (diagnostic: the pixels know this step, the canvas could not use it)");
     if oracle_failed > 0 {
         println!("  oracle could not decide {oracle_failed} pairs (no overlap)");
     }
@@ -598,6 +629,11 @@ struct Oracle {
     ambiguous: bool,
     /// Cost at the chosen displacement, in mean luminance units.
     cost: f64,
+    /// Every distinct displacement the pixels cannot tell apart. A placement
+    /// inside this set is consistent with the frames; only a placement outside
+    /// it is a wrong displacement. Reporting just the smallest-magnitude member
+    /// (what the summary used to do) turns a genuine ambiguity into an error.
+    ties: Vec<i32>,
 }
 
 /// Exhaustive search for the vertical displacement between two frames.
@@ -609,7 +645,7 @@ struct Oracle {
 /// On periodic content several offsets match equally well. Reporting the
 /// smallest-magnitude one and flagging the tie keeps the oracle from blaming
 /// the stitcher for a position that is genuinely indistinguishable.
-fn oracle_delta(previous: &Image, current: &Image) -> Option<Oracle> {
+fn oracle_delta(previous: &Image, current: &Image, step: u32) -> Option<Oracle> {
     if previous.width != current.width || previous.height != current.height {
         return None;
     }
@@ -637,7 +673,7 @@ fn oracle_delta(previous: &Image, current: &Image) -> Option<Oracle> {
                     let mut local: Vec<(f64, i32)> = Vec::new();
                     for delta in lo..=hi {
                         if let Some(entry) =
-                            oracle_score(prev, cur, width, height, min_overlap, delta)
+                            oracle_score(prev, cur, width, height, min_overlap, delta, step)
                         {
                             local.push(entry);
                         }
@@ -673,7 +709,7 @@ fn oracle_delta(previous: &Image, current: &Image) -> Option<Oracle> {
         .iter()
         .min_by_key(|delta| delta.abs())
         .expect("at least one candidate survived the filter");
-    return Some(Oracle { delta: chosen, ambiguous: distinct.len() > 1, cost: best_cost });
+    return Some(Oracle { delta: chosen, ambiguous: distinct.len() > 1, cost: best_cost, ties: distinct });
 
 }
 
@@ -685,6 +721,7 @@ fn oracle_score(
     height: u32,
     min_overlap: u32,
     delta: i32,
+    step: u32,
 ) -> Option<(f64, i32)> {
     let (cur_start, prev_start, rows) = if delta >= 0 {
         (0u32, delta as u32, height.checked_sub(delta as u32)?)
@@ -704,9 +741,9 @@ fn oracle_score(
         while x < width {
             sum += u64::from(prev[a + x as usize].abs_diff(cur[b + x as usize]));
             count += 1;
-            x += ORACLE_STEP;
+            x += step;
         }
-        y += ORACLE_STEP;
+        y += step;
     }
     if count == 0 {
         return None;
@@ -950,12 +987,13 @@ fn locate_in_canvas(
             .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
     });
     let (best_row, best_cost) = found.unwrap_or((claimed, claimed_cost));
-    let (row, cost) = if best_cost + LOCATE_MARGIN < claimed_cost {
-        (best_row, best_cost)
-    } else {
-        (claimed, claimed_cost)
-    };
-    Located { claimed, claimed_cost, row, cost, floor: best_cost }
+    // Content decides the row, never the stitcher's own row bookkeeping: a
+    // recovery or a far placement re-bases the engine's page coordinate, so the
+    // claimed row can sit thousands of rows away from where the frame's pixels
+    // actually are (measured on `real-2`: frame 44 claimed row 683, matched the
+    // canvas at 3203 with a perfect fit). The claimed row is kept only for
+    // reporting, so a divergence stays visible instead of being judged.
+    Located { claimed, claimed_cost, row: best_row, cost: best_cost, floor: best_cost }
 }
 
 /// Placements that sit far from the rows their neighbours occupy.
@@ -998,15 +1036,14 @@ fn find_isolation(located: &[(usize, i32, f64)]) -> Vec<(usize, i32, i32, i32)> 
 /// treated as misplaced. Real scrolling is continuous; a whole viewport of
 /// disagreement between adjacent frames is not scrolling.
 const ISOLATION_MAX_GAP: i32 = 300;
-/// How much better a different row must fit before it overrides the claimed
-/// one when locating a frame.
-const LOCATE_MARGIN: f64 = 1.0;
 /// Above this, the frame's pixels do not match the canvas where it was put.
 const REPROJECTION_MAX_COST: f64 = 2.0;
-/// A placement is only wrong when it is this much worse than the frame's own
-/// best fit anywhere. Blurred frames never fit tightly; comparing against their
-/// own floor keeps the check about *where* the frame went, not how sharp it is.
-const REPROJECTION_MARGIN: f64 = 2.0;
+/// How far the stitcher's own recorded row may differ from the row the frame's
+/// pixels actually occupy before the divergence is reported. This is not a
+/// placement error: a recovery re-bases the engine's page coordinate, so the
+/// two numbers are in different coordinate systems and only their *change*
+/// means anything.
+const ROW_DIVERGENCE_REPORT: i32 = 2;
 /// Frames are split into this many horizontal bands for the band check.
 const BAND_COUNT: i32 = 4;
 /// A band found this far from its frame's own top is displaced, not jitter.

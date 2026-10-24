@@ -628,7 +628,18 @@ impl EdgeCanvas {
         }
         let bins = self.bins as usize;
         if top < self.origin_row {
-            self.shift_forward(self.origin_row - top);
+            if self.is_empty() {
+                // Nothing to shift: the first frame of a session is the canvas,
+                // and its top is wherever the caller says it is. `shift_forward`
+                // returns early on an empty canvas, so leaving `origin_row` at
+                // its seed would put every row of the frame at a negative index
+                // and silently write nothing — which is what a session whose
+                // first frame is committed at a negative page row (a selection
+                // edit late in the capture) used to do.
+                self.origin_row = top;
+            } else {
+                self.shift_forward(self.origin_row - top);
+            }
         }
         let start = top - self.origin_row;
         let needed = (start + ladder.rows as i32).max(self.filled.len() as i32).max(0) as usize;

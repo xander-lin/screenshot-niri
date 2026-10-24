@@ -346,6 +346,24 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
   3. `MISPLACED` 汇总把运动模糊帧也算进去（修复后接受更多、该项反而变大），不能当唯一指标；判断"错位修没修好"要看 |delta| ≥ 帧高的远放置数和逐帧 err。
   4. 抓语料时选区里有大片空白是**真实**形态（长页面就是有空档），它暴露的正是"低信息帧 + 重复内容"这条路径；回放工具的 `no-boundaries`/`no-candidate` 长串不是噪声，是引擎在诚实地拒绝，错的是偶尔放行的那几帧。
 
+### 34. "记录的行号"必须写明属于哪个坐标系：引擎的页坐标会被恢复路径重新定基，拿它去和画布像素对位就是自欺
+
+- **Context**：用户追问"我们怎么知道哪一帧应该接受、哪一帧应该拒绝？有没有标准答案？"为回答它去核对 `replay-frames` 的逐像素回投影判据，发现 `real-2` 的基线 `230 接受 / 200 MISPLACED / 9 位移条带` 不是可信测量。直接证据：帧 44 的回投影按记录行 `683` 计算，与画布均差 **19.56**；同一帧按内容全画布搜索落在 **3203**，均差 **0.00**。230 个接受帧里 154 个的记录行都不是内容所在行（最大偏差数千行），有的甚至为负（`-937`，落在画布外，`reprojection_band_cost` 直接跳过 → 代价记 0）。
+- **Root cause**：判据把 `last_engine_top() - canvas_origin()` 当作"该帧在最终画布中的行"。这只在同一坐标系里成立。引擎的页坐标在两类路径上会被**重新定基**：`push_geometry_frame` 用 `frame_y`（像素画布行，随向上生长被 relabel）推导引擎的 top；两条恢复路径（`find_dirty_overlap_recovery` / `find_nomatch_recovery`）把帧写在恢复算出的位置，却告诉引擎它还在 `candidate_rect.y`，再靠 `canvas_origin = candidate_rect.y - new_rect.y` 把两套坐标"接上"。每次接续都是一次整体平移，于是早先记录的 `logical` 与最终 `canvas_origin` 不再对应——记录行可以在会话中漂移几千行再漂回来。
+- **Two production bugs found on the way**（都不是工具问题，已修）：
+  1. `push_geometry_frame` 的 `engine_top = frame_y + new_crop.y`：像素行被向上生长改写，而引擎的已存行不会被改写，所以一次选区编辑会把引擎的页坐标整体平移 `-canvas_origin` 行。宽度编辑会 reset（凑巧无害），**高度编辑不 reset**，正是契约要求"高度 resize 不动已存行"的那条路径，实际上被平移作废了。改为 `last_engine_top + delta_y`：上一帧的页坐标加上选区自身的位移，与像素画布无关。横向放置分支里的 `last_engine_top = applied.y; canvas_origin = 0` 同理，改为 `applied.y + canvas_origin`。
+  2. `EdgeCanvas::write` 在**空画布**上收到负的首次 top 时静默不写：`shift_forward` 对空画布提前返回，`start = top - origin_row < 0`，每一行都落在负索引被 `continue` 掉。之前没人踩到，是因为引擎的 top 一直是 ~0；修好 (1) 之后 `real-2` 的高度编辑后 800 帧连续 no-match（引擎画布 `filled_lo=MAX`）。空画布时直接 `origin_row = top`。
+- **Correction**：
+  - 判据改为**按内容定位**：`locate_in_canvas` 的最佳行直接作为该帧的行（`Located.row`），不再"除非明显更好才用"；远放置判据改比内容行与邻居内容行（不再用记录行），条带判据也相对内容行。
+  - 记录行与内容行的偏差单独报一行（`placements whose recorded row is not the content row`），它是"引擎坐标被重新定基"的诊断，不是错位。
+  - 修正后的基线：real-1 204 接受 / 远放置 0 / 条带 0 / 未覆盖 0；real-2 230 / **0** / **1** / 0（记录行偏差 154 是诊断项）；real-3 65 / 0 / 0 / 0；其余六份语料不变（real-long 97、real-scroll 7、mini 3、pipeline-test 7、pipeline-bad 7、lowcontrast-2b 78）。
+  - 回归测试 `a_selection_edit_keeps_the_page_row_of_a_canvas_that_grew_upward`：先向上长 600 行，再做宽度编辑（reset 后首次提交为负 top），再做高度编辑（不 reset），每一步断言 `last_engine_top() == 页面行`，最后继续滚动仍能接受。分别撤掉两个修复，测试都会在对应断言失败。
+- **Prevention**：
+  1. 任何"绝对行号"在跨帧使用时，先问它属于**哪个坐标系**、这个坐标系会不会被 reset/恢复/编辑重新定基。会，就只能在同一段内比较，或者改用内容定位（像素说话）。
+  2. 用"记录位置"验证"实际位置"时，先做一次**同帧自证**：该帧在自己的记录行上是否真的零代价？`real-2` 的帧 44 一查就破（19.56 vs 0.00），200 这个数字根本不该进基线。语料的验证工具也要有这种自证用例。
+  3. 一个"静默不写"的分支比 panic 危险得多：`write` 的负索引 `continue` 让引擎空转 800 帧而无任何报错。凡是"跳过一行"的循环，都要有"一行都没写"的断言或测试。
+  4. 动态内容（流式输出的聊天界面）不能作为静态马赛克来验证：同一页面行两次经过时像素本来就不同。`real-2` 的 201/230 帧在最终画布上找不到 ≤2 的拟合，这是内容变了，不是拼错了；这类语料只能用**时间维度**的判据（相邻帧穷举 delta、连续性、覆盖）。
+
 ---
 
 ## Verification Memory

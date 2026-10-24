@@ -716,12 +716,18 @@ impl RawStitcher {
         if layout_changed {
             self.engine.reset();
         }
-        // The engine's rows are the *crop's*, and its positions are logical
-        // canvas rows, never the pixel canvas's re-based row: `new_rect.y` is
-        // `frame_y - min_y` once the canvas has grown upward.
-        let engine_top = frame_y + new_crop.y as i32;
+        // The engine's positions are page rows, not canvas rows: a canvas that
+        // has grown upward has a negative origin, and `frame_y` is a row in
+        // that canvas, so deriving the new top from it would re-base the
+        // engine's whole coordinate system on every edit. The previous top plus
+        // the crop's own movement is the same page row without the re-basing,
+        // which is what keeps the rows already committed comparable (a height
+        // resize deliberately keeps them).
+        let engine_top = self
+            .last_engine_top
+            .map_or(frame_y + new_crop.y as i32, |top| top + delta_y);
         self.last_engine_top = Some(engine_top);
-        self.canvas_origin = frame_y - new_rect.y;
+        self.canvas_origin = engine_top - new_rect.y;
         let previous = self
             .previous_compose_frame
             .as_ref()
@@ -1048,9 +1054,13 @@ impl RawStitcher {
                 // one and refuse. Re-seed from the frame the horizontal matcher
                 // just verified against the pixel canvas.
                 self.engine.reset();
-                self.last_engine_top = Some(applied.y);
-                self.canvas_origin = 0;
-                self.engine.commit(applied, applied.y, active_compose_frame);
+                // `applied` is a canvas row; the engine's rows are page rows,
+                // which the current origin maps onto it. Setting the origin to
+                // zero here was only correct while the canvas had never grown
+                // upward.
+                let engine_top = applied.y + self.canvas_origin;
+                self.last_engine_top = Some(engine_top);
+                self.engine.commit(applied, engine_top, active_compose_frame);
             } else {
                 self.last_engine_top = Some(candidate_rect.y);
                 self.canvas_origin = candidate_rect.y - applied.y;
@@ -4789,6 +4799,80 @@ mod tests {
         assert_eq!(stitched.height, 4);
         // All rows fully covered: the widened frame spans the whole width.
         assert!(stitched.row_coverage.iter().all(|r| r == &RowCoverage::Full));
+    }
+
+    /// A capture that has grown upward has a negative page coordinate, and a
+    /// selection edit late in the session must not re-base it.
+    ///
+    /// Two defects met here. `push_geometry_frame` derived the engine's top from
+    /// the *pixel* row, which is re-based by every upward prepend, so the edit
+    /// moved the engine's whole coordinate system while its rows stayed put. And
+    /// once the top was correct (negative), `EdgeCanvas::write` silently wrote
+    /// nothing for the first commit after a reset: `shift_forward` returns early
+    /// on an empty canvas, so every row of that frame landed at a negative index
+    /// and the engine stayed blind for the rest of the capture (measured on
+    /// `real-2`: 800 consecutive refusals after the height edit).
+    #[cfg(not(feature = "stitch-legacy"))]
+    #[test]
+    fn a_selection_edit_keeps_the_page_row_of_a_canvas_that_grew_upward() {
+        const PAGE_WIDTH: u32 = 120;
+        const HEIGHT: u32 = 100;
+        let page: Vec<Vec<u8>> = (0..2000u32).map(|row| row_texture(PAGE_WIDTH, row)).collect();
+        let crop = |x: u32, top: u32, width: u32, height: u32| -> RgbFrame {
+            let stride = width * 3;
+            let mut data = Vec::with_capacity((stride * height) as usize);
+            for y in 0..height {
+                let row = &page[(top + y) as usize];
+                data.extend_from_slice(&row[(x * 3) as usize..((x + width) * 3) as usize]);
+            }
+            RgbFrame { width, height, stride, data }
+        };
+        let origin = FrameScreenOffset { x: 0, y: 0 };
+        let mut stitcher = RawStitcher::new();
+        let first = crop(0, 500, 100, HEIGHT);
+        assert!(matches!(
+            stitcher.push_frame_with_offset(&first, &first, Some(LongDirection::Up), origin),
+            Ok(PushResult::Initialized)
+        ));
+        for top in [440u32, 380, 320, 260, 200, 140] {
+            let frame = crop(0, top, 100, HEIGHT);
+            assert!(matches!(
+                stitcher.push_frame_with_offset(&frame, &frame, Some(LongDirection::Up), origin),
+                Ok(PushResult::Accepted { .. })
+            ));
+            assert_eq!(stitcher.last_engine_top(), Some(top as i32 - 500));
+        }
+        // Width edit: the engine resets, so its first commit is a fresh canvas
+        // whose only frame sits at a negative page row.
+        let narrow_origin = FrameScreenOffset { x: 10, y: 0 };
+        let narrow = crop(10, 140, 80, HEIGHT);
+        assert!(matches!(
+            stitcher.push_frame_with_offset(&narrow, &narrow, Some(LongDirection::Up), narrow_origin),
+            Ok(PushResult::Accepted { .. })
+        ));
+        assert_eq!(stitcher.last_engine_top(), Some(140 - 500));
+        // Height edit (the box grows downward, its top does not move): the page
+        // row is unchanged and the matcher keeps its rows.
+        let taller = crop(10, 140, 80, HEIGHT + 20);
+        assert!(matches!(
+            stitcher.push_frame_with_offset(&taller, &taller, Some(LongDirection::Up), narrow_origin),
+            Ok(PushResult::Accepted { .. })
+        ));
+        assert_eq!(stitcher.last_engine_top(), Some(140 - 500));
+        // And the capture continues to place frames by content.
+        for top in [80u32, 20] {
+            let frame = crop(10, top, 80, HEIGHT + 20);
+            assert!(
+                matches!(
+                    stitcher.push_frame_with_offset(&frame, &frame, Some(LongDirection::Up), narrow_origin),
+                    Ok(PushResult::Accepted { .. })
+                ),
+                "the capture must keep stitching after the edits (page row {top})"
+            );
+            assert_eq!(stitcher.last_engine_top(), Some(top as i32 - 500));
+        }
+        let stitched = stitcher.stitched().unwrap();
+        assert!(stitched.row_coverage.iter().all(|row| row != &RowCoverage::Empty));
     }
 
     #[test]

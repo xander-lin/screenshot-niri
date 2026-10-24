@@ -450,6 +450,8 @@ pixels written are the pixels the overlay displayed, including the `H` decision.
 | Logical↔pixel mapping comes from the capture | `capture_pixel_scale` | using `wl_output.scale` |
 | Never-captured rows read as missing, not zeros | `CanvasStore::written` | dropping the flag, or allocating tiles lazily by row |
 | Growing upward copies no pixels | `relabel` + `origin_row`-relative indexing | re-cutting bands per prepend |
+| The engine's page rows survive an edit and a re-basing | `last_engine_top + delta_y`, `EdgeCanvas::write`'s empty-canvas rebase | deriving the top from the pixel rect, or skipping every row of a negative first commit |
+| A placement is verified by its content, not by a recorded row | `replay-frames`' `locate_in_canvas` (whole-canvas search) | `last_engine_top() - canvas_origin()` across recoveries/edits |
 | The overlay commits only on change | `live_state_seq`, `last_selected` | committing unconditionally |
 | Spanning long selections are refused, not clamped | `discard_spanning_long_selection` | clamping in the selection path |
 | `raw_rgb` reads only captured pixels | `RowCoverage` + colour check | reading the bounding box |
