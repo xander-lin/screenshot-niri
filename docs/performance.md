@@ -590,12 +590,15 @@ Unweighted mean of the per-corpus medians (push mean / push p95):
 * PGO on top of a target CPU is **worse than that target CPU alone** (1.35 vs
   1.27 ms mean, 1.37 vs 1.29 for v3), consistently across corpora.
 
-**Not adopted.** PGO stays out of the build; it is a measured dead end for
-this workload. `-C target-cpu` is deliberately not enabled by default either:
-the published and AUR binaries must run on the package's declared CPU baseline.
-A local build can use `RUSTFLAGS="-C target-cpu=x86-64-v3"` (AVX2) or
-`native`; choosing v3 for a release is a supported-CPU policy decision, not a
-compiler trick. Sample-based PGO (AutoFDO, from `perf` samples) and BOLT
+**Adopted in 0.2.1, partially.** PGO stays out of the build; it is a measured
+dead end for this workload. From 0.2.1 the **x86_64 release assets and the AUR
+package are built with `-C target-cpu=x86-64-v3`**, and a `-x86_64-generic`
+asset is published alongside them; aarch64 stays at the architecture default.
+The in-repo/source build remains generic. This is a supported-CPU policy
+decision, not a compiler trick: a v3 binary executes AVX2/BMI/FMA instructions
+unconditionally and dies with SIGILL on older CPUs (pre-Haswell 2013 /
+pre-Excavator 2015), so the generic fallback and the README note are part of the
+release, not optional extras. Sample-based PGO (AutoFDO, from `perf` samples) and BOLT
 (post-link layout) were not tested — `llvm-bolt` is not installed here — but
 both optimise layout rather than vector width, so their ceiling is the PGO
 result above rather than the `target-cpu` result.
