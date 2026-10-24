@@ -16,6 +16,7 @@ mod fixed_bands;
 mod hash;
 #[cfg(any(test, feature = "stitch-legacy"))]
 mod motion;
+mod parallel;
 mod perceptual;
 #[cfg(feature = "stitch-legacy")]
 mod placement;
@@ -62,7 +63,7 @@ use rgb::{
     average_luminance_difference_source, crop_rgb_frame,
     sampled_difference_and_luminance_range,
     pixel_difference_source, pixel_offset, rgb_frame_from_source,
-    rgb_frame_from_source_reusing, rgb_frame_from_source_reusing_with, validate_rgb_frame,
+    rgb_frame_from_source_reusing, validate_rgb_frame,
     validate_rgb_source, CroppedRgbSource,
 };
 
@@ -592,7 +593,7 @@ impl RawStitcher {
         screen_offset: FrameScreenOffset,
     ) -> Result<PushResult, Box<dyn Error>>
     where
-        C: RgbSource,
+        C: RgbSource + Sync,
         A: RgbSource,
     {
         validate_rgb_source(compose_frame)?;
@@ -758,7 +759,7 @@ impl RawStitcher {
         direction: Option<LongDirection>,
     ) -> Result<PushResult, Box<dyn Error>>
     where
-        C: RgbSource,
+        C: RgbSource + Sync,
         A: RgbSource,
     {
         self.last_duplicate_difference = None;
@@ -877,15 +878,18 @@ impl RawStitcher {
             && active_crop.height == compose_frame.height())
         .then(|| BinLayout::for_across(compose_frame.width()))
         .flatten();
-        let mut fused_means = fused_layout
-            .map(|layout| vec![0f32; compose_frame.height() as usize * layout.bins() as usize]);
-        let compose_frame = rgb_frame_from_source_reusing_with(compose_frame, recycled, |y, row| {
-            if let (Some(layout), Some(means)) = (fused_layout.as_ref(), fused_means.as_mut()) {
-                let bins = layout.bins() as usize;
-                let start = y as usize * bins;
-                layout.means_into(row, &mut means[start..start + bins]);
+        // The conversion and the descriptor are one parallel pass when the
+        // crop is the whole frame; a real crop (trace-only detector) keeps the
+        // serial hook path because the ladder then describes a different
+        // rectangle.
+        let (compose_frame, fused_means) = match fused_layout {
+            Some(layout) => {
+                let (frame, means) =
+                    rgb::rgb_frame_from_source_fused(compose_frame, recycled, layout)?;
+                (frame, Some(means))
             }
-        })?;
+            None => (rgb_frame_from_source_reusing(compose_frame, recycled)?, None),
+        };
         let prebuilt_means = match (fused_layout, fused_means.as_deref()) {
             (Some(layout), Some(means)) => Some(PrebuiltMeans {
                 along: compose_frame.height(),

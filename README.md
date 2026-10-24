@@ -98,7 +98,7 @@ border_width = 3
 3. **Release** — the screenshot saves and is copied to clipboard.
 4. Press **Esc** at any time to cancel.
 5. The frozen preview and the saved screenshot use the cursor-free frame by default. Press **H** to show the cursor (toggle between the captured with-cursor and without-cursor frames). The live selection cursor stays visible.
-6. Press **1**–**9** to skip selection entirely and capture a full screen; screens are numbered left to right by their position.
+6. Press **1**–**9** to skip selection entirely and capture a full screen; screens are numbered left to right by their position. Press **0** to capture **every** screen in one image (the whole desktop).
 7. Press **E** (during the drag or afterwards) to enter selection-box **editing mode**: each of the four box edges has a snap target you can grab and drag to resize the box. Press **E** again or **Enter/Space** to capture with the adjusted box.
 
 ### Long/Scroll Screenshot (`--long`)

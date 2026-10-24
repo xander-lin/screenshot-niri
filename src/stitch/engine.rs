@@ -23,6 +23,7 @@
 use std::collections::VecDeque;
 
 use super::rgb::RgbSource;
+use super::parallel::cap_threads;
 use super::types::{RowCoverage, SearchAxis};
 use super::{
     minimum_overlap, AppendDirection, FrameMatch, SearchDirection, StitchedFrame, ViewportRect,
@@ -117,6 +118,16 @@ const EDGE_POOL_MIN_BIN_WIDTH: u32 = 64;
 /// times better than the runner-up, so the match is unmistakable even on
 /// imperfect content.
 const EDGE_CONFIDENT_SECOND_OVER_BEST: f64 = 2.5;
+/// Bin comparisons a scoring window needs before it is split across helpers.
+///
+/// A guard band on a tall frame scores ~1 500 positions x ~190 rows x 48 bins
+/// (tens of millions of byte comparisons, the dominant cost of a 4K push); the
+/// smallest corpora score a few hundred thousand and stay serial. One position's
+/// cost is independent of every other's, so the split is exact.
+const EDGE_PARALLEL_MIN_WORK: u64 = 2_000_000;
+/// Positions a helper should own before one is spawned.
+const EDGE_PARALLEL_MIN_POSITIONS_PER_THREAD: u64 = 32;
+
 /// Comparable rows below which the colour check is replaced by a
 /// boundary-direction check.
 ///
@@ -847,6 +858,17 @@ struct ScoreCache {
 }
 
 impl ScoreCache {
+    /// The cached answer for `top`, or `None` when the position was never
+    /// scored. A cached *miss* is `Some(None)` and is reused as well.
+    fn lookup(&self, top: i32) -> Option<Option<Score>> {
+        self.entries.get(&top).copied()
+    }
+
+    fn insert(&mut self, top: i32, score: Option<Score>) {
+        self.entries.insert(top, score);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     fn cost(
         &mut self,
         canvas: &EdgeCanvas,
@@ -1084,12 +1106,103 @@ pub(super) struct WindowedEdgeMatcher {
     gain_decided: bool,
 }
 
+/// Scores a list of candidate positions, splitting them across helpers when the
+/// window is large enough to pay for it.
+///
+/// Every position is an independent row-window comparison against the same
+/// read-only descriptor canvas, so the split needs no locks and no shared
+/// mutable state. Results are returned in the input order: the caller's tie
+/// handling sorts by cost and relies on an order that does not depend on how
+/// many threads ran.
+fn score_tops(
+    canvas: &EdgeCanvas,
+    ladder: &EdgeLadder,
+    tops: &[i32],
+    min_overlap: u32,
+    floor: u32,
+) -> Vec<Option<Score>> {
+    let work = tops.len() as u64
+        * ladder.scoring_rows.len() as u64
+        * u64::from(ladder.bins);
+    let by_positions = tops.len() as u64 / EDGE_PARALLEL_MIN_POSITIONS_PER_THREAD;
+    let by_work = work / EDGE_PARALLEL_MIN_WORK;
+    let threads = cap_threads(by_positions.min(by_work));
+    if threads <= 1 || tops.len() < threads * EDGE_PARALLEL_MIN_POSITIONS_PER_THREAD as usize {
+        return tops
+            .iter()
+            .map(|&top| canvas.cost_at_with_floor(ladder, top, min_overlap, floor))
+            .collect();
+    }
+    let chunk = tops.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = tops
+            .chunks(chunk)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|&top| canvas.cost_at_with_floor(ladder, top, min_overlap, floor))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut scores = Vec::with_capacity(tops.len());
+        for handle in handles {
+            scores.extend(handle.join().expect("scoring helper panicked"));
+        }
+        scores
+    })
+}
+
 impl WindowedEdgeMatcher {
     pub(super) fn new(axis: SearchAxis) -> Self {
         Self {
             axis,
             ..Self::default()
         }
+    }
+
+    /// Scores `tops` through the per-call cache, parallelising the misses.
+    ///
+    /// The cache is keyed by position and the window's inputs are fixed, so a
+    /// stage may re-*judge* a position another stage already scored; only the
+    /// computation is shared. Returns `(cost, top, used)` in ascending `top`
+    /// order, exactly as the previous in-order loops did.
+    fn window_costs(
+        &self,
+        cache: &mut ScoreCache,
+        ladder: &EdgeLadder,
+        tops: &[i32],
+        min_overlap: u32,
+        floor: u32,
+    ) -> Vec<(f64, i32, u32)> {
+        let Some(canvas) = self.canvas.as_ref() else {
+            return Vec::new();
+        };
+        let mut scores: Vec<Option<Score>> = Vec::with_capacity(tops.len());
+        let mut missing: Vec<usize> = Vec::new();
+        for (index, &top) in tops.iter().enumerate() {
+            match cache.lookup(top) {
+                Some(score) => scores.push(score),
+                None => {
+                    scores.push(None);
+                    missing.push(index);
+                }
+            }
+        }
+        if !missing.is_empty() {
+            let missing_tops: Vec<i32> = missing.iter().map(|&index| tops[index]).collect();
+            let scored = score_tops(canvas, ladder, &missing_tops, min_overlap, floor);
+            for (&index, score) in missing.iter().zip(scored) {
+                cache.insert(tops[index], score);
+                scores[index] = score;
+            }
+        }
+        scores
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, score)| score.map(|score| (score.cost, tops[index], score.used)))
+            .collect()
     }
 
     /// Scores an annulus around `centre`: positions with `inner < |top - centre|
@@ -1118,14 +1231,14 @@ impl WindowedEdgeMatcher {
     ) -> DecideOutcome {
         let lo = (centre - outer).max(bounds.0);
         let hi = (centre + outer).min(bounds.1);
-        let mut costs: Vec<(f64, i32, u32)> = Vec::new();
-        let Some(canvas) = self.canvas.as_ref() else {
+        if self.canvas.is_none() {
             return DecideOutcome::Reject(RejectReason::Uninitialised);
-        };
+        }
         if lo > hi {
             return DecideOutcome::Reject(RejectReason::NoCandidate);
         }
         let min_overlap = minimum_overlap(ladder.rows(), ladder.rows()).max(1);
+        let mut tops: Vec<i32> = Vec::with_capacity((hi - lo + 1) as usize);
         for top in lo..=hi {
             // `inner == 0` means "no hole": the ring includes the centre, so
             // the first ring can answer "the content did not move".
@@ -1135,10 +1248,15 @@ impl WindowedEdgeMatcher {
             if exclude.iter().any(|&(a, b)| top >= a && top <= b) {
                 continue;
             }
-            if let Some(score) = cache.cost(canvas, ladder, top, min_overlap) {
-                costs.push((score.cost, top, score.used));
-            }
+            tops.push(top);
         }
+        let costs = self.window_costs(
+            cache,
+            ladder,
+            &tops,
+            min_overlap,
+            EDGE_MIN_COMPARABLE_ROWS,
+        );
         self.decide_from_costs(costs, tie_centre, request, ladder)
     }
 
@@ -1156,20 +1274,21 @@ impl WindowedEdgeMatcher {
         centre: i32,
         request: &PlacementRequest<'_>,
     ) -> DecideOutcome {
-        let Some(canvas) = self.canvas.as_ref() else {
+        if self.canvas.is_none() {
             return DecideOutcome::Reject(RejectReason::Uninitialised);
-        };
+        }
         if lo > hi {
             return DecideOutcome::Reject(RejectReason::NoCandidate);
         }
         let min_overlap = minimum_overlap(ladder.rows(), ladder.rows()).max(1);
-
-        let mut costs: Vec<(f64, i32, u32)> = Vec::new();
-        for top in lo..=hi {
-            if let Some(score) = cache.cost(canvas, ladder, top, min_overlap) {
-                costs.push((score.cost, top, score.used));
-            }
-        }
+        let tops: Vec<i32> = (lo..=hi).collect();
+        let costs = self.window_costs(
+            cache,
+            ladder,
+            &tops,
+            min_overlap,
+            EDGE_MIN_COMPARABLE_ROWS,
+        );
         // `centre` is the best available "where should this be" estimate for
         // this pass: the impulse window centres on the prediction, the
         // horizontal window on the previous frame (ties then prefer the
@@ -1800,12 +1919,14 @@ impl WindowedEdgeMatcher {
             return None;
         }
         let min_overlap = minimum_overlap(ladder.rows(), ladder.rows()).max(1);
-        let mut costs: Vec<(f64, i32, u32)> = Vec::new();
-        for top in lo..=hi {
-            if let Some(score) = canvas.cost_at_with_floor(ladder, top, min_overlap, 1) {
-                costs.push((score.cost, top, score.used));
-            }
-        }
+        let tops: Vec<i32> = (lo..=hi).collect();
+        let mut costs: Vec<(f64, i32, u32)> = score_tops(canvas, ladder, &tops, min_overlap, 1)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, score)| {
+                score.map(|score| (score.cost, tops[index], score.used))
+            })
+            .collect();
         if costs.len() < 4 {
             return None;
         }

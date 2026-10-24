@@ -4,6 +4,8 @@ use wayland_client::protocol::wl_shm::Format;
 
 use crate::image::Image;
 
+use super::engine::BinLayout;
+use super::parallel::helper_threads;
 use super::perceptual::PerceptualFrame;
 use super::{ComposeCrop, RgbFrame};
 
@@ -462,6 +464,87 @@ where
         stride,
         data,
     })
+}
+
+/// Pixels a helper should own before one is spawned.
+///
+/// A 1080p frame (2.1 MP) splits four ways and already takes ~3 ms to convert
+/// and describe; the smallest corpus region (163 k px) finishes in tens of
+/// microseconds and would only pay thread wake-ups.
+const FUSED_MIN_PIXELS_PER_THREAD: u64 = 250_000;
+
+/// Converts a frame and builds its descriptor bins in one parallel pass.
+///
+/// The row loop is split into contiguous bands: helper `n` reads its own rows
+/// of `source` and writes its own `data` and `means` slices, so nothing is
+/// shared but the read-only source. The arithmetic per row is identical to the
+/// serial path (`BinLayout::means_into` is the same definition of the
+/// descriptor), so the result is bit-identical — the corpora replay to the same
+/// canvases.
+pub(super) fn rgb_frame_from_source_fused<S>(
+    source: &S,
+    buffer: Vec<u8>,
+    layout: BinLayout,
+) -> Result<(RgbFrame, Vec<f32>), Box<dyn Error>>
+where
+    S: RgbSource + Sync,
+{
+    validate_rgb_source(source)?;
+    let (width, height) = (source.width(), source.height());
+    let stride = width.checked_mul(3).ok_or("RGB stride overflow")?;
+    let size = (stride as usize)
+        .checked_mul(height as usize)
+        .ok_or("RGB frame size overflow")?;
+    let bins = layout.bins() as usize;
+    let mut data = buffer;
+    data.resize(size, 0);
+    let mut means = vec![0f32; height as usize * bins];
+    let rows = height as usize;
+
+    let threads = helper_threads(
+        u64::from(width) * u64::from(height),
+        FUSED_MIN_PIXELS_PER_THREAD,
+    );
+    if threads <= 1 {
+        for y in 0..height {
+            let start = y as usize * stride as usize;
+            let row = &mut data[start..start + stride as usize];
+            source.row_rgb_into(0, y, width, row);
+            layout.means_into(row, &mut means[y as usize * bins..(y as usize + 1) * bins]);
+        }
+    } else {
+        let rows_per_thread = rows.div_ceil(threads);
+        std::thread::scope(|scope| {
+            let mut data_rest = data.as_mut_slice();
+            let mut means_rest = means.as_mut_slice();
+            let mut first_row = 0usize;
+            while first_row < rows {
+                let take = rows_per_thread.min(rows - first_row);
+                let (row_data, next_data) = data_rest.split_at_mut(take * stride as usize);
+                let (row_means, next_means) = means_rest.split_at_mut(take * bins);
+                data_rest = next_data;
+                means_rest = next_means;
+                scope.spawn(move || {
+                    for local in 0..take {
+                        let y = (first_row + local) as u32;
+                        let row = &mut row_data[local * stride as usize..(local + 1) * stride as usize];
+                        source.row_rgb_into(0, y, width, row);
+                        layout.means_into(row, &mut row_means[local * bins..(local + 1) * bins]);
+                    }
+                });
+                first_row += take;
+            }
+        });
+    }
+    Ok((
+        RgbFrame {
+            width,
+            height,
+            stride,
+            data,
+        },
+        means,
+    ))
 }
 
 pub(super) fn validate_rgb_source(source: &impl RgbSource) -> Result<(), Box<dyn Error>> {

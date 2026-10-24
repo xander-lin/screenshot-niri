@@ -257,6 +257,59 @@ that turned out to be an artefact of `replay-frames`'s row bookkeeping (found.md
 lesson 34) — do not use it as evidence. The decision itself stands: with no real
 4K corpus, pooling stays gated at `EDGE_POOL_MIN_BIN_WIDTH = 64`.
 
+## 2026-10-24, fourth pass: two cache-local passes on four helpers
+
+The user's constraint is power, not latency: on parts that must raise every core
+to serve one core's boost clock, a 13 ms single-threaded burst per frame is
+expensive even though it fits the budget. The change parallelises only the two
+passes whose work splits into independent bands with no shared mutable state:
+
+* **conversion + descriptor** (`rgb::rgb_frame_from_source_fused`): rows are
+  split into contiguous bands; each helper reads its own rows of the frame and
+  writes its own `data` and `means` slices. The descriptor arithmetic is the same
+  `BinLayout::means_into`, so the output is bit-identical.
+* **scoring windows** (`engine::score_tops`): each candidate position is an
+  independent row-window comparison against the same read-only descriptor
+  canvas; results are concatenated in input order, so tie handling sees exactly
+  the serial order. The per-call `ScoreCache` is consulted before the split and
+  filled afterwards.
+
+Both stay serial below their work floor (250 k px per helper for conversion,
+2 M bin comparisons and 32 positions per helper for scoring), which is why the
+small corpora (`real-1` 644x254) and every 1080p impulse window are unchanged.
+`MAX_HELPER_THREADS = 4`: more helpers do not shorten the memory-bound part and
+would spread the shared last-level cache further.
+
+Measured, three runs each, same machine, release build:
+
+| input | push p50 | preview | UI thread/frame |
+|---|---|---|---|
+| 3840x2160, before | 10.12 ms | 2.77 ms | 12.93 ms (39% of 33.3) |
+| 3840x2160, after | 6.07 ms | 2.91 ms | 8.99 ms (27%) |
+| 1920x1080, before | 3.25 ms | 0.61 ms | 3.90 ms (12%) |
+| 1920x1080, after | 1.88 ms | 0.60 ms | 2.50 ms (8%) |
+| `real-5-4k`, before | 5.87 ms | 1.82 ms | 7.75 ms (23%) |
+| `real-5-4k`, after | 5.76 ms | 1.92 ms | 6.31 ms (19%) |
+
+`real-5-4k`'s p50 barely moves because its frames are lz4-packed canvas reads,
+not descriptor arithmetic; its **p95** falls 16.1 → 7.3 ms, which is the anchor
+scan on refusals — the part that parallelises best. Small frames are unchanged
+(`real-1` push 0.29-0.32 ms, serial path).
+
+Power measured at the package RAPL counter during a saturated 600-frame 4K run:
+serial 72 W / 11.7 s (840 J), four helpers 80 W / 9.4 s (750 J). Instantaneous
+power is *higher* — four cores are running — but the burst is 30% shorter, so
+energy per frame falls ~20% (0.93 → 0.74 J). For a real 30 fps session the duty
+cycle drops 39% → 27%, which is the number the user's power argument rests on.
+Two and three helpers were measured too (79.5 W / 10.3 s and 80 W / 9.6 s):
+package power is already at the same plateau with two, so the extra helpers buy
+time and energy, not frequency.
+
+Bit-identical check: `real-4-4k` and `real-5-4k` canvases replay **byte for
+byte identical** with the helpers forced serial and parallel (PNG sha256
+`c6ddb92c…` / `aad70178…`), and every corpus keeps its acceptance count
+(`real-4-4k` 438 / `real-5-4k` 542).
+
 ## What remains
 
 * **The descriptor's arithmetic — 26% at 1080p.** Fused into the conversion row
