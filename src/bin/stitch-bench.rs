@@ -371,11 +371,14 @@ fn summarize(label: &str, mut report: Report) {
     if let Some(canvas) = report.canvas {
         let mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
         println!(
-            "  canvas  logical {:5.1} MB  resident {:5.1} MB  packed {:5.1} MB  ({})",
+            "  canvas  logical {:5.1} MB  resident {:5.1} MB  packed {:5.1} MB  ({}; {} empty / {} resident / {} packed tiles)",
             mb(canvas.logical_bytes),
             mb(canvas.resident_bytes),
             mb(canvas.packed_bytes),
             canvas.codec,
+            canvas.empty_tiles,
+            canvas.resident_tiles,
+            canvas.packed_tiles,
         );
     }
 }

@@ -468,6 +468,54 @@ alone deliberately: 10 ms on a key-release action is not a frame-budget problem,
 and parallelising the reseed would need another resident-view ladder builder for
 a once-per-edit win.
 
+## 2026-10-24, audit: is the LZ4 tile store worth its cost?
+
+The packing path was audited end to end (format, features, round-trip failure
+handling, and a time/memory A/B against `--features canvas-raw-tiles`).
+
+**What the code does, and why it is the right shape**
+
+* `lz4_flex::block::compress` + `decompress_into` with the uncompressed length
+  stored beside the payload — the block format, not `compress_prepend_size`
+  (which would add a header only to recover a length we already keep).
+* One independent block per 64-row tile. That is the point of the tile store:
+  a row must be readable without decoding its neighbours, or one preview row
+  would pull the whole canvas back through the decoder.
+* `default-features = false` + `safe-encode` / `safe-decode`: no `frame`
+  machinery, no unsafe in the codec path. The payload is produced in-process,
+  so a safe decoder costs nothing but a few percent and removes a whole class of
+  memory bugs.
+* Eviction is budget-driven (8 frames, sweep to 75 % on a 32-touch interval),
+  so packing only runs when the working set actually exceeds the cap.
+
+**A/B on the real corpora** (same binary apart from the codec):
+
+| corpus | lz4 resident+packed | raw resident | push mean | push p95 | push max |
+|---|---|---|---|---|---|
+| `real-1` (15.8 MB logical) | 7.1 + 0.4 MB | 15.8 MB | 0.23 vs 0.23 ms | 0.81 vs 0.86 ms | 1.00 vs 1.15 ms |
+| `real-long` (33.4 MB logical) | 12.8 + 1.8 MB | 33.4 MB | 1.76 vs 1.74 ms | 3.15 vs 2.65 ms | 5.12 vs 4.50 ms |
+
+The packing halves the resident canvas (4.5 % of the packed bytes on `real-1`,
+8.4 % on `real-long`) and costs about 0.3-0.6 ms of p95 on the largest corpus —
+one sweep's compression, not a per-frame cost. `real-5-4k` packs nothing at all
+(its raised budget keeps the 28.9 MB canvas resident), so the wide-selection
+path never sees the decoder.
+
+**Two fixes from the audit**: the `pack` trait doc claimed the result is never
+larger than the input (LZ4 expands incompressible data; the store already drops
+such a result and keeps the resident tile), and an unpack failure used to vanish
+silently — every row of that tile read as "never written", which quietly changes
+what the matcher sees. It now trips a `debug_assert!` in tests and logs under
+`trace-logs`; the read still degrades to zeros rather than panicking mid-session.
+
+**Deliberately not changed**: `pack` allocates one output `Vec` per tile and
+`unpack` one zeroed buffer per tile. Both are dwarfed by the compression itself
+(a sweep's ~0.5 ms) and by the lz4 call; a reusable scratch buffer would need
+interior mutability in the compressor for no measurable gain. The tile size is
+already past LZ4's 64 KB match window at these widths, and the measured ratio is
+4-8 %, so a different tile size would trade ratio against unpack granularity for
+nothing.
+
 ## What remains
 
 * **The descriptor's arithmetic — 26% at 1080p.** Fused into the conversion row

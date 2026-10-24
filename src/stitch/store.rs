@@ -61,8 +61,9 @@ enum Tile {
 /// is a build-time choice (`raw` keeps everything resident, `lz4` packs).
 pub(super) trait TileCompressor {
     fn name(&self) -> &'static str;
-    /// Packs `src`. May return something no larger than `src`; the store treats
-    /// the result as opaque.
+    /// Packs `src`. The result is opaque and may be *larger* than `src` (LZ4
+    /// expands incompressible data); the store drops it and keeps the resident
+    /// copy when packing does not shrink the tile.
     fn pack(&self, src: &[u8]) -> Vec<u8>;
     /// Unpacks `src` into `dst`, which is exactly the original length. Returns
     /// false if the payload does not describe `dst` (corruption, a length
@@ -145,7 +146,11 @@ pub(super) fn new_tile_compressor() -> Box<dyn TileCompressor> {
 /// What the store currently costs, for the memory report and the tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CanvasMemoryReport {
-    /// Bytes the canvas covers if every row were resident: `height * stride`.
+    /// Bytes the whole tile *grid* would take resident: `grid_rows * stride`.
+    ///
+    /// The grid includes up to 63 rows of slack past the canvas and every
+    /// `Empty` band a ragged canvas never filled, so it can exceed
+    /// `height * stride`; `empty_tiles` says how much of that is allocation-free.
     pub logical_bytes: usize,
     /// Bytes the resident tiles actually occupy.
     pub resident_bytes: usize,
@@ -489,6 +494,14 @@ impl CanvasStore {
                     let bytes = data.len();
                     let mut unpacked = vec![0u8; *len];
                     if !self.compressor.unpack(data, &mut unpacked) {
+                        // A tile we wrote cannot fail to round-trip, so this is
+                        // a codec/store bug, not input. It is loud in tests and
+                        // in trace builds; the read still degrades to "never
+                        // written" rather than panicking in a capture session.
+                        debug_assert!(false, "tile {index} failed to unpack ({bytes} bytes)");
+                        crate::trace_log!(
+                            "store: tile {index} failed to unpack; its rows read as never-written"
+                        );
                         return None;
                     }
                     self.packed_bytes.set(self.packed_bytes.get().saturating_sub(bytes));

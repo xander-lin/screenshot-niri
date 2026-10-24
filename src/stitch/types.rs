@@ -368,6 +368,17 @@ pub struct FastMotionTrace {
     pub verify_pass: Option<FastMotionVerifyPass>,
 }
 
+impl FrameMatch {
+    /// Whether this placement actually moved the viewport.
+    ///
+    /// This is the single definition of "the content moved": the axis memory
+    /// (a zero step is not an impulse), the impulse-vs-fallback decision and the
+    /// geometry-edit direction memory all read it, so they cannot disagree.
+    pub fn moved(&self) -> bool {
+        self.delta_x != 0 || self.delta_y != 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StitchDecisionPath {
     Initialized,

@@ -538,6 +538,39 @@ struct AppliedPlacement {
     match_info: FrameMatch,
 }
 
+/// Whether an axis' answer settles the question without asking the other one.
+///
+/// A refusal does not, and neither does a placement that moved nothing: the
+/// duplicate gate has already established that the pixels changed, so an axis
+/// that can only say "the same place" has not explained anything. This is the
+/// single definition of that rule — the engine still *returns* the zero-delta
+/// placement (it is the best structural answer), the choice of whether to ask
+/// the other axis lives here.
+fn answer_settles(answer: &EngineDecision) -> bool {
+    match answer {
+        EngineDecision::Place { match_info, .. } => match_info.moved(),
+        EngineDecision::Reject { .. } => false,
+    }
+}
+
+/// Whether the fallback axis beats the first answer.
+///
+/// The fallback is only asked when [`answer_settles`] is false:
+/// - after a refusal, any placement is better than none — even a zero one,
+///   because the other axis is the only thing that can verify "it stayed";
+/// - after a zero-delta answer, only a fallback that *did* move content is a
+///   better explanation. Zero from both axes is content changing in place, and
+///   it keeps the axis the capture was on.
+fn fallback_wins(primary: &EngineDecision, fallback: &EngineDecision) -> bool {
+    let EngineDecision::Place { match_info, .. } = fallback else {
+        return false;
+    };
+    match primary {
+        EngineDecision::Place { .. } => match_info.moved(),
+        EngineDecision::Reject { .. } => true,
+    }
+}
+
 impl RawStitcher {
     /// Whether anything in this build will read a `PerceptualFrame`.
     ///
@@ -749,7 +782,7 @@ impl RawStitcher {
         //
         // A resize (delta 0) says nothing about direction and clears the
         // memory instead, so the next frame falls back to the hint.
-        if delta_x != 0 || delta_y != 0 {
+        if match_info.moved() {
             self.accepted_direction.record(match_info.direction);
         } else {
             self.accepted_direction = AcceptedDirectionMemory::default();
@@ -905,7 +938,7 @@ impl RawStitcher {
             Some(StitchDecisionPath::CanvasAccepted),
             None,
             applied.match_info.direction,
-            applied.match_info.delta_x != 0 || applied.match_info.delta_y != 0,
+            applied.match_info.moved(),
         );
         Ok(PushResult::Accepted {
             match_info: applied.match_info,
@@ -1103,9 +1136,8 @@ impl RawStitcher {
         // frame. Whichever axis answers, wins; if neither does, the frame is
         // refused.
         let primary_axis = self.impulse_axis(search_direction);
-        let mut placed_axis = primary_axis;
         let place_started_at = profile_enabled.then(Instant::now);
-        let mut decision = self.place_on_axis(
+        let answer = self.place_on_axis(
             primary_axis,
             previous_rect,
             active,
@@ -1113,49 +1145,39 @@ impl RawStitcher {
             true,
             prebuilt_means,
         );
-        let primary_reason = match &decision {
-            EngineDecision::Reject { reason } => Some(*reason),
-            EngineDecision::Place { .. } => None,
-        };
-        // "Nothing moved" is not an answer on the impulse axis while the pixels
-        // changed: the duplicate check has already established that this frame
-        // differs from the previous one, so an axis that can only say "the same
-        // place" has not explained anything. That is what a stale impulse looks
-        // like at a turn — the axis the capture just left keeps answering zero,
-        // because movement along the other axis barely disturbs its descriptor.
-        // So a zero-delta answer asks the other axis too; it is kept only when
-        // that axis has nothing better, which is the honest reading of content
-        // that changed in place.
-        let primary_is_zero = match &decision {
-            EngineDecision::Place { match_info, .. } => {
-                match_info.delta_x == 0 && match_info.delta_y == 0
-            }
-            EngineDecision::Reject { .. } => false,
-        };
-        if primary_reason.is_some() || primary_is_zero {
-            let attempt = self.place_on_axis(
-                primary_axis.other(),
+        let chosen = if answer_settles(&answer) {
+            (answer, primary_axis)
+        } else {
+            // "Nothing moved" is not an answer on the impulse axis while the
+            // pixels changed: the duplicate check has already established that
+            // this frame differs from the previous one, so an axis that can
+            // only say "the same place" has not explained anything. That is
+            // what a stale impulse looks like at a turn — the axis the capture
+            // just left keeps answering zero, because movement along the other
+            // axis barely disturbs its descriptor.
+            //
+            // The rule itself lives in `answer_settles` / `fallback_wins`, not
+            // here: this function only asks the second axis once and keeps
+            // whichever answer survives.
+            let fallback_axis = primary_axis.other();
+            let fallback = self.place_on_axis(
+                fallback_axis,
                 previous_rect,
                 active,
                 search_direction,
                 false,
                 prebuilt_means,
             );
-            let improved = match &attempt {
-                EngineDecision::Place { match_info, .. } => {
-                    !primary_is_zero || match_info.delta_x != 0 || match_info.delta_y != 0
-                }
-                EngineDecision::Reject { .. } => false,
-            };
-            if improved {
-                placed_axis = primary_axis.other();
-                decision = attempt;
+            if fallback_wins(&answer, &fallback) {
+                (fallback, fallback_axis)
+            } else {
+                (answer, primary_axis)
             }
-        }
+        };
         if let Some(started_at) = place_started_at {
             self.last_profile_breakdown.canvas_match += started_at.elapsed();
         }
-        (decision, placed_axis)
+        chosen
     }
 
     /// Writes the decided placement into the pixel canvas and commits it to the
@@ -5650,6 +5672,43 @@ mod tests {
             stitcher.accepted_direction.vertical_direction(),
             Some(AppendDirection::Bottom)
         );
+    }
+
+    /// The axis fallback rule as a truth table.
+    ///
+    /// A move settles the question; a refusal and a zero step do not. After a
+    /// refusal any placement wins (even a zero one — the other axis is the only
+    /// thing that can verify "it stayed"), while after a zero answer only a
+    /// move wins. `real-5-4k` pays for the latter: without it, 115 paused frames
+    /// each ran a full horizontal search to confirm they had not moved.
+    #[test]
+    fn the_axis_fallback_truth_table() {
+        let place = |delta_x: i32, delta_y: i32| EngineDecision::Place {
+            rect: ViewportRect { x: 0, y: 0, width: 10, height: 10 },
+            match_info: FrameMatch {
+                direction: AppendDirection::Bottom,
+                overlap: 10,
+                delta_x,
+                delta_y,
+                score: 0.0,
+            },
+        };
+        let reject = EngineDecision::Reject {
+            reason: RejectReason::NoCandidate,
+        };
+
+        assert!(answer_settles(&place(0, 40)));
+        assert!(answer_settles(&place(40, 0)));
+        assert!(!answer_settles(&place(0, 0)));
+        assert!(!answer_settles(&reject));
+
+        assert!(fallback_wins(&reject, &place(0, 0)));
+        assert!(fallback_wins(&reject, &place(0, 40)));
+        assert!(!fallback_wins(&reject, &reject));
+
+        assert!(fallback_wins(&place(0, 0), &place(40, 0)));
+        assert!(!fallback_wins(&place(0, 0), &place(0, 0)));
+        assert!(!fallback_wins(&place(0, 0), &reject));
     }
 
     /// A zero-delta acceptance must not become the impulse.
