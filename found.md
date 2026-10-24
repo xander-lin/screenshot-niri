@@ -391,6 +391,8 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
   2. 渲染回归测试必须在**非整数缩放**下也跑一遍：身份缩放下 buffer 和 logical 同格，所有取整差异消失，测试会给出虚假的安全感。
   3. 冷路径（冻结帧的增量重画）和热路径（live 的整块重画）不会互相暴露 bug；用户报告"只有某种模式才有"时，先确认两条路径的差异，而不是怀疑共享的像素规则。
 
+- **Local install 0.1.0-38 (2026-10-24)**: HEAD `bd5b555` (normal-mode drag residue on fractionally scaled outputs + the `R` debug canvas view + four 4K shrink regression tests) packaged with the local recipe, pkgrel 38, installed over 0.1.0-37. `makepkg` with `check()` passed (231 tests), `pacman -Qkk` reports 0 altered files, installed `/usr/bin/screenshot` sha256 `ebb795bc…`. Awaiting real-machine confirmation of two things: moving the selection box in **normal** mode on a fractionally scaled output must leave no thin line behind (the regression test reproduces the old failure at 1.5x), and pressing `R` in long mode must show the stitched canvas inside the box with an amber border while capture is paused. The reported 4K striping after a selection shrink is **not reproduced** by the four new synthetic 4K-scale tests (right/left/top-edge shrink and a shrink while the canvas grows upward all match the page pixel for pixel); it needs a real 4K corpus to diagnose.
+
 ---
 
 ## Verification Memory
