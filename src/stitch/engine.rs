@@ -22,8 +22,8 @@
 #[cfg(test)]
 use std::collections::VecDeque;
 
-use super::types::SearchAxis;
 use super::rgb::RgbSource;
+use super::types::{RowCoverage, SearchAxis};
 use super::{
     minimum_overlap, AppendDirection, FrameMatch, SearchDirection, StitchedFrame, ViewportRect,
 };
@@ -815,6 +815,28 @@ pub(super) trait PlacementEngine {
         self.commit(rect, requested_top, frame);
     }
 
+    /// Rebuilds the descriptor canvas from the pixels the capture already
+    /// holds.
+    ///
+    /// Needed after an edit that changed the descriptor's geometry — the
+    /// frame's width or its horizontal extent. Every stored row was built
+    /// across other columns, so it cannot be compared with the new frames, but
+    /// the pixels those rows describe are still in the canvas. Rebuilding them
+    /// restores the anchor's evidence; without it the matcher keeps exactly one
+    /// frame and a box narrower than the scroll step cannot recover a jump.
+    ///
+    /// `x` and `width` are the new frame's rectangle in canvas columns, and
+    /// `logical_origin` is the logical canvas row of pixel row 0 (the engine
+    /// stores logical rows; the pixel canvas re-bases itself).
+    fn reseed_from_canvas(
+        &mut self,
+        _stitched: &StitchedFrame,
+        _x: i32,
+        _width: u32,
+        _logical_origin: i32,
+    ) {
+    }
+
     fn reset(&mut self);
 
     /// Descriptor of the frame most recently passed to `place`, as a grayscale
@@ -867,6 +889,15 @@ impl RgbSource for CanvasRegion<'_> {
             .store
             .pixel(self.x + x, (self.y + y) as i32)
             .unwrap_or([0, 0, 0])
+    }
+
+    fn row_rgb_into(&self, x: u32, y: u32, count: u32, out: &mut [u8]) {
+        let pixels = (count as usize).min(out.len() / 3);
+        let len = pixels * 3;
+        let row = (self.y + y) as i32;
+        if !self.canvas.store.row_into(self.x + x, row, &mut out[..len]) {
+            out[..len].fill(0);
+        }
     }
 
     fn row_rgb_sampled_into(&self, x: u32, y: u32, step: u32, out: &mut [u8]) {
@@ -1625,6 +1656,60 @@ impl PlacementEngine for WindowedEdgeMatcher {
 
     fn commit_known_step(&mut self, _rect: ViewportRect, requested_top: i32, frame: &dyn RgbSource) {
         self.write_committed(requested_top, frame, false);
+    }
+
+    fn reseed_from_canvas(
+        &mut self,
+        stitched: &StitchedFrame,
+        x: i32,
+        width: u32,
+        logical_origin: i32,
+    ) {
+        if self.canvas.as_ref().is_none_or(EdgeCanvas::is_empty) || x < 0 || width == 0 {
+            return;
+        }
+        // Bands, each read with one row of margin above it: a ladder's row `p`
+        // is the difference between positions `p` and `p - 1`, so a band that
+        // started at its first kept row would score that row against itself
+        // (level 0). `write` skips rows that are already verified, so the
+        // margin row of every band but the first is simply ignored.
+        const BAND_ROWS: u32 = 512;
+        // Only rows that cover the *whole* new x range are rebuilt. A row
+        // captured at another column would produce a descriptor from zeros, and
+        // a zero row that is marked filled is worse than a missing one: it takes
+        // part in every later comparison, so the frame's rows that land on it
+        // are scored against black and the correct placement costs too much to
+        // accept.
+        let left = x as u32;
+        let right = left.saturating_add(width);
+        let coverage = &stitched.row_coverage;
+        let mut top = 0u32;
+        while top < stitched.height {
+            let end = (top + BAND_ROWS).min(stitched.height);
+            let covered = |row: u32| match coverage.get(row as usize) {
+                // An empty outer vector means every row is fully covered.
+                None => coverage.is_empty(),
+                Some(RowCoverage::Full) => true,
+                Some(RowCoverage::Empty) => false,
+                Some(RowCoverage::Spans(spans)) => {
+                    spans.iter().any(|&(start, end)| start <= left && right <= end)
+                }
+            };
+            // A band with a partially captured row in it would do the same, so
+            // the band is skipped whole: at most one band of evidence is lost
+            // around a ragged gap, and the rows that are there stay honest.
+            if (top..end).all(covered) {
+                let read_top = top.saturating_sub(1);
+                let height = end - read_top;
+                let region = CanvasRegion::new(stitched, x as u32, read_top, width, height);
+                if let Some(ladder) = EdgeLadder::from_source(&region, self.session_gain) {
+                    if let Some(canvas) = self.canvas.as_mut() {
+                        canvas.write(read_top as i32 + logical_origin, &ladder);
+                    }
+                }
+            }
+            top = end;
+        }
     }
 
     fn reset(&mut self) {

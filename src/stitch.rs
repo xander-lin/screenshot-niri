@@ -726,6 +726,19 @@ impl RawStitcher {
             .ok_or("missing compose frame")?;
         self.engine
             .commit_known_step(new_rect, engine_top, &CroppedRgbSource::new(previous, new_crop)?);
+        if layout_changed {
+            // The rows that were invalidated are still in the pixel canvas:
+            // rebuild the descriptor from those pixels instead of starting the
+            // matcher over with one frame.
+            if let Some(stitched) = self.stitched.as_ref() {
+                self.engine.reseed_from_canvas(
+                    stitched,
+                    new_rect.x,
+                    new_crop.width,
+                    self.canvas_origin,
+                );
+            }
+        }
         self.last_profile_breakdown.path = Some(StitchDecisionPath::CanvasAccepted);
         Ok(PushResult::Accepted { match_info })
     }
@@ -5987,6 +6000,40 @@ mod tests {
                 );
                 session.assert_canvas(&label, 4, 8);
             }
+        }
+
+        /// A box that also got *narrower* must keep stitching.
+        ///
+        /// The descriptor is 48 bins across the frame's width, so a width
+        /// change really does invalidate every stored row — but not the pixels
+        /// those rows describe, which are still in the canvas. The matcher is
+        /// rebuilt from those pixels instead of from the edited frame alone;
+        /// without it the capture kept one frame of history, and a scroll-back
+        /// taller than the box could never be recovered.
+        #[test]
+        fn a_narrowed_box_rebuilds_the_matcher_from_the_canvas() {
+            let label = "narrowed box, scroll back";
+            let mut session = RandomSession::new(7, 1200, 20_000);
+            session.x = 150;
+            session.y = 5000;
+            session.width = 900;
+            session.height = 900;
+            session.screen_x = 120;
+            session.screen_y = 120;
+            session.push(Some(LongDirection::Down), &format!("{label}: first frame"));
+            for step in 0..12 {
+                session.scroll(0, 300);
+                session.push(Some(LongDirection::Up), &format!("{label}: up {step}"));
+            }
+            // Right edge in, bottom edge up: a different width *and* a box
+            // shorter than the 300 px the content moves between frames.
+            session.resize(0, 0, 700, 260);
+            session.push(None, &format!("{label}: narrow"));
+            for step in 0..6 {
+                session.scroll(0, -300);
+                session.push(Some(LongDirection::Down), &format!("{label}: back {step}"));
+            }
+            session.assert_canvas(label, 0, 1);
         }
 
         /// A box shrunk below the scroll step must keep stitching.
