@@ -128,33 +128,32 @@ uniform base, "unchanged footprint restores nothing", "moved footprint restores
 what it covered", "ragged preview always restores", "a moved ring restores only
 the old band", and "no pixel is drawn outside the footprint".
 
-### 3. Reuse the capture buffer instead of a fresh memfd per frame — 16.1 ms → ~2 ms
+### 3. Reuse the capture buffer instead of a fresh memfd per frame — 6.9 → 1.9 ms (1080p)
 
-**Problem.** `CaptureSession::capture_region_frame_without_cursor` sets
-`shm_image = None` at the start of every frame, dropping the previous pool,
-buffer and mapping; the `Buffer` event then creates a new 33 MB memfd. The
-system calls cost 0.01 ms — the 16.1 ms is first-touch page faults on fresh
-shmem (kernel zeroing 33 MB), plus a 1.9 ms `bytes.to_vec()` on `Ready`.
+**Problem.** `capture_region_frame_without_cursor` set `shm_image = None` at the
+start of every frame, dropping the pool, buffer and mapping; the `Buffer` event
+then created a new 33 MB memfd. The syscalls are free (0.01 ms) — the cost is
+the first touch of a fresh set of pages, which the `ready` read pays: 19.3 ms
+measured for a 33 MB mapping at 4K, against 1.2 ms to refill the same mapping.
 
-**Approach.** Keep the `ShmImage` across frames: if the compositor offers the
-same `(format, width, height, stride)` as the live one, reuse the pool/buffer/
-mapping (re-requesting a `copy` into the same `wl_buffer`). Only reallocate when
-the geometry changes. Keep the `to_vec()` into a *recycled* `Vec<u8>` carried by
-the session, so the UI still owns its frame and the capture thread stops
-allocating.
+**Approach (as built).** `ShmImage` carries a `BufferSpec` (width, height,
+stride, format) and the `Buffer` handler returns early when it matches — the
+pool, `wl_buffer` and mapping stay alive for the whole session. Safe because a
+session only starts a frame after the previous one reached `ready`/`failed`,
+and wlr-screencopy allows reusing a buffer after `ready`. A cancelled frame
+(stop flag) drops the buffer instead of keeping it, because the compositor may
+still be writing into it when the frame is destroyed. A geometry change
+reallocates, pinned by `a_capture_buffer_is_reused_only_for_the_same_geometry`.
 
-Two rules to respect: a `wl_buffer` may not be re-used for a new `copy` while
-the compositor still holds it (wlroots sends `wl_buffer.release`; wait for it,
-or use a two-buffer pool), and `y_inverted` must still flip into the recycled
-buffer rather than allocating a new one.
+**Not done: recycling the `to_vec` destination.** A fresh 33 MB `Vec` costs
+1.42 ms and the copy into it dominates; getting the buffer back from the UI
+thread would need a second channel across the app/wayland boundary for ~0.5 ms
+on a thread that is not the bottleneck. Left out deliberately.
 
-**Files.** `src/wayland/screencopy.rs` (`State`, `ShmImage`, the `Buffer`/
-`Ready`/`release` handlers, `CaptureSession`).
-
-**Acceptance.** `capture-frames` still produces byte-identical frames on
-`testdata/frames/real-1` (compare the decoded pixels, not the PNG bytes);
-`cargo test` green; a release timing test shows the per-frame capture cost
-without the first-touch spike after the first frame.
+**Measured, real screencopy on niri, 30 frames of 1920x1080, p50:** before
+6.82–6.91 ms, after **1.87–1.93 ms** (p95 8.1 → 3.2 ms). At 4K the page cost is
+4x, so the per-frame saving is ~19 ms: the capture thread stops allocating a
+gigabyte per second of fresh pages at 30 fps.
 
 ### 4. Read canvas rows, not pixels, for the two checks — 3.9 ms → ~2.0 ms
 
@@ -250,7 +249,7 @@ grows by ~2 ms; net ~4 ms.
 |---|---|---|
 | 1 overlay preview draw | **done** | full-screen hole 3.22 → **0.01 ms**; 24.6 MB history 10.04 → **2.1 ms**; 80% box 5.06 → **0.28 ms**; side column ~1.95 ms. UI thread at 4K: 29.4–36.2 → **26.2–28.3 ms**. 1080p unchanged (push 4.93, preview 1.36). Corpora unchanged. |
 | 2 overlay base copy | **done** | the 33 MB cache is gone (uniform base): steady-state restore **0.00 ms**, old copy 2.08–2.27 ms; moved footprint 0.74–1.03 ms; mask rebuild 1.18–1.27 ms (was 1.6). UI thread at 4K 26.2–28.3 → **24.0–26.1 ms**. 1080p bench unchanged. Corpora unchanged. clippy 41 (one fewer than baseline). |
-| 3 capture buffer reuse | not started | |
+| 3 capture buffer reuse | **done** | real screencopy 1080p p50 6.82–6.91 → **1.87–1.93 ms** (p95 8.1 → 3.2); at 4K the page cost is 4x. `to_vec` recycling skipped: a fresh 33 MB Vec is 1.42 ms and needs a return channel. Corpora unchanged. clippy 41. |
 | 4 canvas row sampling | not started | |
 | 5 fused conversion + descriptor | not started | |
 | 6 preview direct from canvas | not started | |

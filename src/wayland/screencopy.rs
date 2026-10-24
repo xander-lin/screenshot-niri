@@ -38,11 +38,30 @@ pub struct CapturedOutput {
     pub image: Image,
 }
 
-struct ShmImage {
+/// The geometry a shm capture buffer was created for.
+///
+/// A session keeps its pool, buffer and mapping alive across frames and only
+/// reallocates when this changes. A fresh 33 MB memfd per frame made the kernel
+/// allocate and zero a new set of pages every time — 19.3 ms of first touch
+/// measured at 4K, paid by whoever writes the capture — and freed the old ones
+/// again, so at 30 fps the session churned a gigabyte per second of page
+/// allocation for pixels it had already mapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BufferSpec {
     width: u32,
     height: u32,
     stride: u32,
     format: Format,
+}
+
+impl BufferSpec {
+    fn matches(self, width: u32, height: u32, stride: u32, format: Format) -> bool {
+        self.width == width && self.height == height && self.stride == stride && self.format == format
+    }
+}
+
+struct ShmImage {
+    spec: BufferSpec,
     size: usize,
     data: *mut u8,
     _fd: OwnedFd,
@@ -234,7 +253,6 @@ impl CaptureSession {
         stop: &std::sync::atomic::AtomicBool,
     ) -> Result<Option<Image>, Box<dyn Error>> {
         self.state.image = None;
-        self.state.shm_image = None;
         self.state.wait_for_damage = wait_for_damage;
         self.state.done = false;
         self.state.failed = false;
@@ -260,6 +278,11 @@ impl CaptureSession {
                 if let Some(frame) = self.state.frame.take() {
                     frame.destroy();
                 }
+                // The compositor may still be writing into the shared buffer
+                // when the frame is destroyed, so the next frame must not
+                // reuse it. (A cancelled frame ends the session in practice;
+                // this keeps reuse safe rather than lucky.)
+                self.state.shm_image = None;
                 self.conn.flush()?;
                 return Ok(None);
             }
@@ -368,6 +391,18 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                     state.done = true;
                     return;
                 };
+                // Reuse the pool, buffer and mapping when the compositor asks
+                // for the same geometry: `ready` for the previous copy already
+                // arrived (a session only starts a frame after the previous one
+                // completed), so the buffer is ours again.
+                if state
+                    .shm_image
+                    .as_ref()
+                    .is_some_and(|image| image.spec.matches(width, height, stride, format))
+                {
+                    return;
+                }
+                state.shm_image = None;
                 match create_shm_image(shm, width, height, stride, format, qh) {
                     Ok(image) => state.shm_image = Some(image),
                     Err(_) => {
@@ -401,12 +436,17 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                     return;
                 };
                 let bytes = unsafe { std::slice::from_raw_parts(image.data, image.size) };
+                let spec = image.spec;
                 state.image = Some(Image {
-                    width: image.width,
-                    height: image.height,
-                    stride: image.stride,
-                    format: image.format,
-                    data: if state.y_inverted { flip_rows(bytes, image.height, image.stride) } else { bytes.to_vec() },
+                    width: spec.width,
+                    height: spec.height,
+                    stride: spec.stride,
+                    format: spec.format,
+                    data: if state.y_inverted {
+                        flip_rows(bytes, spec.height, spec.stride)
+                    } else {
+                        bytes.to_vec()
+                    },
                 });
                 state.done = true;
             }
@@ -468,7 +508,8 @@ fn create_shm_image(
     let pool_size = i32::try_from(size).map_err(|_| "shm buffer exceeds 2 GiB")?;
     let pool = shm.create_pool(fd.as_fd(), pool_size, qh, ());
     let buffer = pool.create_buffer(0, width as i32, height as i32, stride as i32, format, qh, ());
-    Ok(ShmImage { width, height, stride, format, size, data: data.cast(), _fd: fd, pool, buffer })
+    let spec = BufferSpec { width, height, stride, format };
+    Ok(ShmImage { spec, size, data: data.cast(), _fd: fd, pool, buffer })
 }
 
 impl Dispatch<WlShm, ()> for State {
@@ -482,3 +523,22 @@ impl Dispatch<ZwlrScreencopyManagerV1, ()> for State {
 delegate_noop!(State: ignore WlOutput);
 delegate_noop!(State: ignore WlBuffer);
 delegate_noop!(State: ignore WlShmPool);
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A capture session reuses its pool, buffer and mapping across frames.
+    /// Reusing them for a different geometry would hand the compositor a
+    /// buffer of the wrong size, so the match has to be exact.
+    #[test]
+    fn a_capture_buffer_is_reused_only_for_the_same_geometry() {
+        let spec = BufferSpec { width: 100, height: 50, stride: 400, format: Format::Argb8888 };
+        assert!(spec.matches(100, 50, 400, Format::Argb8888), "identical geometry");
+        assert!(!spec.matches(100, 50, 400, Format::Xrgb8888), "a different format needs a new buffer");
+        assert!(!spec.matches(101, 50, 400, Format::Argb8888), "a wider region");
+        assert!(!spec.matches(100, 51, 400, Format::Argb8888), "a taller region");
+        assert!(!spec.matches(100, 50, 404, Format::Argb8888), "a different stride");
+    }
+}
