@@ -1,14 +1,10 @@
 /target/
 /pkg/
 /screenshot-niri/
+/screenshot-plain/
 .idea/
 .omo/
 .cortexkit/
 perf.data*
 *.pkg.tar.*
 *.tar.gz
-
-# Real-frame corpora: 50 MB of PNGs, kept on disk only. See testdata/frames/README.md
-testdata/frames/**/*.png
-# Ground-truth caches for the corpus tools (derived, content-keyed).
-testdata/frames/**/.truth-*.cache

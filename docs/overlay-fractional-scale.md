@@ -1,6 +1,6 @@
 # Overlay resolution and fractional scaling
 
-Status: merged into `niri` (`c16711f`); hardware verification pending.
+Status: implemented on `plain`; hardware verification pending.
 
 ## Two symptoms, one root cause
 
@@ -66,32 +66,15 @@ buffer = max(content pixels, ceil(logical x preferred_scale / 120))
 (logical size) and from `preferred_scale` (density); either can arrive first and
 either can change independently.
 
-### Renderers
+### Renderer
 
 Everything downstream works in **buffer pixels** and converts once:
-
-- frozen path: `draw_overlay_region` maps each buffer pixel to global logical
-  coordinates before testing the hole and the closed border ring; the dirty ring
-  uses `buffer_length` to express the configured logical width in buffer pixels;
-- live path: the hole and the dirty region are already buffer-mapped
-  (`selected_buffer_rect`), the border thickness is converted with
-  `buffer_length`, and the stitched preview is drawn **buffer-major**: each
-  buffer pixel of the dimmed area picks the stitched pixel it covers. Iterating
-  the stitched image instead would leave gaps as soon as the buffer is denser
-  than the logical grid, and the live screen would show through them.
-  The buffer→canvas mapping must be **direct** (selection's buffer extent plus
-  the capture density). Mapping buffer → global logical → capture instead
-  quantises the phase to logical pixels and re-expands it, which samples the
-  canvas at 1x and draws it at the buffer's density: the preview then looks
-  soft at 1.5x even though both grids are identical. That was the long-capture
-  blur this document's first version missed.
-- `frozen_pixel` is a pure ratio (`buffer -> capture`); the old
-  `wl_output.scale` shortcut is gone, since it is wrong whenever the buffer is
-  the capture size on an integer-scaled output.
-
-The live path keeps the larger buffer for the whole session instead of resizing
-on the `L` handover: no allocation burst mid-session, and the live overlay
-(border, preview) is rendered at the output's density.
+`draw_overlay_region` maps each buffer pixel to global logical coordinates
+before testing the hole and the closed border ring, and the dirty ring uses
+`buffer_length` to express the configured logical width in buffer pixels.
+`frozen_pixel` is a pure ratio (`buffer -> capture`); the old `wl_output.scale`
+shortcut is gone, since it is wrong whenever the buffer is the capture size on
+an integer-scaled output.
 
 ### Normal-mode composite
 
@@ -114,16 +97,15 @@ pieces stay contiguous.
 
 ## Cost
 
-Overlay buffers and both frozen caches grow by `scale^2` (2.25x at 1.5). On a
-1920x1080 mode that is roughly 22 MB -> 50 MB per output.
+Overlay buffers (two per output) and the frozen frame grow by `scale^2` (2.25x
+at 1.5). On a 1920x1080 mode the buffers are roughly 16 MB -> 37 MB per output;
+the stored frame is the capture itself plus a cursor-sized patch.
 
 ## Tests
 
 - `overlay_buffer_size_never_shrinks_below_content_or_density`
 - `frozen_overlay_maps_buffer_pixels_through_the_logical_grid` (4x4 logical,
   6x6 buffer): reverting the mapping to 1:1 fails it.
-- `preview_fills_a_denser_buffer_without_gaps` (2x2 logical, 4x4 buffer): the
-  forward-iteration implementation leaves gaps and fails it.
 - `mixed_scale_selection_places_pieces_contiguously`: a spanning selection that
   starts inside a fractionally scaled output. Mapping the destination offset in
   global coordinates instead of the output's local frame adds the phase of
@@ -136,9 +118,7 @@ Overlay buffers and both frozen caches grow by `scale^2` (2.25x at 1.5). On a
 ## Hardware checklist
 
 1. Scale 1.5: the frozen selection image must match the pre-freeze desktop
-   pixel for pixel; the 1 px border must be sharp.
+   pixel for pixel; the border must be sharp.
 2. Scale 1.5, press `1`: a full 1920x1080 PNG.
 3. Scale 1.5 + 1.0 spanning selection: one file, pieces aligned at the seam.
 4. Scale 1.0: unchanged behaviour (buffer == logical, same code path).
-5. Long mode: preview alignment in the hole, edit-mode border tracking, `L`
-   handover without a resize stall.

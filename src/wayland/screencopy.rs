@@ -54,12 +54,6 @@ struct BufferSpec {
     format: Format,
 }
 
-impl BufferSpec {
-    fn matches(self, width: u32, height: u32, stride: u32, format: Format) -> bool {
-        self.width == width && self.height == height && self.stride == stride && self.format == format
-    }
-}
-
 struct ShmImage {
     spec: BufferSpec,
     size: usize,
@@ -93,7 +87,6 @@ struct State {
     done: bool,
     failed: bool,
     image: Option<Image>,
-    wait_for_damage: bool,
 }
 
 impl State {
@@ -110,7 +103,6 @@ impl State {
             done: false,
             failed: false,
             image: None,
-            wait_for_damage: false,
         }
     }
 }
@@ -176,119 +168,6 @@ fn capture_output(output_name: u32, overlay_cursor: bool) -> Result<Image, Box<d
     state.image.take().ok_or_else(|| "screencopy completed without image".into())
 }
 
-// ── Persistent capture session ─────────────────────────────────────────
-
-pub struct CaptureSession {
-    conn: Connection,
-    event_queue: wayland_client::EventQueue<State>,
-    state: State,
-}
-
-impl CaptureSession {
-    pub fn new(output_name: u32) -> Result<Self, Box<dyn Error>> {
-        let conn = Connection::connect_to_env()?;
-        let mut event_queue = conn.new_event_queue::<State>();
-        let qh = event_queue.handle();
-        let mut state = State::new(Some(output_name));
-
-        conn.display().get_registry(&qh, ());
-        event_queue.roundtrip(&mut state)?;
-        if state.shm.is_none() {
-            return Err("compositor does not expose wl_shm".into());
-        }
-        if state.screencopy.is_none() {
-            return Err("compositor does not expose zwlr_screencopy_manager_v1".into());
-        }
-        if state.output.is_none() {
-            return Err("requested wl_output was not advertised".into());
-        }
-        Ok(Self { conn, event_queue, state })
-    }
-
-    /// Capture an output-local logical rectangle. Returned dimensions are
-    /// compositor-provided buffer pixels; `None` means the stop flag was set.
-    pub fn capture_region_frame_without_cursor(
-        &mut self,
-        region: CaptureOutputRegion,
-        wait_for_damage: bool,
-        stop: &std::sync::atomic::AtomicBool,
-    ) -> Result<Option<Image>, Box<dyn Error>> {
-        self.state.image = None;
-        self.state.wait_for_damage = wait_for_damage;
-        self.state.done = false;
-        self.state.failed = false;
-        self.state.y_inverted = false;
-
-        let qh = self.event_queue.handle();
-        let screencopy = self.state.screencopy.as_ref().ok_or("missing screencopy")?;
-        let output = self.state.output.as_ref().ok_or("missing output")?;
-        self.state.frame = Some(screencopy.capture_output_region(
-            0,
-            output,
-            region.region.x,
-            region.region.y,
-            region.region.width,
-            region.region.height,
-            &qh,
-            (),
-        ));
-        self.conn.flush()?;
-
-        while !self.state.done && !self.state.failed {
-            if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                if let Some(frame) = self.state.frame.take() {
-                    frame.destroy();
-                }
-                // The compositor may still be writing into the shared buffer
-                // when the frame is destroyed, so the next frame must not
-                // reuse it. (A cancelled frame ends the session in practice;
-                // this keeps reuse safe rather than lucky.)
-                self.state.shm_image = None;
-                self.conn.flush()?;
-                return Ok(None);
-            }
-            self.event_queue.dispatch_pending(&mut self.state)?;
-            self.event_queue.flush()?;
-            if self.state.done || self.state.failed {
-                break;
-            }
-            let Some(guard) = self.event_queue.prepare_read() else { continue; };
-            let mut fd = libc::pollfd {
-                fd: guard.connection_fd().as_raw_fd(),
-                events: libc::POLLIN | libc::POLLERR | libc::POLLHUP,
-                revents: 0,
-            };
-            // Damage may never arrive on a static screen. Poll with a bounded
-            // wait so Enter/Esc can stop and join the worker without another redraw.
-            let ready = unsafe { libc::poll(&mut fd, 1, 20) };
-            if ready > 0 {
-                guard.read()?;
-            } else {
-                drop(guard);
-                if ready < 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::EINTR) {
-                        return Err(error.into());
-                    }
-                }
-            }
-        }
-        if let Some(frame) = self.state.frame.take() {
-            frame.destroy();
-        }
-        if self.state.failed {
-            return Err("screencopy region capture failed".into());
-        }
-        self.state.image.take().map(Some).ok_or_else(|| "screencopy region completed without image".into())
-    }
-}
-
-impl Drop for CaptureSession {
-    fn drop(&mut self) {
-        let _ = self.conn.flush();
-    }
-}
-
 // ── Dispatch impls ─────────────────────────────────────────────────────
 
 impl Dispatch<WlRegistry, ()> for State {
@@ -316,10 +195,8 @@ impl Dispatch<WlRegistry, ()> for State {
                     state.output = Some(output);
                 }
             }
-            "zwlr_screencopy_manager_v1" => {
-                if version >= 3 {
-                    state.screencopy = Some(registry.bind::<ZwlrScreencopyManagerV1, _, _>(name, 3, qh, ()));
-                }
+            "zwlr_screencopy_manager_v1" if version >= 3 => {
+                state.screencopy = Some(registry.bind::<ZwlrScreencopyManagerV1, _, _>(name, 3, qh, ()));
             }
             _ => {}
         }
@@ -352,17 +229,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                     state.done = true;
                     return;
                 };
-                // Reuse the pool, buffer and mapping when the compositor asks
-                // for the same geometry: `ready` for the previous copy already
-                // arrived (a session only starts a frame after the previous one
-                // completed), so the buffer is ours again.
-                if state
-                    .shm_image
-                    .as_ref()
-                    .is_some_and(|image| image.spec.matches(width, height, stride, format))
-                {
-                    return;
-                }
+                // One capture per connection, so there is nothing to reuse.
                 state.shm_image = None;
                 match create_shm_image(shm, width, height, stride, format, qh) {
                     Ok(image) => state.shm_image = Some(image),
@@ -374,21 +241,15 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
             }
             zwlr_screencopy_frame_v1::Event::BufferDone => {
                 if let Some(image) = state.shm_image.as_ref() {
-                    if state.wait_for_damage {
-                        frame.copy_with_damage(&image.buffer);
-                    } else {
-                        frame.copy(&image.buffer);
-                    }
+                    frame.copy(&image.buffer);
                 } else {
                     state.failed = true;
                     state.done = true;
                 }
             }
             zwlr_screencopy_frame_v1::Event::Damage { .. } => {}
-            zwlr_screencopy_frame_v1::Event::Flags { flags } => {
-                if let WEnum::Value(flags) = flags {
-                    state.y_inverted = flags.contains(zwlr_screencopy_frame_v1::Flags::YInvert);
-                }
+            zwlr_screencopy_frame_v1::Event::Flags { flags: WEnum::Value(flags) } => {
+                state.y_inverted = flags.contains(zwlr_screencopy_frame_v1::Flags::YInvert);
             }
             zwlr_screencopy_frame_v1::Event::Ready { .. } => {
                 let Some(image) = state.shm_image.as_ref() else {
@@ -485,21 +346,3 @@ delegate_noop!(State: ignore WlOutput);
 delegate_noop!(State: ignore WlBuffer);
 delegate_noop!(State: ignore WlShmPool);
 
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A capture session reuses its pool, buffer and mapping across frames.
-    /// Reusing them for a different geometry would hand the compositor a
-    /// buffer of the wrong size, so the match has to be exact.
-    #[test]
-    fn a_capture_buffer_is_reused_only_for_the_same_geometry() {
-        let spec = BufferSpec { width: 100, height: 50, stride: 400, format: Format::Argb8888 };
-        assert!(spec.matches(100, 50, 400, Format::Argb8888), "identical geometry");
-        assert!(!spec.matches(100, 50, 400, Format::Xrgb8888), "a different format needs a new buffer");
-        assert!(!spec.matches(101, 50, 400, Format::Argb8888), "a wider region");
-        assert!(!spec.matches(100, 51, 400, Format::Argb8888), "a taller region");
-        assert!(!spec.matches(100, 50, 404, Format::Argb8888), "a different stride");
-    }
-}

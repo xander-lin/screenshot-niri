@@ -14,20 +14,9 @@ path = "src/main.rs"
 
 [features]
 trace-logs = []
-# Keeps the canvas tiles uncompressed: the pre-compression behaviour, for A/B
-# and for measuring what the packing costs.
-canvas-raw-tiles = []
-# Keeps the previous canvas-scan matcher available for A/B comparison.
-# Removed once the windowed edge matcher is the only implementation.
-stitch-legacy = []
 
 [dependencies]
 libc = "0.2"
-# `default-features = false` keeps the frame and dictionary machinery out, which
-# this does not use. The rest is named explicitly because 0.14 moved what used to
-# be unconditional behind features: `block::compress` needs `alloc` (which only
-# `std` pulls in), and both codecs need their `safe-*` gate.
-lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 png = "0.18"
 tempfile = "3"
 wayland-client = { version = "0.31", default-features = false }
@@ -38,9 +27,9 @@ wayland-protocols-wlr = { version = "0.3", default-features = false, features = 
 lto = "thin"
 codegen-units = 1
 
-# The stitching tests are pixel loops: an unoptimised build spends 12 s on them
-# and an optimised one ~1.2 s. Overflow checks and debug assertions stay on
-# (`debug-assertions` is a separate switch), so the tests still exercise the
-# checked build; only the code generation changes.
+# The overlay tests are pixel loops: an unoptimised build spends seconds on
+# them and an optimised one under a second. Overflow checks and debug
+# assertions stay on (`debug-assertions` is a separate switch), so the tests
+# still exercise the checked build; only the code generation changes.
 [profile.test]
 opt-level = 2

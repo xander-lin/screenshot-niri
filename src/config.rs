@@ -1,11 +1,7 @@
 use std::path::PathBuf;
 
-/// Hardcoded default long-capture frame-rate cap (fps).
-pub const DEFAULT_MAX_FRAME_RATE: u32 = 30;
 /// Hardcoded default selection-border thickness in logical pixels.
 pub const DEFAULT_BORDER_WIDTH: i32 = 3;
-/// Upper bound accepted for `--fps`.
-pub const MAX_FRAME_RATE_LIMIT: u32 = 240;
 
 /// User configuration loaded from `$XDG_CONFIG_HOME/screenshot/config`
 /// (default `~/.config/screenshot/config`). Simple `key = value` lines,
@@ -13,8 +9,6 @@ pub const MAX_FRAME_RATE_LIMIT: u32 = 240;
 /// hand-edited file can never break the tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
-    /// Long-capture frame-rate cap used when `--fps` is not given.
-    pub max_fps: u32,
     /// Visible selection-border thickness in logical pixels.
     pub border_width: i32,
 }
@@ -25,7 +19,6 @@ pub const BORDER_WIDTH_MAX: i32 = 16;
 impl Default for Config {
     fn default() -> Self {
         Self {
-            max_fps: DEFAULT_MAX_FRAME_RATE,
             border_width: DEFAULT_BORDER_WIDTH,
         }
     }
@@ -55,22 +48,12 @@ impl Config {
             };
             let key = key.trim();
             let value = value.trim();
-            match key {
-                "max_fps" => {
-                    if let Ok(fps) = value.parse::<u32>() {
-                        if (1..=MAX_FRAME_RATE_LIMIT).contains(&fps) {
-                            config.max_fps = fps;
-                        }
+            if key == "border_width" {
+                if let Ok(width) = value.parse::<i32>() {
+                    if (BORDER_WIDTH_MIN..=BORDER_WIDTH_MAX).contains(&width) {
+                        config.border_width = width;
                     }
                 }
-                "border_width" => {
-                    if let Ok(width) = value.parse::<i32>() {
-                        if (BORDER_WIDTH_MIN..=BORDER_WIDTH_MAX).contains(&width) {
-                            config.border_width = width;
-                        }
-                    }
-                }
-                _ => {}
             }
         }
         config
@@ -92,30 +75,23 @@ mod tests {
     #[test]
     fn defaults_apply_without_a_file() {
         assert_eq!(Config::parse(""), Config::default());
-        assert_eq!(Config::default().max_fps, 30);
         assert_eq!(Config::default().border_width, 3);
     }
 
     #[test]
     fn parses_known_keys_with_comments_and_padding() {
-        let config = Config::parse(
-            "# screenshot config\n\n  max_fps = 15\nborder_width=5\nunknown = thing\n",
-        );
-        assert_eq!(config.max_fps, 15);
+        let config = Config::parse("# screenshot config\n\n  border_width=5\nunknown = thing\n");
         assert_eq!(config.border_width, 5);
     }
 
     #[test]
     fn out_of_range_values_keep_defaults() {
-        let config = Config::parse("max_fps = 0\nborder_width = 99\n");
-        assert_eq!(config, Config::default());
-        let config = Config::parse("max_fps = 241\nborder_width = 0\n");
-        assert_eq!(config, Config::default());
+        assert_eq!(Config::parse("border_width = 99\n"), Config::default());
+        assert_eq!(Config::parse("border_width = 0\n"), Config::default());
     }
 
     #[test]
     fn non_numeric_and_garbage_lines_keep_defaults() {
-        let config = Config::parse("max_fps = fast\nborder_width\n= 3\nno equals\n");
-        assert_eq!(config, Config::default());
+        assert_eq!(Config::parse("border_width = wide\nborder_width\n= 3\nno equals\n"), Config::default());
     }
 }

@@ -15,11 +15,9 @@ pub struct Image {
     pub format: Format,
     /// Pixel bytes.
     ///
-    /// May be *longer* than `stride * height`: the preview path recycles a
-    /// buffer across frames, and the allocation is a high-water mark so a
-    /// window that shrinks does not have to reallocate. Readers must bound
-    /// themselves by `stride * height`, which is what every one of them
-    /// already does; nothing may assume the two lengths are equal.
+    /// Readers must bound themselves by `stride * height` rather than by
+    /// `data.len()`: a caller may hand over a longer allocation (a recycled
+    /// buffer), and nothing may assume the two lengths are equal.
     pub data: Vec<u8>,
 }
 
