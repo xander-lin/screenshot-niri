@@ -516,6 +516,89 @@ already past LZ4's 64 KB match window at these widths, and the measured ratio is
 4-8 %, so a different tile size would trade ratio against unpack granularity for
 nothing.
 
+## 2026-10-24, build-flag pass: corpus-trained PGO vs CPU-specific codegen
+
+Question: does **Profile-Guided Optimization (PGO)** trained on the real capture
+corpora make the stitcher faster? Short answer: no — the win in the same
+experiment came from `-C target-cpu`, which is a different lever.
+
+**Method.** All builds use the shipped release profile (`lto = "thin"`,
+`codegen-units = 1`) and the same source (`v0.2.0`), in separate target dirs:
+
+* `base` — the shipped build.
+* `pgo` — instrumented with `-Cprofile-generate`, trained on every corpus
+  (`lowcontrast-2b`, `mini`, `pipeline-*`, `real-1`…`real-5-4k`, `real-long`,
+  `real-scroll`) plus `--synthetic 1920x1080x60` and `3840x2160x60`; profiles
+  merged with `llvm-profdata`, rebuilt with `-Cprofile-use`.
+* `holdout` — same, but `real-5-4k` and synthetic 4K excluded from training.
+* `pgo-nolto` — instrumented with `-Clto=off` (the usual cargo-pgo shape), then
+  used with LTO.
+* `v3` — `-Ctarget-cpu=x86-64-v3` (AVX2).
+* `native` — `-Ctarget-cpu=native` (Zen 4 / AVX-512 on this machine).
+* `pgo-v3`, `pgo-native` — PGO plus that target CPU.
+
+Three interleaved runs per build and corpus, medians below; `push` is the
+per-frame stitcher cost, `preview` the stitched-window conversion.
+
+| corpus | build | push mean | push p95 | preview mean |
+|---|---|---|---|---|
+| real-1 | base | 0.230 ms | 0.810 ms | 0.050 ms |
+| | pgo | 0.240 (+4%) | 0.880 (+9%) | 0.050 |
+| | v3 | 0.170 (−26%) | 0.690 (−15%) | 0.030 (−40%) |
+| | native | 0.160 (−30%) | 0.650 (−20%) | 0.030 (−40%) |
+| | pgo-native | 0.170 (−26%) | 0.620 (−23%) | 0.030 |
+| real-2 | base | 0.260 | 0.630 | 0.100 |
+| | pgo | 0.270 (+4%) | 0.690 (+10%) | 0.090 |
+| | v3 | 0.180 (−31%) | 0.460 (−27%) | 0.080 |
+| | native | 0.170 (−35%) | 0.420 (−33%) | 0.080 |
+| | pgo-native | 0.180 (−31%) | 0.430 (−32%) | 0.070 |
+| real-5-4k | base | 0.830 | 1.530 | 0.250 |
+| | pgo | 0.830 (+0%) | 1.620 (+6%) | 0.230 |
+| | v3 | 0.540 (−35%) | 1.050 (−31%) | 0.220 |
+| | native | 0.520 (−37%) | 1.020 (−33%) | 0.230 |
+| | pgo-native | 0.600 (−28%) | 1.100 (−28%) | 0.220 |
+| real-long | base | 1.770 | 3.350 | 0.200 |
+| | pgo | 1.840 (+4%) | 3.370 (+1%) | 0.190 |
+| | v3 | 1.370 (−23%) | 2.950 (−12%) | 0.180 |
+| | native | 1.320 (−25%) | 2.860 (−15%) | 0.180 |
+| | pgo-native | 1.470 (−17%) | 2.900 (−13%) | 0.180 |
+| synthetic 4K | base | 5.380 | 6.420 | 2.000 |
+| | pgo | 5.470 (+2%) | 6.180 (−4%) | 2.060 |
+| | v3 | 4.170 (−22%) | 5.120 (−20%) | 1.990 |
+| | native | 4.190 (−22%) | 5.150 (−20%) | 1.960 |
+| | pgo-native | 4.330 (−20%) | 5.210 (−19%) | 1.940 |
+
+Unweighted mean of the per-corpus medians (push mean / push p95):
+`base` 1.69 / 2.55 ms, `pgo` 1.73 / 2.55, `holdout` 1.73 / 2.56,
+`v3` 1.29 / 2.05, `native` 1.27 / 2.02, `pgo-native` 1.35 / 2.05,
+`pgo-v3` 1.37 / 2.18. The holdout profile did not rescue PGO: `real-5-4k`
++2% mean, synthetic 4K +2%.
+
+**What this says.**
+
+* PGO is **neutral to slightly negative** here. The hot paths are pixel and
+  memory-bandwidth loops (conversion, luminance, descriptors, row copies) with
+  almost no unpredictable branches, so profile-guided block layout and inlining
+  hints have little left to win — and the layout it did choose costs a few
+  percent on `p95`. `lto = "thin"` + one codegen unit already inlines across
+  modules.
+* `-C target-cpu` is the real lever: AVX2/AVX-512 auto-vectorisation cuts push
+  cost by roughly **a quarter to a third**, and the small-corpus preview cost
+  by up to half. `x86-64-v3` and `native` are within noise of each other, so
+  the gain is vector width, not AVX-512 specifically.
+* PGO on top of a target CPU is **worse than that target CPU alone** (1.35 vs
+  1.27 ms mean, 1.37 vs 1.29 for v3), consistently across corpora.
+
+**Not adopted.** PGO stays out of the build; it is a measured dead end for
+this workload. `-C target-cpu` is deliberately not enabled by default either:
+the published and AUR binaries must run on the package's declared CPU baseline.
+A local build can use `RUSTFLAGS="-C target-cpu=x86-64-v3"` (AVX2) or
+`native`; choosing v3 for a release is a supported-CPU policy decision, not a
+compiler trick. Sample-based PGO (AutoFDO, from `perf` samples) and BOLT
+(post-link layout) were not tested — `llvm-bolt` is not installed here — but
+both optimise layout rather than vector width, so their ceiling is the PGO
+result above rather than the `target-cpu` result.
+
 ## What remains
 
 * **The descriptor's arithmetic — 26% at 1080p.** Fused into the conversion row
