@@ -199,6 +199,37 @@ pub(crate) struct CanvasStore {
     touches_since_sweep: Cell<u32>,
 }
 
+/// A read-only, shareable view of one range of canvas rows.
+///
+/// Only created by [`CanvasStore::with_resident_rows`], which guarantees every
+/// tile in the range is resident for as long as this lives. `row` therefore
+/// reads tile bytes directly; there is no borrow, no working-set lookup and no
+/// unpack per row.
+pub(super) struct ResidentRows<'a> {
+    tiles: &'a [Tile],
+    written: &'a [bool],
+    stride: usize,
+    origin_row: i32,
+    rows_per_tile: usize,
+}
+
+impl ResidentRows<'_> {
+    /// The whole canvas row at `y`, or `None` when it was never written.
+    pub(super) fn row(&self, y: i32) -> Option<&[u8]> {
+        let relative = usize::try_from(y - self.origin_row).ok()?;
+        if !self.written.get(relative).copied().unwrap_or(false) {
+            return None;
+        }
+        let index = relative / self.rows_per_tile;
+        let row = relative % self.rows_per_tile;
+        let Tile::Resident { data, .. } = self.tiles.get(index)? else {
+            return None;
+        };
+        let offset = row * self.stride;
+        data.get(offset..offset + self.stride)
+    }
+}
+
 impl CanvasStore {
     /// Resident bytes allowed before cold tiles are packed.
     ///
@@ -394,6 +425,51 @@ impl CanvasStore {
             return None;
         };
         (end <= data.len()).then(|| f(&data[offset..end]))
+    }
+
+    /// Makes every tile covering `y0..y1` resident and hands the caller an
+    /// immutable view of the rows.
+    ///
+    /// The view is `Sync` (it holds only slices): a helper thread may read any
+    /// row of the range while the borrow lives, because nothing can mutate the
+    /// store during the call. That is what lets the preview conversion split its
+    /// rows without a copy and without putting a lock on the hot `pixel` path.
+    ///
+    /// Returns `None` when the range cannot be made resident — a window wider
+    /// than the working-set budget touches enough tiles that the touch pass
+    /// evicts its own first tiles, and the caller must fall back to the serial
+    /// reader rather than show a transparent row.
+    pub(super) fn with_resident_rows<R>(
+        &self,
+        y0: i32,
+        y1: i32,
+        f: impl FnOnce(&ResidentRows<'_>) -> R,
+    ) -> Option<R> {
+        if y1 <= y0 {
+            return None;
+        }
+        let (first, _) = self.locate(y0)?;
+        let (last, _) = self.locate(y1 - 1)?;
+        for index in first..=last {
+            self.touch_tile(index)?;
+        }
+        let tiles = self.tiles.borrow();
+        let written = self.written.borrow();
+        // The touch pass can evict a tile it touched earlier when the range is
+        // larger than the budget; every tile of the range must be resident.
+        if !tiles[first..=last]
+            .iter()
+            .all(|tile| matches!(tile, Tile::Resident { .. }))
+        {
+            return None;
+        }
+        Some(f(&ResidentRows {
+            tiles: &tiles,
+            written: &written,
+            stride: self.stride as usize,
+            origin_row: self.origin_row,
+            rows_per_tile: CANVAS_TILE_ROWS as usize,
+        }))
     }
 
     /// Marks a tile as just used, unpacking it if it has gone cold.

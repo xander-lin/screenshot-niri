@@ -45,18 +45,15 @@ measurement that closed them.
   `SCREENSHOT_TRACE_PROFILE=1` it prints the per-stage breakdown, and the
   shipped path now fills `frame_prepare` / `canvas_match` (they were legacy-only,
   which is why the tail could not be attributed before).
+- **Preview window conversion** — split across four helpers through a new
+  `CanvasStore::with_resident_rows` (unpack once, hand out `Sync` row slices):
+  3840x2160 2.9 → 1.9-2.1 ms, `real-5-4k` 0.36 → 0.24 ms. Memory-bound now; a
+  further gain would need to move fewer bytes, not more threads. The full-canvas
+  conversion at the end of a capture uses the same path.
 
 ## P0 — next
 
-1. **Canvas window → preview image (last single-threaded per-frame pass).**
-   `image_from_stitched_window_reusing` (row loop + `expand_row`) is 2.9 ms at
-   3840x2160 and 0.39 ms on `real-5-4k`. Blocked on `CanvasStore`'s `RefCell`:
-   every read mutates the working set (`touch_tile`), so rows cannot be split.
-   Next step: a concurrency-safe read path — unpack under a write lock and
-   convert outside it, or a per-tile read handle. A plain `Mutex<Vec<Tile>>`
-   would serialise the lz4 decode and is not worth it. Measure after.
-
-2. **Geometry-edit cost (~10-12 ms per edit).** The five edits in `real-5-4k`
+1. **Geometry-edit cost (~10-12 ms per edit).** The five edits in `real-5-4k`
    are now the slowest frames: `reseed_from_canvas` rebuilds the descriptor rows
    from the canvas in 512-row bands. It happens once per edit (not per frame), so
    it does not threaten 30 fps, but it is the largest single burst left. Next
@@ -148,7 +145,7 @@ measurement that closed them.
 ## Reproduce the baselines
 
 ```
-cargo test                                   # 259 tests, ~1.3 s warm
+cargo test                                   # 260 tests, ~1.3 s warm
 cargo build --release --bins
 ./target/release/verify-corpora --jobs 2     # 11 corpora, ~46 s, non-zero on drift
 ./target/release/stitch-bench --dir testdata/frames/real-5-4k   # push p50 0.86 ms

@@ -410,6 +410,38 @@ The remaining slow frames are the five geometry edits (~10-12 ms, the
 the horizontal search once. `real-1`'s push mean also fell 0.28 → 0.23 ms.
 All 11 corpora keep their baselines (`verify-corpora`).
 
+## 2026-10-24, eighth pass: the preview window on helpers, without a copy
+
+`image_from_stitched_window_reusing` was the last per-frame single-threaded
+pass. The obvious fix — snapshot the rows into a contiguous buffer, then convert
+in parallel — trades one serial memory pass for the parallel one, so instead the
+canvas exposes a **resident view**: `CanvasStore::with_resident_rows(y0, y1, f)`
+unpacks every tile of the range under one borrow and hands `f` a `Sync` view of
+the row slices. No copy, no lock on the `pixel` path, and a fallback to the
+serial reader when the range cannot be made resident (a window wider than the
+working-set budget would evict its own first tiles).
+
+Measured with `stitch-bench`:
+
+| | before | after | |
+|---|---|---|---|
+| 3840x2160 synthetic, preview | 2.9 ms | 1.9-2.1 ms | 1.45x |
+| `real-5-4k` preview | 0.36 ms | 0.24 ms | 1.5x |
+| `real-long` preview | - | 0.20 ms | |
+| `real-1` preview | 0.05 ms | 0.05 ms | unchanged |
+
+The gain stops at ~1.5x because the pass is memory-bound: 58 MB moved per 4K
+window. A micro-benchmark of three `expand_row` forms (the shipped 4-pixel byte
+unroll, a per-pixel u32 store, and a 12→16-byte word swizzle) measured 4.2, 5.6
+and 4.3 ms single-threaded — the shuffle is not the limit and there is no
+cheaper per-byte form worth carrying. The full-canvas conversion at the end of a
+capture (`image_from_stitched_frame`) goes through the same path and gains the
+same way.
+
+`split_window_conversion_matches_the_serial_pixels` compares the split and serial
+readers byte for byte on a frame with a half-captured row and a never-captured
+row, and asserts a small window stays serial.
+
 ## What remains
 
 * **The descriptor's arithmetic — 26% at 1080p.** Fused into the conversion row

@@ -204,79 +204,17 @@ pub fn image_from_stitched_window_reusing(
     if buffer.len() < size {
         buffer.resize(size, 0);
     }
+    // A per-pixel accessor would put a borrow check and a working-set lookup on
+    // every pixel (measured: 3× the cost of the whole rest of the frame), so
+    // the window is converted a row at a time. Rows are independent and read
+    // only the canvas, so a large window splits them across helpers; a window
+    // that cannot be made resident falls back to the serial reader.
     let mut data = buffer;
-    // One row at a time: a per-pixel accessor would put a borrow check and a
-    // working-set lookup on every one of them (measured: 3× the cost of the
-    // whole rest of the frame).
-    //
-    // The scratch row is only for the ragged case. A whole row is expanded
-    // straight out of the tile it lives in: copying it into a scratch first
-    // cost a 25 MB write plus a 25 MB read per 4K screenful, on top of the
-    // 25 MB read and 33 MB write the expansion already does.
-    let mut source = vec![0u8; window.width as usize * 3];
-    let mut opaque = true;
-    for row in 0..window.height {
-        let canvas_y = window.y as u32 + row;
-        let dst_row = row as usize * stride as usize;
-        let dst = &mut data[dst_row..dst_row + stride as usize];
-        let covered = frame.row_coverage.get(canvas_y as usize);
-        // Coverage is decided per row, not per pixel. The common canvas is
-        // rectangular and every row is `Full`, so this branch settles the whole
-        // row at once instead of asking `contains` 1920 times — the per-pixel
-        // form was 18% of a 1080p frame's cost.
-        let first = window.x as u32;
-        let last = first + window.width;
-        let whole_row = match covered {
-            None | Some(RowCoverage::Full) => true,
-            Some(RowCoverage::Empty) => false,
-            Some(RowCoverage::Spans(_)) => covered.is_some_and(|row| row.covers(first, last)),
-        };
-        if whole_row {
-            // Nothing was ever written here, or the window starts past the
-            // canvas: the row stays transparent. The buffer is recycled, so
-            // "stays" has to be written down — without this the row would show
-            // the previous frame's pixels, and the overlay paints any pixel
-            // with a non-zero alpha.
-            let drawn = frame.store.with_row(canvas_y as i32, |line| {
-                let start = window.x as usize * 3;
-                match line.get(start..start + window.width as usize * 3) {
-                    Some(source_row) => {
-                        expand_row(dst, source_row);
-                        true
-                    }
-                    None => false,
-                }
-            });
-            if drawn != Some(true) {
-                dst.fill(0);
-                opaque = false;
-            }
-            continue;
-        }
-        // Ragged row (T/L/arch shapes): only the captured extents are opaque,
-        // so the gaps stay transparent rather than being filled with black.
-        // Clearing first is what makes that true for a recycled buffer.
-        dst.fill(0);
-        opaque = false;
-        if !frame
-            .store
-            .row_into(window.x as u32, canvas_y as i32, &mut source)
-        {
-            continue;
-        }
-        for column in 0..window.width {
-            let filled = covered.is_none_or(|row| row.contains(first + column));
-            if !filled {
-                continue;
-            }
-            let dst = dst_row + column as usize * 4;
-            let src = column as usize * 3;
-            data[dst] = source[src + 2];
-            data[dst + 1] = source[src + 1];
-            data[dst + 2] = source[src];
-            data[dst + 3] = 255;
-        }
-    }
+    let stride_usize = stride as usize;
+    let opaque = match convert_window_parallel(frame, &window, &mut data, stride_usize) {
+        Some(opaque) => opaque,
+        None => convert_window_serial(frame, &window, &mut data, stride_usize),
+    };
     Ok(WindowImage {
         image: Image {
             width: window.width,
@@ -286,6 +224,158 @@ pub fn image_from_stitched_window_reusing(
             data,
         },
         opaque,
+    })
+}
+
+
+/// Rows below this count stay on the serial path: the helper spawn costs more
+/// than the rows.
+const WINDOW_PARALLEL_MIN_PIXELS: u64 = 250_000;
+/// The preview draw is a write into one buffer; four helpers is enough to leave
+/// the single-core boost range and more only spreads the same memory traffic.
+const WINDOW_MAX_HELPERS: usize = 4;
+
+/// One window row: the whole-window expansion, or the per-pixel form when the
+/// row is ragged (T/L/arch).
+///
+/// `row` is the whole canvas row when it was written and is resident; `None`
+/// leaves the row transparent. Returns whether the row is fully opaque, which
+/// is exact: the overlay copies contiguous runs when it is.
+fn convert_window_row(
+    dst: &mut [u8],
+    row: Option<&[u8]>,
+    window: &CanvasWindow,
+    covered: Option<&RowCoverage>,
+) -> bool {
+    let first = window.x as u32;
+    let last = first + window.width;
+    // Coverage is decided per row, not per pixel. The common canvas is
+    // rectangular and every row is `Full`, so this branch settles the whole
+    // row at once instead of asking `contains` once per column — the per-pixel
+    // form was 18% of a 1080p frame's cost.
+    let whole_row = match covered {
+        None | Some(RowCoverage::Full) => true,
+        Some(RowCoverage::Empty) => false,
+        Some(RowCoverage::Spans(_)) => covered.is_some_and(|row| row.covers(first, last)),
+    };
+    if whole_row {
+        let Some(row) = row else {
+            dst.fill(0);
+            return false;
+        };
+        let source_start = window.x as usize * 3;
+        let Some(source) = row.get(source_start..source_start + window.width as usize * 3) else {
+            dst.fill(0);
+            return false;
+        };
+        expand_row(dst, source);
+        return true;
+    }
+    // Ragged row (T/L/arch shapes): only the captured extents are opaque, so
+    // the gaps stay transparent rather than being filled with black. Clearing
+    // first is what makes that true for a recycled buffer.
+    dst.fill(0);
+    let Some(row) = row else {
+        return false;
+    };
+    for column in 0..window.width {
+        let filled = covered.is_none_or(|row| row.contains(first + column));
+        if !filled {
+            continue;
+        }
+        let source = (window.x as usize + column as usize) * 3;
+        let Some(pixel) = row.get(source..source + 3) else {
+            continue;
+        };
+        let destination = column as usize * 4;
+        dst[destination] = pixel[2];
+        dst[destination + 1] = pixel[1];
+        dst[destination + 2] = pixel[0];
+        dst[destination + 3] = 255;
+    }
+    false
+}
+
+fn convert_window_serial(
+    frame: &StitchedFrame,
+    window: &CanvasWindow,
+    data: &mut [u8],
+    stride: usize,
+) -> bool {
+    let mut opaque = true;
+    for row in 0..window.height {
+        let canvas_y = window.y as u32 + row;
+        let dst = &mut data[row as usize * stride..(row as usize + 1) * stride];
+        let covered = frame.row_coverage.get(canvas_y as usize);
+        let row_opaque = match frame.store.with_row(canvas_y as i32, |line| {
+            convert_window_row(dst, Some(line), window, covered)
+        }) {
+            Some(value) => value,
+            None => convert_window_row(dst, None, window, covered),
+        };
+        opaque &= row_opaque;
+    }
+    opaque
+}
+
+/// Splits the window's rows across helpers, reading the canvas without a copy.
+///
+/// Returns `None` when the range cannot be made resident (a window larger than
+/// the working-set budget), in which case the caller uses the serial reader.
+fn convert_window_parallel(
+    frame: &StitchedFrame,
+    window: &CanvasWindow,
+    data: &mut [u8],
+    stride: usize,
+) -> Option<bool> {
+    let pixels = u64::from(window.width) * u64::from(window.height);
+    if pixels < WINDOW_PARALLEL_MIN_PIXELS || window.height < 32 {
+        return None;
+    }
+    let helpers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(WINDOW_MAX_HELPERS);
+    if helpers <= 1 {
+        return None;
+    }
+    let y0 = window.y;
+    let y1 = y0 + window.height as i32;
+    let coverage = &frame.row_coverage[..];
+    frame.store.with_resident_rows(y0, y1, |view| {
+        let rows_per_helper = (window.height as usize).div_ceil(helpers);
+        let bytes_per_helper = rows_per_helper * stride;
+        let mut opaque = true;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (chunk_index, chunk) in data[..window.height as usize * stride]
+                .chunks_mut(bytes_per_helper)
+                .enumerate()
+            {
+                let window = *window;
+                handles.push(scope.spawn(move || {
+                    let first_row = chunk_index * rows_per_helper;
+                    let rows = chunk.len() / stride;
+                    let mut chunk_opaque = true;
+                    for offset in 0..rows {
+                        let row = first_row + offset;
+                        let canvas_y = window.y + row as i32;
+                        let dst = &mut chunk[offset * stride..(offset + 1) * stride];
+                        let covered = coverage.get(canvas_y as usize);
+                        let row_opaque = match view.row(canvas_y) {
+                            Some(line) => convert_window_row(dst, Some(line), &window, covered),
+                            None => convert_window_row(dst, None, &window, covered),
+                        };
+                        chunk_opaque &= row_opaque;
+                    }
+                    chunk_opaque
+                }));
+            }
+            for handle in handles {
+                opaque &= handle.join().expect("preview helper panicked");
+            }
+        });
+        opaque
     })
 }
 
@@ -849,11 +939,64 @@ fn first_frame_store(frame: &RgbFrame) -> CanvasStore {
 
 #[cfg(test)]
 mod tests {
-    use super::expand_row;
+    use super::{
+        convert_window_parallel, convert_window_serial, expand_row, CanvasWindow, RowCoverage,
+        StitchedFrame,
+    };
+    use crate::stitch::RgbFrame;
+
+    fn test_frame(width: u32, height: u32) -> RgbFrame {
+        let stride = width * 3;
+        let mut data = vec![0u8; (stride * height) as usize];
+        for y in 0..height {
+            for x in 0..width {
+                let offset = (y * stride + x * 3) as usize;
+                data[offset] = (x * 7 + y * 3) as u8;
+                data[offset + 1] = (x * 5 + y * 11) as u8;
+                data[offset + 2] = (x * 13 + y * 2) as u8;
+            }
+        }
+        RgbFrame { width, height, stride, data }
+    }
 
     /// The preview's expansion is written four pixels at a time for speed. It
     /// must produce exactly the ARGB8888 the per-pixel form did, including for
     /// widths that are not a multiple of four.
+    /// The window conversion splits its rows across helpers when the window is
+    /// large; a split row range must produce exactly the serial pixels, for
+    /// full rows, ragged rows and rows the capture never wrote.
+    #[test]
+    fn split_window_conversion_matches_the_serial_pixels() {
+        let width = 640;
+        let height = 900;
+        let mut frame = StitchedFrame::from_first_frame(&test_frame(width, height));
+        // One row captured only on its left half (an arch's leg), one never
+        // captured at all (the space between the legs).
+        frame.row_coverage[100] = RowCoverage::from_spans(&[(0, 300)], width);
+        frame.row_coverage[101] = RowCoverage::Empty;
+        let window = CanvasWindow { x: 0, y: 0, width, height: height - 100 };
+        let stride = width as usize * 4;
+
+        let mut serial = vec![0u8; stride * window.height as usize];
+        let mut split = vec![0u8; stride * window.height as usize];
+        let serial_opaque = convert_window_serial(&frame, &window, &mut serial, stride);
+        let split_opaque = convert_window_parallel(&frame, &window, &mut split, stride)
+            .expect("a 640x800 window must take the parallel path");
+        assert_eq!(serial_opaque, split_opaque);
+        assert_eq!(serial, split);
+        assert!(!serial_opaque, "a ragged canvas is not fully opaque");
+
+        // A small window stays serial: the spawn would cost more than the rows.
+        let small = CanvasWindow { x: 0, y: 0, width: 100, height: 100 };
+        assert!(convert_window_parallel(
+            &frame,
+            &small,
+            &mut vec![0u8; 100 * 4 * 100],
+            400
+        )
+        .is_none());
+    }
+
     #[test]
     fn expand_row_matches_the_per_pixel_conversion() {
         for width in [1usize, 2, 3, 4, 5, 7, 8, 9, 16, 3839] {
