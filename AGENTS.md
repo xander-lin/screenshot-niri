@@ -9,7 +9,7 @@
 
 ## Functional Goals And Scope
 
-- **Normal mode** (default): freeze all outputs (with-cursor and cursor-free frame pair), dimmed drag-region selection overlay, save PNG, copy to clipboard. `1`–`9` full-screen capture, `0` captures every screen as one image (the union of all output rectangles; a gap between outputs is opaque black, the composite being XRGB), `H` toggles cursor in output, `L` promotes selection to long mode, `Esc` cancels.
+- **Normal mode** (default): freeze all outputs (with-cursor and cursor-free frame pair), dimmed drag-region selection overlay, save PNG, copy to clipboard. `1`–`9` full-screen capture, `0` captures every screen as one image (the bounding box of the outputs, with each screen's piece packed end to end — a gap between outputs is closed rather than painted black, and the composite is XRGB), `H` toggles cursor in output, `L` promotes selection to long mode, `Esc` cancels.
 - **Long/scroll mode** (`--long`): select a region on a single output, scroll content, continuous capture (configurable fps cap via `--fps`, default 30) with live stitched preview, direction hints (`Up`/`Down`/`Left`/`Right`), selection-box edit mode (`E`) with per-edge snap targets and wheel blocking for T/L-shaped captures and static-footer completion, finish on `Enter`/`Space`, stitch into one PNG (+ transparent corners for ragged shapes).
 - **Clipboard**: `wlr-data-control` serving `image/png` (default) or `file://` URI (`--url`), as a detached provider process.
 - **Output path policy**: temp dir default → `--file [PATH]` (Pictures/Screenshots) → `-o/--output PATH` → `--name NAME` → positional PATH (same as `--file PATH`).
@@ -96,6 +96,6 @@ Concise boundaries for each module: what it owns, what it must not do, and how i
 ## Commands
 
 - Build: `cargo build --release` (binary `target/release/screenshot`; Rust 1.88+, enforced by `rust-version` in `Cargo.toml`).
-- Test: `cargo test` (261 tests, one target: `main.rs` links the library instead of re-declaring the modules, so the `#[cfg(test)]` blocks no longer run twice; `[profile.test] opt-level = 2` takes the suite from ~24 s to ~1.3 s). Corpus verification: `verify-corpora` runs every corpus against the baselines in `src/bin/verify-corpora.rs` (non-zero exit on any mismatch); `replay-frames` / `truth-frames` cache their standard answers in `testdata/frames/*/.truth-*.cache` (content-keyed; `--refresh` recomputes).
+- Test: `cargo test` (262 tests, one target: `main.rs` links the library instead of re-declaring the modules, so the `#[cfg(test)]` blocks no longer run twice; `[profile.test] opt-level = 2` takes the suite from ~24 s to ~1.3 s). Corpus verification: `verify-corpora` runs every corpus against the baselines in `src/bin/verify-corpora.rs` (non-zero exit on any mismatch); `replay-frames` / `truth-frames` cache their standard answers in `testdata/frames/*/.truth-*.cache` (content-keyed; `--refresh` recomputes).
 - Trace logs: `--features trace-logs` (see `src/trace.rs` env gates).
 - Packaging: `PKGBUILD` (package `screenshot-niri`, conflicts with `screenshot-plain`).

@@ -361,6 +361,30 @@ mod tests {
         assert!(prepare_capture_region(inside, &outputs).is_some());
     }
 
+    /// A layout with a gap between two outputs: `0` (and any spanning drag)
+    /// joins the pieces, it does not preserve the empty desktop space as black.
+    /// Offsets equal the widths already written — that is what keeps a
+    /// fractional-scale seam at exactly one boundary column — so the gap is
+    /// closed. Pinned because the documentation claimed the opposite.
+    #[test]
+    fn a_gapped_layout_packs_pieces_without_painting_the_gap() {
+        let outputs = [
+            OutputInfo { global_name: 1, logical: LogicalRect { x: 0, y: 0, width: 100, height: 80 }, scale: 1 },
+            OutputInfo { global_name: 2, logical: LogicalRect { x: 140, y: 0, width: 100, height: 80 }, scale: 1 },
+        ];
+        let captures = [captured(1, 100, 80), captured(2, 100, 80)];
+        let viewport = SelectedViewport::from_outputs(
+            LogicalRect { x: 0, y: 0, width: 240, height: 80 },
+            &outputs,
+        )
+        .unwrap();
+        let regions = viewport.capture_regions(&captures);
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].dst_x, 0);
+        assert_eq!(regions[1].dst_x, 100, "the 40 px gap is closed, not painted black");
+        assert_eq!(viewport.capture_size(&captures).unwrap(), (200, 80));
+    }
+
     /// Three screens in a row: the offsets are accumulated across *every*
     /// covered output, not just the first two. Nothing may be written twice or
     /// skipped when the selection crosses two seams.

@@ -450,5 +450,5 @@ place_horizontally(stitched, previous_rect, frame, direction)
 1. **先存基线**：`cargo build --release --bins && ./target/release/verify-corpora --jobs 2`（11 个语料，约 46 s）。
 2. **一次只动一个阶段**；用 `--features trace-logs` + `SCREENSHOT_TRACE_EDGE_GATE=1` 看每个窗口的 gate 数字，`SCREENSHOT_TRACE_PROFILE=1` 看阶段耗时，`SCREENSHOT_TRACE_VERBOSE=1` 看放置路径。
 3. **常量的标定语料写在常量注释里**；改常量必须说明它动的是哪条语料的哪个数字。
-4. **全语料 + 全特性组合 + clippy 45**：`cargo test`（261）、`--features stitch-legacy`（252）、`canvas-raw-tiles`、`trace-logs`。
+4. **全语料 + 全特性组合 + clippy 45**：`cargo test`（262）、`--features stitch-legacy`（252）、`canvas-raw-tiles`、`trace-logs`。
 5. **树变了，文档必须变**：这一份的 §3–§8 与 `AGENTS.md` 的 `stitch` 契约、`docs/performance.md` 的对应轮次同一次提交。

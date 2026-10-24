@@ -145,7 +145,7 @@ measurement that closed them.
 ## Reproduce the baselines
 
 ```
-cargo test                                   # 261 tests, ~1.3 s warm
+cargo test                                   # 262 tests, ~1.3 s warm
 cargo build --release --bins
 ./target/release/verify-corpora --jobs 2     # 11 corpora, ~46 s, non-zero on drift
 ./target/release/stitch-bench --dir testdata/frames/real-5-4k   # push p50 0.86 ms
