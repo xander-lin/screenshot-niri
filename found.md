@@ -458,8 +458,9 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
   few percent of p95.
 - **Correction**: PGO was **not adopted** (`push` mean +0-5%, p95 +1-10%;
   preview unchanged). `-C target-cpu=x86-64-v3` / `native` was measured as the
-  separate lever that does help (`push` −20 to −37%, p95 −15 to −33%), but it
-  is not enabled for published builds because it raises the supported CPU
+  separate lever that does help (`push` −20 to −37%, p95 −15 to −33%). From
+  0.2.1 the x86_64 release/AUR binaries use v3, with a `-x86_64-generic`
+  fallback asset and a README note, because it raises the supported CPU
   baseline.
 - **Prevention**: Name the technique before testing it — PGO (FDO) changes code
   layout from execution counts; it cannot widen vectors. Measure both separately
@@ -467,8 +468,34 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
   result so the experiment is not repeated. Details:
   `docs/performance.md`, "build-flag pass".
 
+### 42. x86-64-v3 is an ABI level, not a performance switch
+
+- **Context**: After measuring `-C target-cpu=x86-64-v3` as the real performance
+  lever (PGO was neutral), the release policy changed to v3 x86_64 binaries.
+- **Root cause**: x86-64-v3 means the CPU unconditionally provides AVX, AVX2,
+  BMI1/2, F16C, FMA, LZCNT, MOVBE and OSXSAVE — not "the compiler may use them
+  when available". A binary built for it executes those instructions everywhere,
+  including in `main`, so an unsupported CPU dies with `SIGILL` (illegal
+  instruction) before any fallback could run. The compiler cannot emit a
+  runtime check for the whole crate.
+- **Correction**: Publish the v3 asset as the default x86_64 build, plus an
+  `-x86_64-generic` asset and a README/AUR note stating the requirement
+  (Haswell 2013 / Excavator 2015 or later). aarch64 is unaffected.
+- **Prevention**: When changing `target-cpu`, treat it as a change to the
+  supported CPU baseline, not as a compiler flag: ship a generic fallback, say
+  the first supported generation in the README, and never claim `arch=('x86_64')`
+  compatibility for a v3 binary without that note.
+
 ## Verification Memory
 
+- **Release 0.2.1 (2026-10-24)**: niri HEAD `3076758`, tag `v0.2.1-niri`;
+  plain `001817f`, tag `v0.2.1-plain`. README now documents `L` promotion of a
+  normal selection to long mode. x86_64 assets are built with
+  `-C target-cpu=x86-64-v3` and a `-x86_64-generic` fallback is published;
+  aarch64 is generic. AUR packages updated to 0.2.1-1 with the v3 checksum and
+  a pkgdesc note. Installed locally: `screenshot-niri-local 0.2.1-1` built with
+  the same v3 flag, `/usr/bin/screenshot` reports 0.2.1, binary sha256
+  `05e690cb…`, `pacman -Qkk` 0 altered files.
 - **Release 0.2.0 (2026-10-24)**: niri HEAD `220c506`, tag `v0.2.0-niri`;
   plain tag `v0.2.0-plain` at `463788b`. GitHub releases carry x86_64 and
   aarch64 tarballs (`screenshot-niri-0.2.0-*.tar.gz`,
