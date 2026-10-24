@@ -444,6 +444,29 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
   2. 加了线程之后先看带宽：如果单线程已经跑在十几 GB/s，线程数带来的收益会远低于核心数，别再为 1.2× 继续折腾。
   3. 并行路径必须有逐字节等价测试和「不可并行时的确定性回退」，否则一个偏移错误会以"行列错位"的形式悄悄进入预览。
 
+### 41. Corpus-trained PGO lost to CPU-specific codegen on the pixel pipeline
+
+- **Context**: Asked whether compiling with profiles from the real capture
+  corpora makes the stitcher faster, `v0.2.0` was rebuilt three ways (PGO with
+  LTO-instrumented training, PGO with no-LTO training, PGO trained without the
+  widest corpus) and measured with `stitch-bench` on five corpora, three
+  interleaved runs each.
+- **Root cause**: The hot loops are pixel and memory-bandwidth loops with almost
+  no unpredictable branches, and `lto = "thin"` + one codegen unit already
+  inlines across modules. PGO can only improve layout/inlining; the available
+  gain was SIMD width, which it does not change. Its block layout also cost a
+  few percent of p95.
+- **Correction**: PGO was **not adopted** (`push` mean +2-5%, p95 +1-11%,
+  preview unchanged). `-C target-cpu=x86-64-v3` / `native` was measured as the
+  separate lever that does help (`push` −20 to −37%, p95 −15 to −33%), but it
+  is not enabled for published builds because it raises the supported CPU
+  baseline.
+- **Prevention**: Name the technique before testing it — PGO (FDO) changes code
+  layout from execution counts; it cannot widen vectors. Measure both separately
+  against the shipped profile, with interleaved runs, and record the negative
+  result so the experiment is not repeated. Details:
+  `docs/performance.md`, "build-flag pass".
+
 ## Verification Memory
 
 - **Release 0.2.0 (2026-10-24)**: niri HEAD `220c506`, tag `v0.2.0-niri`;
