@@ -4,6 +4,7 @@
 
 - **Normal mode**: drag to select a region — the screen freezes and dims during selection.
 - **Long mode**: capture scrolling content by selecting a region, then scrolling — the tool stitches frames into one tall image.
+- **From normal to long with one key**: press **L** while the selection box is being drawn (or while editing it) and the same region becomes a long/scroll capture. The frozen screen is replaced by the live screen through the box; no restart with `--long` needed.
 
 The binary is named `screenshot`.
 
@@ -21,6 +22,25 @@ Capture uses `wlr-screencopy` v3, the overlay uses `wlr-layer-shell`, and clipbo
 cargo install --git https://github.com/xander-lin/screenshot-niri.git
 ```
 
+Use this path on a CPU older than the prebuilt binaries' baseline (see below).
+
+### Prebuilt binaries
+
+The x86_64 release tarballs are built with `-C target-cpu=x86-64-v3`
+(AVX2/BMI/FMA: Intel Haswell, 2013, or AMD Excavator, 2015, and later). They
+will **not** run on older x86_64 CPUs — the kernel kills them with an illegal
+instruction. A `-x86_64-generic` asset is published alongside the v3 one for
+those machines; aarch64 assets use the architecture default.
+
+### Arch Linux
+
+```bash
+paru -S screenshot-niri
+```
+
+The AUR package ships the v3 x86_64 binary. On a CPU without AVX2, install from
+source instead (or use the generic tarball).
+
 ## Usage
 
 ```
@@ -34,6 +54,11 @@ screenshot [OPTIONS] [PATH]
 | _(default)_ | Normal | Drag to select a region, save, copy to clipboard |
 | `--long` | Long/Scroll | Select a region, scroll to capture more, press Enter to finish |
 | `--fps N` | — | Long-capture frame-rate cap in fps (default: 30, range: 1–240) |
+
+**`L` promotes an in-progress selection to long mode.** If you start with a normal
+screenshot and change your mind while dragging the box, press `L` before releasing
+the mouse (or after pressing `E` to adjust the box); the selection becomes the
+long-capture region and scrolling starts the capture.
 
 ### Output Path
 
@@ -100,6 +125,7 @@ border_width = 3
 5. The frozen preview and the saved screenshot use the cursor-free frame by default. Press **H** to show the cursor (toggle between the captured with-cursor and without-cursor frames). The live selection cursor stays visible.
 6. Press **1**–**9** to skip selection entirely and capture a full screen; screens are numbered left to right by their position. Press **0** to capture **every** screen in one image (the whole desktop).
 7. Press **E** (during the drag or afterwards) to enter selection-box **editing mode**: each of the four box edges has a snap target you can grab and drag to resize the box. Press **E** again or **Enter/Space** to capture with the adjusted box.
+8. **Press `L` before releasing the mouse (or while in edit mode) to turn this box into a long/scroll capture.** The frozen screen is replaced by the live screen through the box, and the box becomes the region long capture follows; continue with the long/scroll steps below (scroll the content, hint the direction, press Enter to finish). A box that spans outputs is clamped to the screen the drag started on, because long capture is single-screen.
 
 ### Long/Scroll Screenshot (`--long`)
 

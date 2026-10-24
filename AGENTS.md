@@ -99,3 +99,7 @@ Concise boundaries for each module: what it owns, what it must not do, and how i
 - Test: `cargo test` (262 tests, one target: `main.rs` links the library instead of re-declaring the modules, so the `#[cfg(test)]` blocks no longer run twice; `[profile.test] opt-level = 2` takes the suite from ~24 s to ~1.3 s). Corpus verification: `verify-corpora` runs every corpus against the baselines in `src/bin/verify-corpora.rs` (non-zero exit on any mismatch); `replay-frames` / `truth-frames` cache their standard answers in `testdata/frames/*/.truth-*.cache` (content-keyed; `--refresh` recomputes).
 - Trace logs: `--features trace-logs` (see `src/trace.rs` env gates).
 - Packaging: `PKGBUILD` (package `screenshot-niri`, conflicts with `screenshot-plain`).
+- Release binaries: x86_64 with `RUSTFLAGS="-C target-cpu=x86-64-v3"` (and a
+  `-x86_64-generic` fallback asset), aarch64 at the architecture default. PGO
+  is not used: measured neutral-to-negative (`docs/performance.md`,
+  "build-flag pass").

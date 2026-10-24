@@ -2,7 +2,7 @@
 # Contributor: screenshot-niri contributors
 
 pkgname=screenshot-niri
-pkgver=0.2.0
+pkgver=0.2.1
 pkgrel=1
 pkgdesc="Wayland screenshot tool — region, full-screen, and long/scroll capture with a frozen-background selection overlay"
 arch=('x86_64')
