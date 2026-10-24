@@ -5,6 +5,11 @@
 //!     stitch-bench --dir DIR              # replay a captured corpus
 //!     stitch-bench --synthetic WxHxN      # a deterministic scrolling page
 //!
+//! `--step PIXELS` sets how far the synthetic page moves per frame (default
+//! 40). It is not cosmetic: the step decides how much new canvas each frame
+//! writes, so it is the input that moves the allocation figure by an order of
+//! magnitude. The default is a fast smooth scroll at 30 fps (1 200 px/s).
+//!
 //! What it reports, per run:
 //!
 //! * `push` — the whole `push_frame_with_offset` call, i.e. what the UI thread
@@ -321,6 +326,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut directory: Option<PathBuf> = None;
     let mut synthetic: Option<(u32, u32, u32)> = None;
     let mut no_preview = false;
+    // Pixels scrolled per frame. 40 is a fast smooth scroll at 30 fps
+    // (1 200 px/s); a wheel notch is ~100 px, a page-down ~900. The step decides
+    // how much *new* canvas each frame writes, so it is the one input that moves
+    // the allocation figure by an order of magnitude — see `--step`.
+    let mut step: u32 = 40;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -338,10 +348,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ));
             }
             "--no-preview" => no_preview = true,
+            "--step" => {
+                step = arguments
+                    .next()
+                    .ok_or("--step needs pixels")?
+                    .parse()
+                    .map_err(|_| "--step needs a positive pixel count")?;
+                if step == 0 {
+                    return Err("--step needs a positive pixel count".into());
+                }
+            }
             "--help" | "-h" => {
                 println!(
                     "stitch-bench --dir DIR [--no-preview]\n\
-                     stitch-bench --synthetic WIDTHxHEIGHTxFRAMES [--no-preview]"
+                     stitch-bench --synthetic WIDTHxHEIGHTxFRAMES [--step PIXELS] [--no-preview]"
                 );
                 return Ok(());
             }
@@ -350,7 +370,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some((width, height, count)) = synthetic {
-        let frames = synthetic_page(width, height, count, 40);
+        let frames = synthetic_page(width, height, count, step);
         summarize(
             &format!("{width}x{height} synthetic, {count} frames"),
             measure(&frames, !no_preview)?,

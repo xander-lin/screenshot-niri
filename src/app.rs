@@ -429,7 +429,15 @@ fn run_long_capture(
                                 capture_width: capture_width.max(1),
                                 capture_height: capture_height.max(1),
                             };
-                            let _ = selection_session.update_long_capture_preview(snapshot);
+                            // Recycle the displaced preview's allocation. Without
+                            // this hand-off the buffer taken above is consumed
+                            // by the snapshot and freed here, so every frame
+                            // would allocate a fresh 8.3 MB (1080p) image.
+                            if let Ok(Some(replaced)) =
+                                selection_session.update_long_capture_preview(snapshot)
+                            {
+                                preview_buffer = replaced.data;
+                            }
                         }
                     }
                 }

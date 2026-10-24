@@ -499,7 +499,11 @@ impl RawStitcher {
     /// instead, so in a default build the frame was built and dropped unread:
     /// measured at 18.7% of a 1080p frame's CPU and 8.3 MB of its allocation.
     fn perceptual_frame_needed() -> bool {
-        cfg!(any(test, feature = "stitch-legacy")) || crate::trace::trace_deep_profile_enabled()
+        // Deliberately *not* `cfg!(test)`: a test build that keeps the frame
+        // alive would hide a new reader of `previous_perceptual_frame` from the
+        // test suite, because tests would still get `Some` while the shipped
+        // build got `None`. Every test runs the same branch the product runs.
+        cfg!(feature = "stitch-legacy") || crate::trace::trace_deep_profile_enabled()
     }
 
     /// The perceptual frame for this push, or `None` when nothing reads it.
@@ -612,7 +616,8 @@ impl RawStitcher {
         analysis_frame: &impl RgbSource,
         new_offset: FrameScreenOffset,
     ) -> Result<PushResult, Box<dyn Error>> {
-        let frame = rgb_frame_from_source(compose_frame)?;
+        let recycled = std::mem::take(&mut self.spare_compose_buffer);
+        let frame = rgb_frame_from_source_reusing(compose_frame, recycled)?;
         let previous_rect = self.viewport_rect.ok_or("missing viewport rect")?;
         let last_offset = self.last_screen_offset.ok_or("missing last screen offset")?;
         let crop = self.active_crop.ok_or("missing active crop")?;
@@ -672,7 +677,9 @@ impl RawStitcher {
             .ok_or("invalid active crop after geometry change")?;
         self.active_crop = Some(new_crop);
         self.fixed_detector = FixedBandDetector::default();
-        self.previous_compose_frame = Some(frame);
+        if let Some(replaced) = self.previous_compose_frame.replace(frame) {
+            self.recycle_compose_frame(replaced);
+        }
         self.previous_perceptual_frame = Self::perceptual_frame_for(analysis_frame);
         self.previous_perceptual_delta = None;
         // A geometry change is a *known* step, not a matched one: the box moved
@@ -692,14 +699,12 @@ impl RawStitcher {
         // The canvas geometry changed underneath the engine; re-seed it from
         // the new viewport instead of letting it search a stale ladder.
         self.engine.reset();
-        self.engine.commit(
-            new_rect,
-            new_rect.y,
-            &CroppedRgbSource::new(
-                &self.previous_compose_frame.clone().ok_or("missing compose frame")?,
-                new_crop,
-            )?,
-        );
+        let previous = self
+            .previous_compose_frame
+            .as_ref()
+            .ok_or("missing compose frame")?;
+        self.engine
+            .commit(new_rect, new_rect.y, &CroppedRgbSource::new(previous, new_crop)?);
         self.last_profile_breakdown.path = Some(StitchDecisionPath::CanvasAccepted);
         Ok(PushResult::Accepted { match_info })
     }
@@ -907,6 +912,12 @@ impl RawStitcher {
                 // The dirty-edge case is still handled, from the accept path:
                 // `find_dirty_overlap_recovery` runs when the engine *did*
                 // produce a candidate and the canvas edge needs rewriting.
+                //
+                // The refused frame still owns a 6.2 MB (1080p) conversion
+                // buffer, and a refusal is not rare — `real-1` refuses 257 of
+                // 461 frames. Hand it back before dropping the frame, or every
+                // refusal pays a fresh allocation and a page fault per page.
+                self.recycle_compose_frame(compose_frame);
                 return self.reject_frame(reason);
             }
         };
@@ -1019,6 +1030,7 @@ impl RawStitcher {
         }
 
         self.last_reject_reason = Some(RejectReason::NoCandidate);
+        self.recycle_compose_frame(compose_frame);
         self.reject_frame(RejectReason::NoCandidate)
     }
 
@@ -1172,6 +1184,18 @@ impl RawStitcher {
         }
     }
 
+    /// Hands a conversion buffer back to the recycler.
+    ///
+    /// Only the allocation is kept — never the contents — so this may be called
+    /// on a frame that was refused, as well as on the one `commit_accepted`
+    /// replaces. Both matter: accepting every frame is not the common case (the
+    /// `real-1` corpus refuses 257 of 461), and a refusal used to drop its
+    /// buffer on the floor, which put the whole 6.2 MB (1080p) allocation and
+    /// its page faults back on the next push.
+    fn recycle_compose_frame(&mut self, frame: RgbFrame) {
+        self.spare_compose_buffer = frame.data;
+    }
+
     /// The only place that advances the "where the last accepted frame is"
     /// state. `viewport_rect`, both reference frames, the direction memory and
     /// the trace slots move together or not at all.
@@ -1194,7 +1218,7 @@ impl RawStitcher {
         self.viewport_rect = Some(new_rect);
         self.previous_perceptual_frame = Self::perceptual_frame_for(analysis_frame);
         if let Some(replaced) = self.previous_compose_frame.replace(compose_frame) {
-            self.spare_compose_buffer = replaced.data;
+            self.recycle_compose_frame(replaced);
         }
         self.last_profile_breakdown.path = path;
         self.last_fast_motion_trace = fast_motion_trace;
@@ -3289,8 +3313,12 @@ mod tests {
         let duplicate_analysis = shifted_bottom_with_difference(&previous_analysis, 12, 6);
         let mut stitcher = RawStitcher::new();
         stitcher
-            .push_frame_with_analysis(frame.clone(), previous_analysis, None)
+            .push_frame_with_analysis(frame.clone(), previous_analysis.clone(), None)
             .unwrap();
+        // The gate is off in a test build on purpose — tests run the branch the
+        // shipped binary runs — so seed the baseline here. The invariant under
+        // test is that the duplicate path leaves it alone.
+        stitcher.previous_perceptual_frame = Some(PerceptualFrame::from_source(&previous_analysis));
         let baseline = stitcher.previous_perceptual_frame.clone().unwrap();
 
         assert_eq!(
@@ -4479,6 +4507,47 @@ mod tests {
         assert_eq!(image.data[4 * 2 + 3], 0);
     }
 
+    /// The same guarantee, for the overlay's *recycled* buffer.
+    ///
+    /// The preview path hands the previous frame's allocation back in, so
+    /// "uncovered pixels stay transparent" is no longer free: a pixel must be
+    /// written even when nothing captured it, or the previous frame shows
+    /// through. The overlay paints every pixel with a non-zero alpha, so a
+    /// stale byte here is visible content in the corner of a T/L/arch capture.
+    #[test]
+    fn a_recycled_preview_buffer_clears_pixels_the_new_window_never_captured() {
+        let previous = frame(4, 2, 10);
+        let mut stitched = StitchedFrame::from_first_frame(&previous);
+        // First pass: every pixel is covered, so the buffer comes back opaque.
+        let covered =
+            image_from_stitched_window_reusing(&stitched, CanvasWindow::full(&stitched), Vec::new())
+                .unwrap();
+        assert!(covered
+            .data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel[3] == 255));
+
+        // The canvas is ragged now: the right half of each row was never
+        // captured. Reusing the opaque buffer must not resurrect those pixels.
+        stitched.row_coverage = vec![RowCoverage::Spans(vec![(0, 2)]); 2];
+        let ragged = image_from_stitched_window_reusing(
+            &stitched,
+            CanvasWindow::full(&stitched),
+            covered.data,
+        )
+        .unwrap();
+        for column in 0..4 {
+            let alpha = ragged.data[column * 4 + 3];
+            let want = if column < 2 { 255 } else { 0 };
+            assert_eq!(
+                alpha, want,
+                "column {column} alpha after recycling a fully opaque buffer"
+            );
+        }
+    }
+
     #[test]
     fn geometry_offset_extension_grows_canvas_and_preserves_overlap() {
         let mut stitcher = RawStitcher::new();
@@ -4879,6 +4948,37 @@ mod tests {
         );
         // The patience counter must not run past the threshold.
         assert_eq!(stitcher.consecutive_refusals, REFUSAL_PATIENCE);
+    }
+
+    /// A refusal must still hand its conversion buffer back.
+    ///
+    /// Refusals are not exceptional: `real-1` refuses 257 of its 461 frames. If
+    /// the buffer only comes back on an accept, every refused frame allocates
+    /// 6.2 MB (1080p) and faults in every page of it — which is exactly what the
+    /// recycling is meant to stop.
+    #[test]
+    fn a_refused_frame_hands_its_conversion_buffer_back() {
+        let width = 64;
+        let height = 200;
+        let mut stitcher = RawStitcher::new();
+        for top in [0u32, 40, 80] {
+            let frame = frame_from_world_rows(width, &(top..top + height).collect::<Vec<_>>());
+            stitcher.push_frame(frame, None).unwrap();
+        }
+
+        // Start from "nothing to recycle", so a buffer after the refusal can
+        // only have come from the refused frame itself.
+        stitcher.spare_compose_buffer = Vec::new();
+        let jump = frame_from_world_rows(width, &(900..900 + height).collect::<Vec<_>>());
+        assert_eq!(
+            push_until_refused(&mut stitcher, &jump, None),
+            PushResult::NoMatch
+        );
+        assert!(
+            stitcher.spare_compose_buffer.len() >= width as usize * height as usize * 3,
+            "a refused frame dropped its conversion buffer: {} bytes spare",
+            stitcher.spare_compose_buffer.len()
+        );
     }
 
     /// An accepted frame clears the patience, so an isolated refusal between

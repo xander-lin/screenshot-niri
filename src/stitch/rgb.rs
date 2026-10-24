@@ -32,7 +32,13 @@ pub trait RgbSource {
         // a short buffer gets the prefix it can hold rather than a panic: this
         // runs per row of every frame, and the bounds are already implied by the
         // row being inside the source.
-        for (index, destination) in out.chunks_exact_mut(3).take(count as usize).enumerate() {
+        for (index, destination) in out
+            .as_chunks_mut::<3>()
+            .0
+            .iter_mut()
+            .take(count as usize)
+            .enumerate()
+        {
             let Some(column) = x.checked_add(index as u32) else {
                 return;
             };
@@ -80,7 +86,11 @@ impl RgbSource for RgbFrame {
         let start = y as usize * self.stride as usize + x as usize * 3;
         let end = start + count as usize * 3;
         if let Some(row) = self.data.get(start..end) {
-            out[..row.len()].copy_from_slice(row);
+            // `out` may be longer than the source supplies; copying the common
+            // prefix keeps the accessor total instead of panicking on a short
+            // destination.
+            let available = row.len().min(out.len());
+            out[..available].copy_from_slice(&row[..available]);
         }
     }
 
@@ -317,13 +327,20 @@ pub(super) fn rgb_frame_from_source_reusing(
         .ok_or("RGB frame size overflow")?;
     buffer.resize(size, 0);
     let mut data = buffer;
-    // Row at a time through the bulk accessor: the per-pixel form paid a
-    // virtual call and two bounds checks per pixel to move three bytes.
-    let mut row = vec![0u8; source.width() as usize * 3];
+    // Row at a time, straight into the frame: the per-pixel form paid a virtual
+    // call and two bounds checks per pixel to move three bytes, and reading each
+    // row into a scratch buffer first would double the traffic (6.2 MB copied
+    // twice per 1080p frame) for no benefit. `resize` above leaves the bytes
+    // past `size` untouched, and every byte up to `size` is written below, so a
+    // recycled buffer never carries a stale pixel into the new frame.
     for y in 0..source.height() {
-        source.row_rgb_into(0, y, source.width(), &mut row);
         let start = y as usize * stride as usize;
-        data[start..start + row.len()].copy_from_slice(&row);
+        source.row_rgb_into(
+            0,
+            y,
+            source.width(),
+            &mut data[start..start + stride as usize],
+        );
     }
     Ok(RgbFrame {
         width: source.width(),

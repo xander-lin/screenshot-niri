@@ -16,6 +16,7 @@ asset rather than a scratch probe. Two modes:
 ```bash
 ./target/release/stitch-bench --dir testdata/frames/real-long
 ./target/release/stitch-bench --synthetic 1920x1080x60
+./target/release/stitch-bench --synthetic 1920x1080x60 --step 120
 ```
 
 It reports the three numbers that matter for a long capture, all of which the UI
@@ -31,6 +32,22 @@ thread pays per frame:
 frames, so resolution scaling can be measured without a 4K capture. It is a
 *page*, not noise: a page that does not genuinely scroll makes the stitcher
 refuse, and the profile then measures the refusal path.
+
+`--step PIXELS` is how far the page moves between frames (default 40). It is the
+one input that decides how much *new canvas* a frame writes, and therefore the
+allocation figure:
+
+| step | push | steady-state allocation |
+|---|---|---|
+| 40 (default, 1 200 px/s at 30 fps) | 5.0 ms | 0.9 MB |
+| 120 (a wheel notch per frame) | 5.5 ms | 9.4 MB |
+| 456 (`real-scroll`'s median delta) | 7.4 ms | 14.7 MB |
+
+The allocation growth is the canvas itself — new rows plus the packed form of
+tiles that just went cold — which is retained, not churn, and is bounded by the
+content captured. `canvas-raw-tiles` (no packing) measures 1.6 MB / 5.2 MB at the
+same two steps with the same CPU, so the difference is storage, not work. Read
+the `0.9 MB` figure as "per-frame churn at a slow scroll", not as a general claim.
 
 `--no-preview` isolates the stitcher from the preview conversion.
 
@@ -59,7 +76,7 @@ which caller is responsible. Symbols require the debug-info build — a plain
 | push | 11.75 ms | 4.8–5.8 ms |
 | preview | 3.59 ms | 1.4–1.6 ms |
 | UI thread per frame | 15.3 ms (46%) | 6.2–7.4 ms (19–22%) |
-| steady-state allocation | 28.1 MB / frame | 0.7 MB / frame |
+| steady-state allocation | 28.1 MB / frame | 0.9 MB / frame (40 px step; see below) |
 
 Resolution scaling after the pass (synthetic, steady state):
 
@@ -146,8 +163,13 @@ cycle:
   a high-water mark, not an exact fit: the overlay window grows with the canvas
   and shrinks after a selection-box edit, and reallocating on every change would
   defeat the purpose. Only `size` bytes are used; the rest stays allocated.
+  The buffer comes back through `update_long_capture_preview`, which returns the
+  `Image` it displaced — the session holds exactly one preview, and returning the
+  old one is the only way the allocation can outlive the snapshot it belonged to.
 
-Steady-state allocation is now 0.7 MB per frame, all small.
+Steady-state allocation is 0.9 MB per frame at a 40 px step, all small. It is
+higher at faster scrolls (see the step table above) because the canvas grows
+faster; that part is retained content, not churn.
 
 ## What remains
 

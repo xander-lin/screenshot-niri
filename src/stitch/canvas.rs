@@ -206,7 +206,11 @@ pub fn image_from_stitched_window_reusing(
             .store
             .row_into(window.x as u32, canvas_y as i32, &mut source);
         if !have_row {
-            // Nothing was ever written here; the row stays transparent.
+            // Nothing was ever written here; the row stays transparent. The
+            // buffer is recycled, so "stays" has to be written down: without
+            // this the row would show the previous frame's pixels, and the
+            // overlay paints any pixel with a non-zero alpha.
+            data[dst_row..dst_row + stride as usize].fill(0);
             continue;
         }
         // Coverage is decided per row, not per pixel. The common canvas is
@@ -237,6 +241,8 @@ pub fn image_from_stitched_window_reusing(
         }
         // Ragged row (T/L/arch shapes): only the captured extents are opaque,
         // so the gaps stay transparent rather than being filled with black.
+        // Clearing first is what makes that true for a recycled buffer.
+        data[dst_row..dst_row + stride as usize].fill(0);
         for column in 0..window.width {
             let filled = covered.is_none_or(|row| row.contains(first + column));
             if !filled {

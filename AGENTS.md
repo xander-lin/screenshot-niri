@@ -58,7 +58,7 @@
 - `src/wayland/selection.rs` → layer-shell overlay: frozen/dimmed selection UI, drag redraw, long-mode preview and status, pointer passthrough for capture.
 - `src/bin/capture-frames.rs` → 真实帧抓取工具：走与正式长截图相同的 overlay/`prepare_capture_clean`/`zwlr_screencopy_manager_v1` 路径，只抓帧存盘（`frame-NNNN.png` + `session.json`），不拼接、不判断。
 - `src/bin/replay-frames.rs` → 离线回放：喂给真实拼接器，同时用逐像素穷举给出相邻帧真值，并用「回投影到画布」+「与邻居位置连续性」两项独立判据判定错位。
-- `src/bin/stitch-bench.rs` → 拼接器性能测量工具（**长期资产，不是探针**）：`--dir` 回放真实语料、`--synthetic WxHxN` 用确定性滚动页扫分辨率，报告 push/preview 的 mean·p50·p95·max 与每帧分配字节数（含稳态口径）。`--no-preview` 隔离预览转换。
+- `src/bin/stitch-bench.rs` → 拼接器性能测量工具（**长期资产，不是探针**）：`--dir` 回放真实语料、`--synthetic WxHxN` 用确定性滚动页扫分辨率（`--step PIXELS` 定每帧滚动距离，默认 40，直接决定分配口径），报告 push/preview 的 mean·p50·p95·max 与每帧分配字节数（含稳态口径）。`--no-preview` 隔离预览转换。
 - `testdata/frames/` → 验收语料（PNG 50 MB，gitignore；`session.json` + `truth.tsv` + `README.md` 进 git）。`real-1` 是真实 screencopy 主语料，改动拼接器后必须跑：`./target/release/replay-frames --dir testdata/frames/real-1`，基线 204 接受 / 0 no-match / 0 错位 / 0 未覆盖行 / 0 位移条带。该语料为跳变滚动（大量重复帧为正常输入，见 found.md 教训 21）。`lowcontrast-2b`（`gen-lowcontrast.py` 生成，灰度差 2 级、随机段长 12–48px）守低对比度路径：基线 78 接受 / 0 no-match / 0 错位。
 - `docs/mechanism.md` → the end-to-end path from frozen capture to PNG on disk: the three coordinate spaces, the two render paths, the `L` handover, the `prepare_capture_clean` handshake, the tile store, preview mapping, and a table of where each invariant is enforced. Read this before changing the pipeline.
 - `docs/performance.md` → 性能基线与方法：测量工具用法、perf 复现命令、本轮五项缺陷的前后数据、剩余热点与 4K 结论。改拼接器性能前先读它。

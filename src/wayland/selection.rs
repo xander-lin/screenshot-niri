@@ -1087,15 +1087,26 @@ impl SelectionSession {
         self.state.stitch_warning
     }
 
-    pub fn update_long_capture_preview(&mut self, snapshot: LongPreviewSnapshot) -> Result<(), Box<dyn Error>> {
-        self.state.long_preview = Some(snapshot);
+    /// Replaces the live preview and returns the image it displaced.
+    ///
+    /// The returned `Image` is the caller's to recycle: `app` keeps its pixel
+    /// allocation and hands it back on the next frame, which is what makes the
+    /// 8.3 MB (1080p) preview buffer a one-time cost instead of a per-frame
+    /// allocation. Nothing in the session retains it — the overlay has already
+    /// been drawn from a copy in its own shm buffer — so returning it here is
+    /// the only way the allocation can outlive the snapshot it belonged to.
+    pub fn update_long_capture_preview(
+        &mut self,
+        snapshot: LongPreviewSnapshot,
+    ) -> Result<Option<Image>, Box<dyn Error>> {
+        let replaced = self.state.long_preview.replace(snapshot);
         // New preview content must repaint the overlay even when the selection
         // rectangle is unchanged; buffers recorded the previous seq.
         self.state.live_state_seq = self.state.live_state_seq.wrapping_add(1);
         queue_render(&mut self.state, true);
         self.event_queue.dispatch_pending(&mut self.state)?;
         self.conn.flush()?;
-        Ok(())
+        Ok(replaced.map(|snapshot| snapshot.image))
     }
 
     pub fn dispatch_poll(&mut self, timeout_ms: i32) -> Result<(), Box<dyn Error>> {
