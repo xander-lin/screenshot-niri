@@ -499,6 +499,45 @@ pub struct RawStitcher {
     consecutive_refusals: u32,
 }
 
+/// A converted frame plus the descriptor bins accumulated while converting it.
+///
+/// `active` is the view the matcher reads: the cropped frame when the fixed-band
+/// detector produced a real crop (trace-only), the whole frame otherwise. The
+/// bins only describe the whole-frame case — a real crop re-cuts the bins, so
+/// the engine falls back to reading the cropped frame.
+struct PreparedFrame {
+    compose: RgbFrame,
+    cropped: Option<RgbFrame>,
+    fused: Option<(BinLayout, Vec<f32>)>,
+}
+
+impl PreparedFrame {
+    fn active(&self) -> &RgbFrame {
+        self.cropped.as_ref().unwrap_or(&self.compose)
+    }
+
+    fn prebuilt(&self) -> Option<PrebuiltMeans<'_>> {
+        let (layout, means) = self.fused.as_ref()?;
+        Some(PrebuiltMeans {
+            along: self.compose.height,
+            layout: *layout,
+            means,
+        })
+    }
+
+    /// The converted frame, for storing as the next comparison baseline.
+    fn into_compose(self) -> RgbFrame {
+        self.compose
+    }
+}
+
+/// Where an accepted placement ended up after the pixels were written.
+struct AppliedPlacement {
+    rect: ViewportRect,
+    /// The match the caller reports: the engine's, or the dirty-edge recovery's.
+    match_info: FrameMatch,
+}
+
 impl RawStitcher {
     /// Whether anything in this build will read a `PerceptualFrame`.
     ///
@@ -780,14 +819,114 @@ impl RawStitcher {
         C: RgbSource + Sync,
         A: RgbSource,
     {
+        self.begin_frame();
+        validate_rgb_source(compose_frame)?;
+        validate_rgb_source(analysis_frame)?;
+        if self.stitched.is_none() {
+            return self.initialize_frame(compose_frame, analysis_frame);
+        }
+
+        let active_crop = self.active_crop.ok_or("missing active crop")?;
+        let previous_rect = self.viewport_rect.ok_or("missing viewport rect")?;
+        if self.duplicate_gate(compose_frame, analysis_frame, active_crop, previous_rect)? {
+            return Ok(PushResult::Duplicate);
+        }
+
+        let search_direction = direction.map(|direction| match direction {
+            LongDirection::Down => SearchDirection::Down,
+            LongDirection::Up => SearchDirection::Up,
+            LongDirection::Right => SearchDirection::Right,
+            LongDirection::Left => SearchDirection::Left,
+        });
+        let prepared = self.prepare_frame(compose_frame, active_crop)?;
+        let (decision, placed_axis) = self.choose_axis(
+            previous_rect,
+            prepared.active(),
+            search_direction,
+            prepared.prebuilt(),
+        );
+        let (candidate_rect, match_info) = match decision {
+            EngineDecision::Place { rect, match_info } => (rect, match_info),
+            EngineDecision::Reject { reason } => {
+                // No stale-edge recovery here on purpose.
+                //
+                // That path was written for the old matcher, whose failure
+                // mode was "found no candidate at all": it then searched the
+                // canvas for a row-prefix match and rewrote a dirty strip.
+                // The windowed-edge matcher's refusal is a *decision* — the
+                // runner-up was too close, or there was no evidence — and
+                // running a second, looser matcher on top of it silently undoes
+                // the gate. Measured on the 480-frame corpus: enabling it here
+                // turns 2 silently misplaced frames into 29, all of them on
+                // repeated content, because row-prefix similarity reports
+                // 70-250 "stable" rows at offsets hundreds of rows wrong.
+                //
+                // The dirty-edge case is still handled, from the accept path:
+                // `find_dirty_overlap_recovery` runs when the engine *did*
+                // produce a candidate and the canvas edge needs rewriting.
+                //
+                // The refused frame still owns a 6.2 MB (1080p) conversion
+                // buffer, and a refusal is not rare — `real-1` refuses 257 of
+                // 461 frames. Hand it back before dropping the frame, or every
+                // refusal pays a fresh allocation and a page fault per page.
+                if crate::trace::trace_verbose_enabled() {
+                    crate::trace_log!("stitch: engine refused reason={}", reason.as_str());
+                }
+                self.last_reject_reason = Some(reason);
+                self.recycle_compose_frame(prepared.into_compose());
+                return self.reject_frame(reason);
+            }
+        };
+
+        let horizontal = placed_axis == SearchAxis::Horizontal;
+        let Some(applied) = self.apply_placement(
+            previous_rect,
+            prepared.active(),
+            candidate_rect,
+            match_info,
+            horizontal,
+        )?
+        else {
+            // `try_apply_match` could not translate the placement onto the
+            // canvas. Today `translate_viewport_rect` only fails on overflow, so
+            // this is defensive; the frame is refused rather than written at a
+            // guessed position.
+            self.last_reject_reason = Some(RejectReason::NoCandidate);
+            self.recycle_compose_frame(prepared.into_compose());
+            return self.reject_frame(RejectReason::NoCandidate);
+        };
+
+        // The engine commit has already run (apply owns it); the compose frame
+        // is moved here last, because the active view may borrow it.
+        self.commit_accepted(
+            applied.rect,
+            prepared.into_compose(),
+            analysis_frame,
+            Some(StitchDecisionPath::CanvasAccepted),
+            None,
+            applied.match_info.direction,
+            applied.match_info.delta_x != 0 || applied.match_info.delta_y != 0,
+        );
+        Ok(PushResult::Accepted {
+            match_info: applied.match_info,
+        })
+    }
+
+    /// Clears the per-frame diagnostics that every push starts from.
+    fn begin_frame(&mut self) {
         self.last_duplicate_difference = None;
         self.last_duplicate_analysis_difference = None;
         self.last_duplicate_analysis_motion = None;
         self.last_fast_motion_trace = None;
         self.last_profile_breakdown = StitchProfileBreakdown::default();
-        let profile_enabled = cfg!(test) || crate::trace::trace_profile_enabled();
-        validate_rgb_source(compose_frame)?;
-        validate_rgb_source(analysis_frame)?;
+    }
+
+    /// The first frame of a session: it *is* the canvas.
+    fn initialize_frame<C: RgbSource, A: RgbSource>(
+        &mut self,
+        compose_frame: &C,
+        analysis_frame: &A,
+    ) -> Result<PushResult, Box<dyn Error>> {
         if self.stitched.is_none() {
             let fixed_bands = FixedBands::default();
             let active_crop = fixed_bands
@@ -821,10 +960,22 @@ impl RawStitcher {
             return Ok(PushResult::Initialized);
         }
 
-        let active_crop = self.active_crop.ok_or("missing active crop")?;
-        let active_compose = CroppedRgbSource::new(compose_frame, active_crop)?;
+        Ok(PushResult::Initialized)
+    }
 
-        let previous_rect = self.viewport_rect.ok_or("missing viewport rect")?;
+    /// The near-duplicate gate: has the content changed at all since the last
+    /// accepted frame?
+    ///
+    /// `true` means this frame is a duplicate and must not touch any state.
+    fn duplicate_gate<C: RgbSource, A: RgbSource>(
+        &mut self,
+        compose_frame: &C,
+        analysis_frame: &A,
+        active_crop: ComposeCrop,
+        previous_rect: ViewportRect,
+    ) -> Result<bool, Box<dyn Error>> {
+        let profile_enabled = cfg!(test) || crate::trace::trace_profile_enabled();
+        let active_compose = CroppedRgbSource::new(compose_frame, active_crop)?;
         // The near-duplicate check samples every fourth pixel in both axes, so
         // it does not need the previous viewport as a buffer: reading the canvas
         // through a view costs the samples and nothing else. Materialising the
@@ -867,16 +1018,20 @@ impl RawStitcher {
                 }
             }
             self.last_profile_breakdown.path = Some(StitchDecisionPath::Duplicate);
-            return Ok(PushResult::Duplicate);
+            return Ok(true);
         }
 
-        let search_direction = direction.map(|direction| match direction {
-            LongDirection::Down => SearchDirection::Down,
-            LongDirection::Up => SearchDirection::Up,
-            LongDirection::Right => SearchDirection::Right,
-            LongDirection::Left => SearchDirection::Left,
-        });
+        Ok(false)
+    }
 
+    /// Converts the frame and (when the crop is the whole frame) accumulates the
+    /// descriptor's bins in the same pass.
+    fn prepare_frame<C: RgbSource + Sync>(
+        &mut self,
+        compose_frame: &C,
+        active_crop: ComposeCrop,
+    ) -> Result<PreparedFrame, Box<dyn Error>> {
+        let profile_enabled = cfg!(test) || crate::trace::trace_profile_enabled();
         // Recycle the buffer of the frame we are about to replace. The stitcher
         // keeps exactly two frames alive, so this makes the pair of 6.2 MB
         // allocations cycle instead of being freed and re-faulted every push.
@@ -909,24 +1064,32 @@ impl RawStitcher {
             }
             None => (rgb_frame_from_source_reusing(compose_frame, recycled)?, None),
         };
-        let prebuilt_means = match (fused_layout, fused_means.as_deref()) {
-            (Some(layout), Some(means)) => Some(PrebuiltMeans {
-                along: compose_frame.height(),
-                layout,
-                means,
-            }),
-            _ => None,
-        };
         // The active crop is the whole frame in the shipped configuration (the
         // fixed-band detector is trace-only, so its top/bottom are zero), and
         // copying a whole 1080p frame to obtain an identical one cost 6.2 MB of
         // allocation per push. Crop only when the crop is not the whole frame.
         let cropped_compose = crop_rgb_frame_if_needed(&compose_frame, active_crop)?;
-        let active_compose_frame: &RgbFrame = cropped_compose.as_ref().unwrap_or(&compose_frame);
         if let Some(started_at) = prepare_started_at {
             self.last_profile_breakdown.frame_prepare += started_at.elapsed();
         }
 
+        Ok(PreparedFrame {
+            compose: compose_frame,
+            cropped: cropped_compose,
+            fused: fused_layout.zip(fused_means),
+        })
+    }
+
+    /// Asks the impulse axis for a placement, then the other axis once if the
+    /// first could not answer (or answered "nothing moved").
+    fn choose_axis(
+        &mut self,
+        previous_rect: ViewportRect,
+        active: &RgbFrame,
+        search_direction: Option<SearchDirection>,
+        prebuilt_means: Option<PrebuiltMeans<'_>>,
+    ) -> (EngineDecision, SearchAxis) {
+        let profile_enabled = cfg!(test) || crate::trace::trace_profile_enabled();
         // The impulse decides which axis is asked first.
         //
         // The capture is moving one way until it isn't, and the last accepted
@@ -945,7 +1108,7 @@ impl RawStitcher {
         let mut decision = self.place_on_axis(
             primary_axis,
             previous_rect,
-            &active_compose,
+            active,
             search_direction,
             true,
             prebuilt_means,
@@ -973,7 +1136,7 @@ impl RawStitcher {
             let attempt = self.place_on_axis(
                 primary_axis.other(),
                 previous_rect,
-                &active_compose,
+                active,
                 search_direction,
                 false,
                 prebuilt_means,
@@ -992,55 +1155,29 @@ impl RawStitcher {
         if let Some(started_at) = place_started_at {
             self.last_profile_breakdown.canvas_match += started_at.elapsed();
         }
-        let horizontal = placed_axis == SearchAxis::Horizontal;
+        (decision, placed_axis)
+    }
 
-        // A refusal is the end of the pipeline for this frame. The stale-edge
-        // recovery that rewrites a canvas edge (a refreshed footer, a
-        // late-loading image) is an *accept*-side path
-        // (`find_dirty_overlap_recovery`): it only runs when the matcher did
-        // produce a candidate, and it validates the overlap it writes.
-        let (candidate_rect, match_info) = match decision {
-            EngineDecision::Place { rect, match_info } => (rect, match_info),
-            EngineDecision::Reject { reason } => {
-                self.last_reject_reason = Some(reason);
-                if crate::trace::trace_verbose_enabled() {
-                    crate::trace_log!("stitch: engine refused reason={}", reason.as_str());
-                }
-                // No stale-edge recovery here on purpose.
-                //
-                // That path was written for the old matcher, whose failure
-                // mode was "found no candidate at all": it then searched the
-                // canvas for a row-prefix match and rewrote a dirty strip.
-                // The windowed edge matcher's refusal is a *decision* — the
-                // runner-up was too close, or there was no evidence — and
-                // running a second, looser matcher on top of it silently undoes
-                // the gate. Measured on the 480-frame corpus: enabling it here
-                // turns 2 silently misplaced frames into 29, all of them on
-                // repeated content, because row-prefix similarity reports
-                // 70-250 "stable" rows at offsets hundreds of rows wrong.
-                //
-                // The dirty-edge case is still handled, from the accept path:
-                // `find_dirty_overlap_recovery` runs when the engine *did*
-                // produce a candidate and the canvas edge needs rewriting.
-                //
-                // The refused frame still owns a 6.2 MB (1080p) conversion
-                // buffer, and a refusal is not rare — `real-1` refuses 257 of
-                // 461 frames. Hand it back before dropping the frame, or every
-                // refusal pays a fresh allocation and a page fault per page.
-                self.recycle_compose_frame(compose_frame);
-                return self.reject_frame(reason);
-            }
-        };
-
+    /// Writes the decided placement into the pixel canvas and commits it to the
+    /// engine. Returns `None` when the placement cannot be applied.
+    fn apply_placement(
+        &mut self,
+        previous_rect: ViewportRect,
+        active: &RgbFrame,
+        candidate_rect: ViewportRect,
+        match_info: FrameMatch,
+        horizontal: bool,
+    ) -> Result<Option<AppliedPlacement>, Box<dyn Error>> {
+        let profile_enabled = cfg!(test) || crate::trace::trace_profile_enabled();
         if let Some(recovery) =
-            self.find_dirty_overlap_recovery(previous_rect, active_compose_frame, match_info)
+            self.find_dirty_overlap_recovery(previous_rect, active, match_info)
         {
             let append_started_at = profile_enabled.then(Instant::now);
             let stitched = self.stitched.as_mut().ok_or("missing stitched frame")?;
             let new_rect = append_frame_at_position_overwriting_overlap_rows(
                 stitched,
                 previous_rect,
-                active_compose_frame,
+                active,
                 recovery.match_info,
                 recovery.overwrite_frame_y,
                 recovery.overwrite_rows,
@@ -1048,73 +1185,44 @@ impl RawStitcher {
             if let Some(started_at) = append_started_at {
                 self.last_profile_breakdown.append_frame += started_at.elapsed();
             }
-            // The engine commit runs first: `active_compose_frame` may borrow
-            // `compose_frame`, which `commit_accepted` takes ownership of.
             self.last_engine_top = Some(candidate_rect.y);
             self.canvas_origin = candidate_rect.y - new_rect.y;
-            self.engine
-                .commit(new_rect, candidate_rect.y, active_compose_frame);
-            self.commit_accepted(
-                new_rect,
-                compose_frame,
-                analysis_frame,
-                Some(StitchDecisionPath::CanvasAccepted),
-                None,
-                recovery.match_info.direction,
-                recovery.match_info.delta_x != 0 || recovery.match_info.delta_y != 0,
-            );
-            return Ok(PushResult::Accepted {
+            self.engine.commit(new_rect, candidate_rect.y, active);
+            return Ok(Some(AppliedPlacement {
+                rect: new_rect,
                 match_info: recovery.match_info,
-            });
+            }));
         }
 
-        if self.try_apply_match(
-            previous_rect,
-            active_compose_frame,
+        if !self.try_apply_match(previous_rect, active, match_info, profile_enabled)? {
+            return Ok(None);
+        }
+        let applied = self.viewport_rect.ok_or("missing viewport rect after apply")?;
+        if horizontal {
+            // The engine's canvas is one column of rows: every row's descriptor
+            // was built from whichever column happened to capture it first, and
+            // the engine has no x dimension to tell the columns apart. A
+            // horizontal scroll changes the column, so those rows are no longer
+            // comparable — keeping them would make the next vertical step read
+            // the new column against the old one and refuse. Re-seed from the
+            // frame the horizontal matcher just verified against the pixel
+            // canvas.
+            self.engine.reset();
+            // `applied` is a canvas row; the engine's rows are page rows, which
+            // the current origin maps onto it. Setting the origin to zero here
+            // was only correct while the canvas had never grown upward.
+            let engine_top = applied.y + self.canvas_origin;
+            self.last_engine_top = Some(engine_top);
+            self.engine.commit(applied, engine_top, active);
+        } else {
+            self.last_engine_top = Some(candidate_rect.y);
+            self.canvas_origin = candidate_rect.y - applied.y;
+            self.engine.commit(applied, candidate_rect.y, active);
+        }
+        Ok(Some(AppliedPlacement {
+            rect: applied,
             match_info,
-            profile_enabled,
-        )? {
-            let applied = self.viewport_rect.ok_or("missing viewport rect after apply")?;
-            if horizontal {
-                // The engine's canvas is one column of rows: every row's
-                // descriptor was built from whichever column happened to
-                // capture it first, and the engine has no x dimension to tell
-                // the columns apart. A horizontal scroll changes the column, so
-                // those rows are no longer comparable — keeping them would make
-                // the next vertical step read the new column against the old
-                // one and refuse. Re-seed from the frame the horizontal matcher
-                // just verified against the pixel canvas.
-                self.engine.reset();
-                // `applied` is a canvas row; the engine's rows are page rows,
-                // which the current origin maps onto it. Setting the origin to
-                // zero here was only correct while the canvas had never grown
-                // upward.
-                let engine_top = applied.y + self.canvas_origin;
-                self.last_engine_top = Some(engine_top);
-                self.engine.commit(applied, engine_top, active_compose_frame);
-            } else {
-                self.last_engine_top = Some(candidate_rect.y);
-                self.canvas_origin = candidate_rect.y - applied.y;
-                self.engine
-                    .commit(applied, candidate_rect.y, active_compose_frame);
-            }
-            // After the engine commit: `active_compose_frame` may borrow
-            // `compose_frame`, which `commit_accepted` takes ownership of.
-            self.commit_accepted(
-                applied,
-                compose_frame,
-                analysis_frame,
-                Some(StitchDecisionPath::CanvasAccepted),
-                None,
-                match_info.direction,
-                match_info.delta_x != 0 || match_info.delta_y != 0,
-            );
-            return Ok(PushResult::Accepted { match_info });
-        }
-
-        self.last_reject_reason = Some(RejectReason::NoCandidate);
-        self.recycle_compose_frame(compose_frame);
-        self.reject_frame(RejectReason::NoCandidate)
+        }))
     }
 
     /// Refuses the frame without touching any accepted state.

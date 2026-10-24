@@ -105,17 +105,21 @@ push_frame_with_offset(compose, analysis, direction, offset)
 ### 3.1 `push_frame_sources`
 
 ```
-1. 清空本帧诊断（duplicate difference、profile、reject reason …）
-2. stitched 为空？
-   └─ 是 → 第一帧：转换 → from_first_frame → engine.reset + commit(0) → Initialized
-3. 重复判定（§3.2）
-   └─ 重复 → Duplicate（唯一一个不碰任何状态的出口）
-4. 转换 + 描述子（§3.3）
-5. 选轴（§3.4）→ place_on_axis(primary) → 可能再问另一轴
-6. 决策
-   ├─ Reject → 归还缓冲 → reject_frame（§9）→ Pending / NoMatch
-   └─ Place  → 落盘树（§6）
+push_frame_sources（编排，约 100 行）
+├─ begin_frame()                       清空本帧诊断
+├─ initialize_frame()                  stitched 为空 → 第一帧即画布 → Initialized
+├─ duplicate_gate()                    §3.2 → 是则 Duplicate（唯一不碰状态的出口）
+├─ prepare_frame()                     §3.3 → PreparedFrame { compose, cropped, fused }
+├─ choose_axis()                       §3.4 → (EngineDecision, SearchAxis)
+├─ Reject → 归还缓冲 → reject_frame()  §9 → Pending / NoMatch
+└─ Place  → apply_placement()          像素 + engine.commit → AppliedPlacement
+             └─ commit_accepted()      描述子已提交，这里推进编排层状态
 ```
+
+`push_frame_sources` 只负责"顺序"，每个阶段是独立函数：
+`begin_frame`（7 行）/ `initialize_frame`（30）/ `duplicate_gate`（59）/
+`prepare_frame`（56）/ `choose_axis`（78）/ `apply_placement`（65）。
+`apply_placement` 返回 `None` 表示落点无法映射到画布（今天只有溢出会走到，防御性拒绝）。
 
 ### 3.2 重复判定
 
@@ -431,13 +435,13 @@ place_horizontally(stitched, previous_rect, frame, direction)
 1. **注释漂移**（本轮已修 4 处）：`pending_ladder` 的文档里混进了一段 `consecutive_refusals` 的说明；"Stage 4" 有一段自相矛盾的重复；`far_placement_supported` 还在用旧的 `used == scoring_rows` 说法；拒绝路径注释还写着"下面的 stale-edge recovery"（那段已删）。根因是"设计变更只改代码"。建议：闸门注释里不写具体数字，数字只进常量表。
 2. **一个长函数**：`push_frame_sources` 约 550 行、6 个出口（初始化 / 重复 / 两个接受 / 两个拒绝）；`place` 反而是 160 行的五段式。树是清楚的，但它是**读出来的**，不是**看出来的**——`push_frame_sources` 里的"重复→转换→选轴→落盘"本可以是四行调用。建议按阶段抽函数：`duplicate_gate` / `prepare_frame` / `choose_axis` / `apply_placement`，让 `push_frame_sources` 只剩一棵 30 行的树。
 3. **隐式不变量**：`pending_top` 只写不读；`last_engine_top`/`canvas_origin` 主要给诊断与几何编辑；`previous_perceptual_*` 只服务 legacy。本文 §2 的字段表补上了这层说明，但代码里没有单一出处。
-4. **轴决策分居两处**：引擎会返回零位移的 `Place`，调用方再决定"要不要问另一轴"；规则靠两处注释 + 一个测试维系。建议收进 `choose_axis`，让"零位移不是答案"只出现一次。
-5. **recovery 的命名**：`find_dirty_overlap_recovery` 是活的脏边修复（在 `Place` 之后）；它曾经与死掉的 `find_nomatch_recovery` 成对，名字高度相似、行为完全不同。删除之后这一点已经缓解，但"recovery"仍值得在函数名里带出"dirty edge"。
-6. **命名四件套**：`place`（决策）/ `accept`（决策封装）/ `apply`（像素落盘）/ `commit`（描述子落盘）。没有对照表时，新人很容易把 `commit` 当成"写像素"（§0 的表就是为此写的）。
+3. **轴决策分居两处**：引擎会返回零位移的 `Place`，调用方再决定"要不要问另一轴"；规则靠两处注释 + 一个测试维系。建议收进 `choose_axis`，让"零位移不是答案"只出现一次。
+4. **recovery 的命名**：`find_dirty_overlap_recovery` 是活的脏边修复（在 `Place` 之后）；它曾经与死掉的 `find_nomatch_recovery` 成对，名字高度相似、行为完全不同。删除之后这一点已经缓解，但"recovery"仍值得在函数名里带出"dirty edge"。
+5. **命名四件套**：`place`（决策）/ `accept`（决策封装）/ `apply`（像素落盘）/ `commit`（描述子落盘）。没有对照表时，新人很容易把 `commit` 当成"写像素"（§0 的表就是为此写的）。
 
 ### 结论
 
-**主干是清晰的，边缘不清晰**：四段搜索 + 一套闸门的骨架稳定、有数据支撑；不清晰集中在三处——注释与结构漂移、长函数把树"藏起来"、以及"一帧的五个动词"没有统一术语。死分支已在写这份文档时删除；剩下两处靠这份文档 + 抽函数解决。
+**主干是清晰的，边缘也在收敛**：四段搜索 + 一套闸门的骨架稳定、有数据支撑。写这份文档时的两处硬伤——死分支、550 行的编排函数——已经处理（删死代码、按阶段拆成 6 个函数）。剩下的都是软性债务：注释漂移的机制、隐式不变量没有单一出处、以及"一帧的五个动词"需要术语表（§0）。
 
 ---
 
