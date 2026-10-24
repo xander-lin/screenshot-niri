@@ -95,6 +95,16 @@ const EDGE_MIN_SECOND_OVER_BEST: f64 = 1.5;
 /// texture measures 82.2. The threshold sits between them with margin on both
 /// sides.
 const EDGE_MAX_COLOUR_DIFFERENCE: f64 = 30.0;
+/// Mean pixel difference a thin placement must stay inside.
+///
+/// Thin evidence — one or two readable boundary rows — cannot be corroborated
+/// by structure, so the pixels have to agree across the whole overlap. This is
+/// a noise budget, not a content judgement: identical frames measure 0.0, a
+/// blinking cursor in a 240-row overlap stays under 0.5, and a global +10
+/// brightness shift measures 7-10 (`real-3`). `real-2`'s four repeated-line
+/// candidates measured 1.8-7.1 and are refused, which is why the bound sits
+/// below them rather than at the acceptance ceiling.
+const EDGE_THIN_MAX_COLOUR_DIFFERENCE: f64 = 1.0;
 /// Margin at which a high absolute cost is forgiven: the winner is this many
 /// times better than the runner-up, so the match is unmistakable even on
 /// imperfect content.
@@ -611,6 +621,22 @@ impl EdgeCanvas {
     /// preconditions, not quality judgements — a sparse page that still has a
     /// handful of boundaries scores normally.
     fn cost_at(&self, ladder: &EdgeLadder, top: i32, min_overlap: u32) -> Option<Score> {
+        self.cost_at_with_floor(ladder, top, min_overlap, EDGE_MIN_COMPARABLE_ROWS)
+    }
+
+    /// [`cost_at`](Self::cost_at) with the boundary-row floor spelled out.
+    ///
+    /// The floor is [`EDGE_MIN_COMPARABLE_ROWS`] everywhere a decision can
+    /// afford it. The one caller that passes `1` is the thin-continuation
+    /// escape, which accepts a single-row answer only when it is perfect and
+    /// strictly unique, so the floor is not the safety mechanism there.
+    fn cost_at_with_floor(
+        &self,
+        ladder: &EdgeLadder,
+        top: i32,
+        min_overlap: u32,
+        floor: u32,
+    ) -> Option<Score> {
         if ladder.bins != self.bins {
             return None;
         }
@@ -648,7 +674,7 @@ impl EdgeCanvas {
         // unambiguous that row is; a dense frame that merely overlaps the canvas
         // by a sliver still has to show three of its many rows, which is what
         // refuses jump frames whose only comparable row happens to line up.
-        let required = EDGE_MIN_COMPARABLE_ROWS.min(ladder.scoring_rows.len() as u32);
+        let required = floor.min(ladder.scoring_rows.len() as u32);
         if used < required || denominator == 0 {
             return None;
         }
@@ -1495,16 +1521,33 @@ impl WindowedEdgeMatcher {
             return false;
         }
         // A far answer must at least be verifiable in pixels.
+        if self.colour_cost_at(request, top).is_none() {
+            return false;
+        }
+        self.pixels_refute_runner_up(request, top, runner_up)
+    }
+
+    /// Whether the pixels refute `runner_up` as an alternative to `top`.
+    ///
+    /// The alternative must sit nearer the "different content" side of the
+    /// colour ceiling than the winner does. A blank patch is not refuted by
+    /// noise around 0 (`real-2`: 0.0 vs 0.5), while a genuinely repeated
+    /// structure on real content is (`real-1`/`real-2` rivals score in the
+    /// tens). Measured on the shrunk-box scroll-back: winner 0.0 against rivals
+    /// 25–44 — accept; blank aliases sit within a pixel of the winner — refuse.
+    ///
+    /// `None` as the alternative means the window held one answer only; there
+    /// is nothing to refute. A rival with no overlapping canvas rows cannot be
+    /// compared, so it cannot be refuted either — that case refuses.
+    fn pixels_refute_runner_up(
+        &self,
+        request: &PlacementRequest<'_>,
+        top: i32,
+        runner_up: Option<(i32, f64)>,
+    ) -> bool {
         let Some(winner) = self.colour_cost_at(request, top) else {
             return false;
         };
-        // Pixel refutation of the runner-up: it must sit nearer the "different
-        // content" side of the colour ceiling than the winner does. A blank
-        // patch is not refuted by noise around 0 (`real-2`: 0.0 vs 0.5), while
-        // a genuinely repeated structure on real content is (`real-1`/`real-2`
-        // rivals score in the tens). Measured on the shrunk-box scroll-back:
-        // winner 0.0 against rivals 25–44 — accept; blank aliases sit within a
-        // pixel of the winner — refuse.
         let midpoint = (winner + EDGE_MAX_COLOUR_DIFFERENCE) * 0.5;
         match runner_up {
             None => true,
@@ -1513,6 +1556,84 @@ impl WindowedEdgeMatcher {
                 None => false,
             },
         }
+    }
+
+    /// Places a frame whose overlap carries fewer boundary rows than the
+    /// evidence floor.
+    ///
+    /// A nearly blank page — a terminal with one line of text, a document whose
+    /// only feature is the edge of a panel — gives the canvas one or two
+    /// readable rows when the frame also brings new content on its leading
+    /// edge. The floor cannot simply be lowered: on `real-1` a floor of 1 was
+    /// measured to reintroduce misplaced jump frames, because one lucky row is
+    /// not evidence by itself.
+    ///
+    /// What thin evidence cannot afford is a *guess*, so this escape demands a
+    /// fact: the winner must be exactly perfect (every bin of every readable
+    /// row agrees, cost 0) and strictly unique (the best answer outside its
+    /// basin disagrees). With a perfect winner the ratio is infinite by
+    /// definition, so the *existence* of structural disagreement is the whole
+    /// signal; a second perfect answer means the content cannot tell two
+    /// offsets apart and is refused. Measured on `real-3` (a terminal page
+    /// whose overlap holds one band edge): 1 row, cost 0.0000, runner-up 0.5,
+    /// winner colour 0.0 — the floor refused it and the canvas stopped growing
+    /// for the rest of the capture. A blank tie (cost 0.0000 against a rival at
+    /// 0.0000) still refuses.
+    fn thin_continuation(
+        &self,
+        ladder: &EdgeLadder,
+        request: &PlacementRequest<'_>,
+        predicted_top: i32,
+        reach: i32,
+    ) -> Option<(i32, f64)> {
+        let canvas = self.canvas.as_ref()?;
+        let (bounds_lo, bounds_hi) = self.canvas_bounds(ladder)?;
+        let lo = (predicted_top - reach).max(bounds_lo);
+        let hi = (predicted_top + reach).min(bounds_hi);
+        if lo > hi {
+            return None;
+        }
+        let min_overlap = minimum_overlap(ladder.rows(), ladder.rows()).max(1);
+        let mut costs: Vec<(f64, i32, u32)> = Vec::new();
+        for top in lo..=hi {
+            if let Some(score) = canvas.cost_at_with_floor(ladder, top, min_overlap, 1) {
+                costs.push((score.cost, top, score.used));
+            }
+        }
+        if costs.len() < 4 {
+            return None;
+        }
+        // Cost first, then continuity: with thin evidence a repeated page can
+        // offer several perfect offsets and only the expected step can tell
+        // them apart.
+        costs.sort_by(|a, b| {
+            a.0.total_cmp(&b.0)
+                .then_with(|| (a.1 - predicted_top).abs().cmp(&(b.1 - predicted_top).abs()))
+        });
+        let (best_cost, best_top, _) = costs[0];
+        // A fact, not a fit.
+        if best_cost > 0.0 {
+            return None;
+        }
+        let basin = self.basin_rows();
+        let second = costs
+            .iter()
+            .find(|(_, top, _)| (top - best_top).abs() > basin)
+            .map(|&(cost, top, _)| (top, cost));
+        if second.is_some_and(|(_, cost)| cost <= 0.0) {
+            return None;
+        }
+        // The pixels have to corroborate the placement *exactly*. One
+        // structural row can be a repeated row — a terminal repeats its lines
+        // every line height, and `real-2` measured four thin winners whose
+        // runner-up sat only 0.10-0.22 away while the pixels differed by
+        // 1.8-7.1. Where the overlap is genuinely unmoved, the pixels agree to
+        // noise; that is the corroboration thin structure cannot give.
+        match self.colour_cost_at(request, best_top) {
+            Some(colour) if colour <= EDGE_THIN_MAX_COLOUR_DIFFERENCE => {}
+            _ => return None,
+        }
+        Some((best_top, best_cost))
     }
 
     fn impulse_half_width(&self) -> i32 {
@@ -1747,7 +1868,20 @@ impl PlacementEngine for WindowedEdgeMatcher {
             }
         }
 
-        // Stage 4 — the frame overlaps the canvas, but nothing in it matches
+        // Stage 4 — thin continuation: the frame is the next step of the
+        // capture, but the overlap holds fewer boundary rows than the evidence
+        // floor (a nearly blank page). A perfect, pixel-exact, strictly unique
+        // answer near the predicted step is still an answer; see
+        // `thin_continuation`.
+        if impulse_reach > 0 {
+            if let Some((top, cost)) =
+                self.thin_continuation(&ladder, request, predicted_top, impulse_reach)
+            {
+                return self.accept(request, ladder, top, cost);
+            }
+        }
+
+        // Stage 5 — the frame overlaps the canvas, but nothing in it matches
         // anywhere the evidence allows. Nothing moves; the caller waits for the
         // next frame.
         EngineDecision::Reject { reason: RejectReason::NoCandidate }
@@ -3157,6 +3291,124 @@ mod tests {
             scoring,
             Some((0, 0.0))
         ));
+    }
+
+    /// A page with almost no structure: flat gray, one black band and one
+    /// bright rule standing in for a line of text.
+    fn sparse_page_frame(top: i32, height: u32, band: (i32, i32), rule: i32) -> RgbFrame {
+        let stride = W * 3;
+        let mut data = Vec::with_capacity(stride as usize * height as usize);
+        for row in top..top + height as i32 {
+            let gray = if row >= band.0 && row < band.1 {
+                0
+            } else if row >= rule && row < rule + 6 {
+                200
+            } else {
+                90
+            };
+            for _ in 0..W {
+                data.extend_from_slice(&[gray, gray, gray]);
+            }
+        }
+        RgbFrame { width: W, height, stride, data }
+    }
+
+    /// The engine a thin-overlap case starts from: one committed frame plus a
+    /// 60-row step already established, so the prediction points at the real
+    /// row of the frame under test.
+    fn thin_setup<'a>(
+        first: &'a RgbFrame,
+        frame: &'a RgbFrame,
+        rect: ViewportRect,
+        previous_step: i32,
+    ) -> (WindowedEdgeMatcher, PlacementRequest<'a>) {
+        let mut engine = WindowedEdgeMatcher::new(SearchAxis::Vertical);
+        engine.commit(rect, 0, first);
+        engine.last_delta = Some(previous_step);
+        engine.trend = 0.0;
+        let committed: Vec<(i32, &RgbFrame)> = vec![(0, first)];
+        (engine, request_on_canvas(frame, rect, &committed))
+    }
+
+    /// A page whose overlap holds one boundary row can still be placed — but
+    /// only when the structure is perfect, the pixels agree across the whole
+    /// overlap, and the step matches the prediction.
+    ///
+    /// `real-3` is this shape: a terminal with one band edge in the overlap and
+    /// the new content (a text line) on the frame's leading edge, so the
+    /// evidence floor saw one readable row and refused every frame of the
+    /// capture. The same thin evidence is exactly what a repeated page looks
+    /// like at a wrong offset, so each corroboration is asserted separately.
+    #[test]
+    fn a_thin_overlap_is_placed_only_when_the_pixels_confirm_it() {
+        let height = 120;
+        let rect = ViewportRect { x: 0, y: 0, width: W, height };
+        // Page: gray, black band 140..200, a bright rule at 230. The first
+        // frame holds page 100..220, so the band's bottom edge is canvas row
+        // 100; the second frame holds page 160..280, whose overlap (its first
+        // 60 rows) contains that single edge, while the rule is new content.
+        let first = sparse_page_frame(100, height, (140, 200), 230);
+        let second = sparse_page_frame(160, height, (140, 200), 230);
+
+        let (mut engine, req) = thin_setup(&first, &second, rect, 60);
+        match engine.place(&req) {
+            EngineDecision::Place { rect: placed, match_info } => {
+                assert_eq!(placed.y, 60, "the one readable row pins the offset");
+                assert_eq!(match_info.delta_y, 60);
+            }
+            other => panic!("a pixel-confirmed thin step must be placed: {other:?}"),
+        }
+
+        // Brightness is content, not noise: a global +10 shift leaves the
+        // structure perfect and is refused, because the pixels over the overlap
+        // no longer corroborate it. This is `real-2`'s repeated-line signature
+        // (thin winners whose pixels differed by 1.8-7.1).
+        let mut brighter = second.clone();
+        for byte in &mut brighter.data {
+            *byte = byte.saturating_add(10);
+        }
+        let (mut engine, req) = thin_setup(&first, &brighter, rect, 60);
+        assert!(
+            matches!(engine.place(&req), EngineDecision::Reject { .. }),
+            "a thin match the pixels do not confirm must be refused"
+        );
+
+        // The expected step is part of the evidence: with nothing moving last
+        // time the prediction does not reach 60 rows, and thin structure cannot
+        // justify the leap on its own.
+        let (mut engine, req) = thin_setup(&first, &second, rect, 0);
+        assert!(
+            matches!(engine.place(&req), EngineDecision::Reject { .. }),
+            "thin evidence without a step to corroborate it must be refused"
+        );
+
+        // Two identical edges a step apart: the descriptor keeps |dL/dy| and
+        // nothing else, so the band edge the overlap can read matches just as
+        // well one step up, where the canvas has the other band's edge. Thin
+        // evidence cannot choose between them, so the frame is refused instead
+        // of written at whichever came first.
+        let two_band_page = |top: i32| {
+            let stride = W * 3;
+            let mut data = Vec::with_capacity(stride as usize * height as usize);
+            for row in top..top + height as i32 {
+                let gray = if (140..200).contains(&row) || (260..320).contains(&row) {
+                    0
+                } else {
+                    90
+                };
+                for _ in 0..W {
+                    data.extend_from_slice(&[gray, gray, gray]);
+                }
+            }
+            RgbFrame { width: W, height, stride, data }
+        };
+        let first = two_band_page(100);
+        let second = two_band_page(160);
+        let (mut engine, req) = thin_setup(&first, &second, rect, 60);
+        assert!(
+            matches!(engine.place(&req), EngineDecision::Reject { .. }),
+            "two indistinguishable edges a step apart are ambiguous"
+        );
     }
 
     /// Both directions are ordinary. A capture that scrolls back up must be
