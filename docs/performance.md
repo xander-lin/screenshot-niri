@@ -337,6 +337,28 @@ budget is one constant to lower if a machine needs the memory back. The old
 figure was not "packing works"; it was "packing ran more often than the capture
 read the same tiles".
 
+## 2026-10-24, sixth pass: the preview draw on four helpers
+
+`stitch-bench` measures the canvas→window conversion, not the overlay draw that
+happens afterwards. An in-module probe (run once, then removed; the test that
+remains compares pixels, not time) rendered a 3840x2160 overlay with a
+2000x1200 box:
+
+| mapping | serial | four helpers |
+|---|---|---|
+| 1:1 (capture density == buffer density, the normal case) | 6.29 ms | 2.40 ms |
+| scaled (per-column source lookup) | 4.27 ms | 1.90 ms |
+
+The draw is a pure write into the overlay buffer from a read-only snapshot, so
+destination rows are independent: `draw_preview_on_overlay_with_threads` splits
+`footprint.y..bottom()` into bands, each with its own `&mut [u8]` slice starting
+at its first row. `split_preview_draw_matches_the_serial_pixels` renders the
+same inputs serially and four-ways and asserts byte equality across the 1:1 and
+scaled mappings, an opaque and a ragged snapshot, and holes covering whole rows
+or part of one. The auto count needs 500 k footprint pixels (small overlays stay
+serial), and a hole covering the whole footprint returns before deciding
+threads — the full-screen-box redraw paints nothing and must not pay a fan-out.
+
 ## What remains
 
 * **The descriptor's arithmetic — 26% at 1080p.** Fused into the conversion row

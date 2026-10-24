@@ -2780,6 +2780,47 @@ fn draw_preview_on_overlay(
     output_logical: LogicalRect,
     selection_local: Option<LogicalRect>,
 ) {
+    draw_preview_on_overlay_with_threads(
+        data,
+        overlay_w,
+        overlay_h,
+        preview,
+        output_logical,
+        selection_local,
+        // 0 = decide from the footprint once it is known.
+        0,
+    );
+}
+
+/// Helpers a preview draw may use.
+///
+/// The draw is a pure write into the overlay buffer from a read-only snapshot:
+/// each destination row is independent, so splitting rows cannot change a
+/// pixel. Four is enough to take a 4K draw out of the single-core boost range;
+/// more would only spread the same memory traffic over more cores.
+fn preview_worker_count(overlay_w: i32, overlay_h: i32) -> usize {
+    const PREVIEW_MIN_PIXELS_PER_THREAD: u64 = 500_000;
+    let pixels = u64::from(overlay_w.max(0) as u32) * u64::from(overlay_h.max(0) as u32);
+    if pixels < PREVIEW_MIN_PIXELS_PER_THREAD {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(4)
+}
+
+/// [`draw_preview_on_overlay`] with an explicit helper count, so a test can
+/// compare the split draw against the serial one pixel for pixel.
+fn draw_preview_on_overlay_with_threads(
+    data: &mut [u8],
+    overlay_w: i32,
+    overlay_h: i32,
+    preview: &LongPreviewSnapshot,
+    output_logical: LogicalRect,
+    selection_local: Option<LogicalRect>,
+    threads: usize,
+) {
     let Some(map) = PreviewMap::new(preview, output_logical, overlay_w, overlay_h) else {
         return;
     };
@@ -2819,8 +2860,79 @@ fn draw_preview_on_overlay(
     let hole_hides_row = hole_x0 == 0 && hole_x1 >= overlay_w;
     let hole_y1 = hole.y.saturating_add(hole.height);
     let cols = footprint.x..footprint.right();
+    let rows = footprint.y..footprint.bottom();
+    // A hole that covers the whole footprint leaves nothing for the preview to
+    // paint: skip before deciding threads, so a full-width box does not pay a
+    // fan-out for a draw that writes no pixel.
+    if hole_hides_row && hole.y <= rows.start && hole_y1 >= rows.end {
+        return;
+    }
+    let threads = if threads == 0 {
+        preview_worker_count(footprint.width, footprint.height)
+    } else {
+        threads
+    }
+    .max(1)
+    .min(rows.len().max(1));
+    if threads <= 1 || rows.len() < 32 {
+        draw_preview_rows(
+            data, 0, buf_stride, &map, preview, img_data, img_stride, cols.clone(), hole,
+            hole_x0, hole_x1, hole_hides_row, hole_y1, one_to_one, &columns, rows,
+        );
+        return;
+    }
+    let rows_per_thread = rows.len().div_ceil(threads) as i32;
+    // The split starts at the first row the draw may touch: rows above the
+    // footprint belong to the base and must not be handed to a helper.
+    let Some(mut rest) = data.get_mut(rows.start as usize * buf_stride..) else {
+        return;
+    };
+    std::thread::scope(|scope| {
+        let mut first = rows.start;
+        while first < rows.end {
+            let last = (first + rows_per_thread).min(rows.end);
+            let bytes = (last - first) as usize * buf_stride;
+            if bytes > rest.len() {
+                break;
+            }
+            let (chunk, remainder) = rest.split_at_mut(bytes);
+            rest = remainder;
+            let range = first..last;
+            let map = &map;
+            let columns = &columns;
+            let cols = cols.clone();
+            scope.spawn(move || {
+                draw_preview_rows(
+                    chunk, first, buf_stride, map, preview, img_data, img_stride, cols, hole,
+                    hole_x0, hole_x1, hole_hides_row, hole_y1, one_to_one, columns, range,
+                );
+            });
+            first = last;
+        }
+    });
+}
 
-    for by in footprint.y..footprint.bottom() {
+/// One row range of the preview draw, into `data` starting at `row_base`.
+#[allow(clippy::too_many_arguments)]
+fn draw_preview_rows(
+    data: &mut [u8],
+    row_base: i32,
+    buf_stride: usize,
+    map: &PreviewMap,
+    preview: &LongPreviewSnapshot,
+    img_data: &[u8],
+    img_stride: usize,
+    cols: std::ops::Range<i32>,
+    hole: LogicalRect,
+    hole_x0: i32,
+    hole_x1: i32,
+    hole_hides_row: bool,
+    hole_y1: i32,
+    one_to_one: bool,
+    columns: &[Option<usize>],
+    rows: std::ops::Range<i32>,
+) {
+    for by in rows {
         let sy = map.canvas_y(by);
         if sy < 0 || sy >= map.image_h {
             continue;
@@ -2830,7 +2942,7 @@ fn draw_preview_on_overlay(
             continue;
         }
         let src_row = sy as usize * img_stride;
-        let dst_row = by as usize * buf_stride;
+        let dst_row = (by - row_base) as usize * buf_stride;
         // The visible runs of this row: the whole footprint, or the two sides
         // of the hole when the hole touches it.
         let segments: [(i32, i32); 2] = if in_hole_row {
@@ -4351,6 +4463,39 @@ mod tests {
         assert_eq!(pixel(&normal, 10, 10), preview_color);
         assert_eq!(pixel(&debug, 10, 10), preview_color);
         assert_eq!(pixel(&debug, 50, 29), OVERLAY_DEBUG_BORDER_BGRA);
+    }
+
+    /// The preview draw splits its rows across helpers; a split row range must
+    /// produce exactly the serial pixels, for the contiguous (1:1) and scaled
+    /// mappings, with an opaque and a ragged snapshot, and with a hole that
+    /// covers whole rows and one that only crosses part of a row.
+    #[test]
+    fn split_preview_draw_matches_the_serial_pixels() {
+        let width = 1200u32;
+        let height = 800u32;
+        let output = LogicalRect { x: 0, y: 0, width: 800, height: 600 };
+        for (capture, viewport, selection, opaque) in [
+            (LogicalRect { x: 0, y: 0, width: 1200, height: 800 }, LogicalRect { x: 0, y: 0, width: 1200, height: 800 }, LogicalRect { x: 0, y: 0, width: 1200, height: 800 }, true),
+            (LogicalRect { x: 0, y: 0, width: 1200, height: 800 }, LogicalRect { x: 0, y: 0, width: 1200, height: 800 }, LogicalRect { x: 100, y: 50, width: 700, height: 500 }, true),
+            (LogicalRect { x: 0, y: 0, width: 900, height: 600 }, LogicalRect { x: 0, y: 0, width: 900, height: 600 }, LogicalRect { x: 50, y: 40, width: 800, height: 700 }, false),
+            (LogicalRect { x: 0, y: 0, width: 800, height: 600 }, LogicalRect { x: 10, y: 20, width: 700, height: 500 }, LogicalRect { x: 30, y: 40, width: 600, height: 400 }, true),
+        ] {
+            let preview = LongPreviewSnapshot {
+                image: solid_image(width, height, &[(0, height, [30, 60, 90, 255])]),
+                opaque,
+                current_origin_x: 0,
+                current_origin_y: 0,
+                viewport_rect: viewport,
+                capture_width: capture.width as u32,
+                capture_height: capture.height as u32,
+            };
+            let _ = selection;
+            let mut serial = vec![0u8; (width as usize) * (height as usize) * 4];
+            let mut split = serial.clone();
+            draw_preview_on_overlay_with_threads(&mut serial, width as i32, height as i32, &preview, output, Some(selection), 1);
+            draw_preview_on_overlay_with_threads(&mut split, width as i32, height as i32, &preview, output, Some(selection), 4);
+            assert_eq!(serial, split, "capture {:?} viewport {:?} selection {:?} opaque {opaque}", capture, viewport, selection);
+        }
     }
 
     #[test]

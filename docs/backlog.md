@@ -25,30 +25,21 @@ with the commit or measurement that closed them.
   content-keyed truth caches (`--refresh`), `stitch-bench --dir` now uses the
   manifest's offsets/direction.
 
-## P0 — worth doing next
+## Remaining after the preview-draw pass
 
-### 1. Preview path: the last single-threaded per-frame pass
+### 1. Canvas window → preview image (still single-threaded)
 
-Measured (`stitch-bench`, synthetic 3840x2160): `preview` 2.9 ms of a 9 ms
-UI-thread frame, on top of push 6.0 ms. On `real-5-4k` it is 0.39 ms. Two
-separate costs, only one is `image_from_stitched_window_reusing`:
+`image_from_stitched_window_reusing` (row loop calling `store.with_row`, then
+`expand_row`) costs 2.9 ms at 3840x2160 in `stitch-bench` and 0.39 ms on
+`real-5-4k`. Its blocker is `CanvasStore`'s `RefCell`: every read mutates the
+working set through `touch_tile`, so rows cannot be split without a
+concurrency-safe read path (unpack under a write lock and convert outside it, or
+a per-tile read handle; a plain `Mutex<Vec<Tile>>` would serialise the lz4
+decode). **The overlay preview draw itself is done** — see the delivered list.
 
-- **Canvas window → RGB image** (`src/stitch/canvas.rs`): row loop calling
-  `store.with_row`, then `expand_row` (RGB→BGRA, ~42 GB/s). Memory-bound, so
-  parallel rows would need concurrent store reads.
-- **Overlay preview draw** (`draw_preview_on_overlay` in
-  `src/wayland/selection.rs`): per-buffer-pixel copy from the snapshot, executed
-  inside `render_live_overlays`. Not covered by any offline benchmark; measure
-  it first (a probe that calls the renderer on a 4K buffer, or tracing in a live
-  session).
-
-Next step: (a) measure the overlay draw; (b) if it dominates, parallelise it —
-it is a pure write into the overlay buffer from a read-only snapshot, the same
-shape as the two passes already parallelised; (c) only then consider the canvas
-window, whose blocker is `CanvasStore`'s `RefCell` (every read mutates the
-working set through `touch_tile`). A concurrency-safe read path means unpacking
-under a write lock and converting outside it, or a per-tile read handle; a plain
-`Mutex<Vec<Tile>>` would serialise the lz4 decode and is not worth it.
+**Delivered in this pass**: the overlay preview draw splits its destination rows
+across four helpers (4K: 6.29 → 2.40 ms 1:1, 4.27 → 1.90 ms scaled), with a
+pixel-identity test and a full-hole early-out.
 
 ### 2. `replay-frames` reprojection check: 26 s of the 30 s 4K replay
 
