@@ -446,6 +446,18 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
 
 ## Verification Memory
 
+- **Release 0.2.0 (2026-10-24)**: niri HEAD `220c506`, tag `v0.2.0-niri`;
+  plain tag `v0.2.0-plain` at `463788b`. GitHub releases carry x86_64 and
+  aarch64 tarballs (`screenshot-niri-0.2.0-*.tar.gz`,
+  `screenshot-plain-0.2.0-*.tar.gz`), built from the release commits and
+  stripped; the AUR packages `screenshot-niri` and `screenshot-plain` were
+  updated to 0.2.0-1 (prebuilt sources, new sha256 sums). Branches and tags
+  pushed to GitHub and Gitee; `plain` replaced the pre-rebuild branch
+  (`7bc8175`) with a force-with-lease push.
+- **Local install 0.2.0-1 (2026-10-24)**: HEAD `220c506` packaged with the local
+  recipe (pkgrel 1), `makepkg` `check()` passed, installed over 0.1.0-48;
+  `pacman -Qkk` reports 0 altered files (11 total), `/usr/bin/screenshot`
+  reports `screenshot 0.2.0`, binary sha256 `f5e62be4…`.
 - **Local install 0.1.0-48 (2026-10-24)**: HEAD `209b397` (LZ4 tile-store audit: `pack`'s doc no longer claims a never-larger result, an unpack failure now debug-asserts and logs instead of vanishing, `memory_report`'s `logical_bytes` documents the grid it measures; `stitch-bench` prints empty/resident/packed tile counts; axis-fallback truth table test) packaged with the local recipe, pkgrel 48, installed over 0.1.0-47. `makepkg` with `check()` passed (261 tests), `pacman -Qkk` reports 0 altered files (11 total), installed `/usr/bin/screenshot` sha256 `209b3972…`. Audit A/B: lz4 halves the resident canvas (real-1 7.5 vs 15.8 MB, real-long 14.6 vs 33.4 MB) at the same push mean and +0.3-0.6 ms p95 on the largest corpus; `real-5-4k` packs nothing.
 
 - **Local install 0.1.0-47 (2026-10-24)**: HEAD `8841fa2` (`push_frame_sources` split into `begin_frame` / `initialize_frame` / `duplicate_gate` / `prepare_frame` / `choose_axis` / `apply_placement`, with `PreparedFrame` / `AppliedPlacement` carrying the ownership that used to force three locals into one scope) packaged with the local recipe, pkgrel 47, installed over 0.1.0-46. `makepkg` with `check()` passed (260 tests), `pacman -Qkk` reports 0 altered files (11 total), installed `/usr/bin/screenshot` sha256 `8b546269…`. Behaviour-neutral: all 11 corpora identical, clippy 45, `real-5-4k` push 0.82 ms / preview 0.24 ms.
