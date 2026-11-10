@@ -14,21 +14,24 @@ design and measurements).
 
 ## 0. The shape of the program
 
-Two processes, three threads, four coordinate spaces.
+Two processes, three threads (four while saving), four coordinate spaces.
 
 ```
 main thread ──┬─ cli::parse ── config::load
               │
               ├─ [normal] screencopy::capture_outputs ×2  (with / without cursor)
               │           selection::SelectionSession     (layer-shell overlays)
-              │           image::composite_captured_region
-              │           image::write_png  ── clipboard::serve_path_detached
+              │           selection_session.close()       (UI gone from here on)
+              │           + encode thread: composite + image::write_png
+              │           + clipboard::serve_path_detached (in parallel, then join)
               │
               └─ [long]   selection::SelectionSession
                           + LongCaptureWorker thread ── screencopy::CaptureSession
                             (own Wayland connection, own event queue)
                           + stitcher (main thread)
-                          + image::write_png  ── clipboard::serve_path_detached
+                          + selection_session.close()      (UI gone from here on)
+                          + encode thread: image::write_png
+                          + clipboard::serve_path_detached (in parallel, then join)
 
 detached `screenshot --clipboard-provider`   (third process, outlives the run)
 ```
@@ -458,26 +461,41 @@ skipped, leaving the dim mask visible beneath.
 ```
 Enter/Space ─▶ long_finish_requested ─▶ loop breaks
              ─▶ worker.stop()  (stop flag + join)
-             ─▶ selection_session.close()
+             ─▶ selection_session.close()      ← the UI is gone from here on
              ─▶ stitcher.finish()      ─▶ StitchedFrame
-             ─▶ image_from_stitched_frame
-             ─▶ image::write_png
-             ─▶ clipboard::serve_path_detached
+             ─▶ image_from_stitched_frame      (main thread: the tiled store is !Send)
+             ─▶ encode thread: image::write_png ─┐ run in parallel, then join
+             ─▶ clipboard::serve_path_detached  ─┘
+             ─▶ "saved"
 ```
+
+**The foreground ends at `close()`.** Everything after it — the conversion,
+the encode, the clipboard handshake — is background work the user never waits
+behind a frozen overlay for. The encode runs on its own thread with the
+clipboard armed in parallel; the thread is **joined, never detached**: a
+killed writer would leave a truncated PNG on disk. `write_png` uses
+`Compression::Fast` + `Filter::Sub` (measured 27 ms vs 84 ms per 4K frame for
+the default profile), so the join is short.
 
 `image_from_stitched_frame` walks the canvas **one row at a time** through
 `row_into`, not per pixel: a per-pixel accessor would put a working-set lookup
 and a borrow check on every one of them (measured: 3× the cost of the whole rest
-of the frame). Rows the canvas never captured stay RGB-zero and **alpha 0**, so
-ragged corners are see-through in the PNG rather than black.
+of the frame). It stays on the main thread because `CanvasStore`'s compressor
+is `dyn TileCompressor`, deliberately single-threaded. Rows the canvas never
+captured stay RGB-zero and **alpha 0**, so ragged corners are see-through in
+the PNG rather than black.
 
 `write_png` converts to RGBA (`Xrgb8888` → alpha 255, `Argb8888` passthrough),
 because PNG has no XRGB.
 
 `serve_path_detached` spawns `screenshot --clipboard-provider` as a **third
-process**. Wayland requires the data source to stay alive for pastes to succeed,
-so the provider deliberately outlives the capture; a lingering `screenshot` in
-`ps` after a screenshot is expected, not a leak.
+process**. It is armed while the encode may still be running: the provider
+only advertises the *path* and reads the file at paste time, so it does not
+need the PNG to exist yet (a paste inside the ~tens-of-ms encode window fails
+rather than pasting a partial image). Wayland requires the data source to stay
+alive for pastes to succeed, so the provider deliberately outlives the
+capture; a lingering `screenshot` in `ps` after a screenshot is expected, not
+a leak.
 
 ---
 
@@ -486,10 +504,16 @@ so the provider deliberately outlives the capture; a lingering `screenshot` in
 Normal mode never enters sections 5–7. After the selection ends:
 
 ```
-viewport.capture_size(&captures)        ← pixel size of the composite
-viewport.capture_regions(&captures)     ← one crop per covered output
-image::composite_captured_region        ← blit each crop at its dst_x/dst_y
+session.frozen_captures_for_output()    ← materialise the chosen pixels
+session.close()                         ← the frozen overlay disappears HERE
+encode thread: capture_size + capture_regions
+             + composite_captured_region + image::write_png ─┐ in parallel,
+clipboard::serve_path_detached                              ┘ then join, "saved"
 ```
+
+The foreground ends at `close()` — the same rule as long mode: compositing,
+encoding and the clipboard arm are background work, and the user's screen is
+live again while they run.
 
 The captures come from `session.frozen_captures_for_output()`, which materialises
 the stored without-cursor frame plus the `cursor_delta` patch when the user asked
@@ -509,6 +533,7 @@ pixels written are the pixels the overlay displayed, including the `H` decision.
 | The engine's page rows survive an edit and a re-basing | `last_engine_top + delta_y`, `EdgeCanvas::write`'s empty-canvas rebase | deriving the top from the pixel rect, or skipping every row of a negative first commit |
 | A placement is verified by its content, not by a recorded row | `replay-frames`' `locate_in_canvas` (whole-canvas search) | `last_engine_top() - canvas_origin()` across recoveries/edits |
 | The overlay commits only on change | `live_state_seq`, `last_selected` | committing unconditionally |
+| The UI closes before save work begins | `selection_session.close()` ahead of the encode thread (both modes) | compositing or encoding while the overlays are still mapped |
 | Spanning long selections are refused, not clamped | `discard_spanning_long_selection` | clamping in the selection path |
 | `raw_rgb` reads only captured pixels | `RowCoverage` + colour check | reading the bounding box |
 
