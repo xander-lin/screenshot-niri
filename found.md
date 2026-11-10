@@ -503,6 +503,18 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
   3. 用相邻对真值判定时，先问"参考点的锚还描述参考帧的内容吗"；拒绝/seam/编辑都会断链，断链后的第一次放置不可判，**计数而不是猜**。
   4. 对比脚本要进仓库（`tools/dms-cmp/analyze.py`）而不是留在 /tmp——本次第一版的两个错误若不可回放，就无法被 review 出来。
 
+### 44. Release archives were not reproducible, and the AUR pinned a hash of a file nobody downloads
+
+- **Context**: Publishing 0.2.2, the AUR `sha256sums` failed `makepkg`'s validity check even though the uploads had supposedly succeeded. Two separate mistakes hid behind one symptom.
+- **Root cause 1 — non-deterministic packing**: archives were built with a bare `tar czf`. gzip stores the packing time in its header (and by default the member name), so two packs of identical content have different bytes and different hashes. The same content packed at 18:31 and 18:38 differed by 534 541 of 536 829 bytes while every unpacked file was identical (`d8bd48de…` both times) — the mtime sits at the head of the deflate stream, so changing it shifts the whole stream. I misread this as "GitHub repacked the upload"; it did not.
+- **Root cause 2 — hashing the local file instead of the published one**: the x86_64 archives pinned in the AUR were still the 17:18 uploads. A re-pack attempt at 18:29 used a broken `${rest%:*}` split, so four `cp` calls failed and only x86 archives were produced; I believed a fresh set had been re-uploaded. The published assets' `created_at` proved otherwise (x86: 09:18Z, aarch64: 10:34Z). A local hash and a published hash can only agree by luck.
+- **Correction**: added `tools/package-release.sh`, which pins every source of variance (`tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner`, `gzip -9n`), ships `--check-repro` (packs twice, asserts byte equality) and `--verify` (downloads the published assets and compares them against a fresh deterministic pack), and re-pinned every AUR `sha256sum` from the downloaded files, each verified by a real `makepkg -f` run.
+- **Prevention**:
+  1. **Never hash a locally built archive into a PKGBUILD.** Order is upload → download → hash → pin, and the pin is only trustworthy after `makepkg` actually validated it.
+  2. **Any archive consumed by a hash must be packed deterministically**, and that must be enforced by a tool that self-checks (`--check-repro`), not by remembering the flags.
+  3. `--clobber` re-uploading the same names is not evidence that the bytes changed; the release API's `created_at`/`updated_at` is. For 0.2.2 the assets were reported "uploaded" and had the old timestamps — checking the metadata first would have caught it.
+  4. A feature that is not scripted is not a process: this branch had no packaging script at all, so each release re-derived the flags by hand. The script is the fix; keep it the only way assets are produced.
+
 ## Verification Memory
 
 - **Release 0.2.1 (2026-10-24)**: niri HEAD `3076758`, tag `v0.2.1-niri`;
