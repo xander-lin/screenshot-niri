@@ -149,6 +149,15 @@
 - Trace logs: `--features trace-logs` (see `src/trace.rs`).
 - Packaging: `PKGBUILD` (package `screenshot-plain`, conflicts with
   `screenshot-niri`).
+- **Release archives: `tools/package-release.sh` is the only sanctioned way to
+  produce them.** It packs deterministically (`tar --sort=name --mtime=@0
+  --owner=0 --group=0 --numeric-owner` + `gzip -9n`) so the same binaries always
+  yield the same bytes — a bare `tar czf` stamps the packing time into the gzip
+  header and changes the hash without changing the content. `--check-repro`
+  packs twice and asserts byte equality; `--verify DIR` downloads the published
+  assets and compares them against a fresh pack. **Pin AUR `sha256sums` from the
+  downloaded files, never from a local archive**, and only trust the pin after a
+  real `makepkg -f` validated it.
 - Release binaries: x86_64 v3 with a generic fallback; the AUR PKGBUILD
   lists both sources and extracts/installs the one the local CPU can run
   (`avx avx2 bmi1 bmi2 f16c fma movbe` plus `lzcnt` or AMD's `abm`), so one

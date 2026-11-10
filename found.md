@@ -139,6 +139,18 @@ capture, the stitcher, and the corpus verification tooling.
 - **Prevention**: Never delete by line range when functions are interleaved;
   delete by named item, and let the compiler prove the survivors are complete.
 
+### 9. Release archives were not reproducible, and the AUR pinned a hash of a file nobody downloads
+
+- **Context**: A 0.2.2 AUR update failed `makepkg`'s validity check even though the release uploads had reportedly succeeded.
+- **Root cause 1 — non-deterministic packing**: archives were built with a bare `tar czf`. gzip stores the packing time in its header, so two packs of identical content have different bytes: the same content packed 7 minutes apart differed by 534541 of 536829 bytes while every unpacked file was byte-identical. This was initially misread as the host repacking the upload; it does not.
+- **Root cause 2 — hashing the local file instead of the published one**: the pinned x86_64 hashes were of a local archive, while the published assets were older uploads (proven by the release API's `created_at`). A local hash and a published hash only agree by luck.
+- **Correction**: added `tools/package-release.sh`, pinning every source of variance (`--sort=name`, `--mtime=@0`, `--owner=0 --group=0 --numeric-owner`, `gzip -9n`), with `--check-repro` (packs twice, asserts byte equality) and `--verify` (downloads the published assets and compares). All pins re-derived from downloaded files and validated by a real `makepkg -f`.
+- **Prevention**:
+  1. Never hash a locally built archive into a PKGBUILD: upload → download → hash → pin, and only trust the pin after `makepkg` validated it.
+  2. Any archive consumed by a hash must be packed deterministically, enforced by a tool that self-checks, not by remembering flags.
+  3. `--clobber` succeeding is not evidence the bytes changed; check the asset's `created_at`/`updated_at`.
+  4. An unscripted process gets re-derived by hand on every release. Keep one sanctioned packer.
+
 ---
 
 ## Verification Memory
