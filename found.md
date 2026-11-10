@@ -17,7 +17,10 @@ capture, the stitcher, and the corpus verification tooling.
   compositor compatibility to user testing. Out of scope: X11, focus-grab
   extensions, diagnostics bins.
 - **Modules**: `cli` parses args and resolves output paths; `app` orchestrates
-  capture → selection → composite → write → clipboard; `wayland::screencopy`
+  capture → selection → close-UI → composite/write/clipboard — the overlays
+  close at the release, before any save work; the PNG encode runs on a joined
+  background thread (`Compression::Fast` + `Filter::Sub`, atomic temp+rename)
+  while the clipboard is armed in parallel; `wayland::screencopy`
   freezes every output with and without the cursor; `wayland::selection` renders
   the layer-shell overlay and collects geometry; `geometry` maps a logical
   selection to per-output pixel pieces; `image` composites and writes PNG;

@@ -52,7 +52,7 @@
 - Keep docs (`README.md`, `AGENTS.md`, `found.md`) in sync in the same change as
   behaviour milestones. A doc claim the code never implemented is a defect.
 - Verification: `cargo test` and `cargo clippy --all-targets` must stay clean
-  (current: 48 tests, no clippy warnings). Interactive Wayland flows require a
+  (current: 49 tests, no clippy warnings). Interactive Wayland flows require a
   manual pass under a live compositor; ask the user to run it.
 - The plain branch never gains a long-capture feature by accident: deleting
   code must leave the normal path compiling, tested and documented.
@@ -92,6 +92,11 @@
   invalid `--name`, `--output` with `--file`. Verified by parsing/path unit
   tests.
 - **`app`** — Orchestrates freeze → select → composite → write → clipboard.
+  The foreground ends at the release: `SelectionSession::close()` runs before
+  any save work, then the PNG encode runs on a background thread
+  (`Compression::Fast` + `Filter::Sub`) with the clipboard provider armed in
+  parallel; the thread is joined, never detached — a killed writer would
+  truncate the PNG — and `saved` prints after both succeed.
   Launches without compositor-name gating. Must not implement protocol dispatch
   or PNG encoding. Verified by `cargo check` plus a manual capture pass.
 - **`geometry`** — Converts a logical selection into per-output crop rectangles
@@ -105,7 +110,11 @@
   handling, or pixel copying.
 - **`image`** — Represents SHM images, converts XRGB/ARGB8888 to RGBA PNG, and
   blits regions. Readers bound themselves by `stride * height`, never by
-  `data.len()`. No Wayland capture, path policy, or clipboard ownership.
+  `data.len()`. `write_png` is atomic (sibling temp file + rename) and uses
+  `Compression::Fast` + `Filter::Sub` — the final path never holds a partial
+  PNG, which the clipboard provider's arm-during-encode depends on. No Wayland
+  capture, path policy, or clipboard ownership. Verified by blit/format unit
+  tests and a PNG round-trip test.
 - **`clipboard`** — Serves `image/png` or a file URI via `wlr-data-control` from
   a detached child process; the parent waits for a `ready` line before returning.
   No region selection, capture, or path decisions; no external clipboard
@@ -133,7 +142,7 @@
 
 - Build: `cargo build --release` (binary `target/release/screenshot`; Rust 1.88+,
   enforced by `rust-version`).
-- Test: `cargo test` (48 tests, one target: `main.rs` links the library instead
+- Test: `cargo test` (49 tests, one target: `main.rs` links the library instead
   of re-declaring the modules, so the `#[cfg(test)]` blocks run once;
   `[profile.test] opt-level = 2` keeps the pixel tests fast).
 - Lint: `cargo clippy --all-targets` (currently zero warnings).

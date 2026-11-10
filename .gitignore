@@ -1,4 +1,5 @@
 /target/
+/target-generic/
 /pkg/
 /screenshot-niri/
 /screenshot-plain/
@@ -8,3 +9,8 @@
 perf.data*
 *.pkg.tar.*
 *.tar.gz
+
+# Frames captured on the fuller variant's branch: kept on disk only when a
+# checkout is shared with it.
+testdata/frames/**/*.png
+testdata/frames/**/.truth-*.cache
