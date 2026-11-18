@@ -1,0 +1,35 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index d3d7797..2d9e931 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -46,6 +46,7 @@
+ - `src/stitch.rs` + `src/stitch/` → full multi-stage matcher ported from the original (canvas exact placement, perceptual bands, fuzzy hash, fast-motion scan, fixed bands, previous-frame fallback).
+ - `src/wayland/screencopy.rs` → wlr screencopy v3 client; one-shot frozen captures and persistent `CaptureSession` for long mode.
+ - `src/wayland/selection.rs` → layer-shell overlay: frozen/dimmed selection UI, drag redraw, long-mode preview and status, pointer passthrough for capture.
++- `docs/hyprland-findings.md` → Hyprland 兼容性问题调研（三个问题的触发条件、上游源码证据、版本时间线、可做的规避、待实测清单）。
+ - `src/geometry.rs`, `src/image.rs`, `src/cli.rs`, `src/clipboard.rs` → see Module Contracts below.
+ 
+ ## Module Contracts
+diff --git a/found.md b/found.md
+index b14f3e8..9b46cdd 100644
+--- a/found.md
++++ b/found.md
+@@ -95,6 +95,13 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
+ - **Correction**: Preserve actual covered row intervals and copy newly captured strips inside the old bounds; initialize empty rows from the frame extent; export empty rows transparent.
+ - **Prevention**: Run a textured wide → narrow → scroll → wide sequence asserting every pixel and alpha, then repeat resizing. Recaptured strips must contain pixels; uncaptured strips must stay transparent.
+ 
++### 12. Cited upstream default values from memory, which inverted a problem's root cause
++
++- **Context**: While diagnosing Hyprland screenshot/cursor behavior, an assertion was made that `cursor:hide_on_key_press` defaults to enabled and therefore the launch hotkey hides the cursor, attributing the "requested cursor frame has no cursor" problem to default behavior. Checking the release source (`src/config/values/ConfigValues.cpp`, v0.56.2) showed `hide_on_key_press` defaults to `false`, `inactive_timeout` to `0` (never), and `invisible` to `false` — with defaults, the cursor is not hidden at all.
++- **Root cause**: Upstream default values and behaviors were quoted from memory/wiki impressions instead of being verified against the actual source of the pinned version.
++- **Correction**: Re-read the release source option table line by line; re-scoped that problem to "requires the user to have enabled a hide-related option", and documented the corrected attribution.
++- **Prevention**: Any assertion about an external dependency's behavior (default values, version, exact semantics) MUST cite a source file + line, or an official record. Mark unverified claims explicitly as unverified and never use them as a premise for reasoning or fixes.
++
+ ---
+ 
+ ## Verification Memory
+@@ -102,3 +109,4 @@ Lesson entry format: **Context**, **Root cause**, **Correction**, **Prevention**
+ - **2026-10-12 final state**: 133 lib + 153 bin tests pass (two profiling tests ignored); `cargo check --locked` and `cargo build --release --locked` pass. Two pre-existing clippy errors (`absurd_extreme_comparisons`) and two unused-import warnings in `cli.rs` exist at the prior commit and were not introduced by recent work.
+ - Release-binary smoke checks with Niri hints unset and desktop set to `sway` reached the deliberately unavailable Wayland connection instead of a compositor-name rejection.
+ - Wayland dispatch/compositor behavior (input grabbing, wheel blocking, passthrough toggling, live capture) remains manually testable only under a live session; unit tests cover the pure logic and pixel rendering.
++- **Hyprland findings (2026-10-12)**: `docs/hyprland-findings.md` records three Hyprland-side problems (wheel passthrough, missing cursor in cursor-requested frames, cursor not removable from region frames), each with triggers, upstream evidence, and what remains separately fixable on our side. Mechanisms are source-verified; none reproduced end-to-end on a live Hyprland session yet.
