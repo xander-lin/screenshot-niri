@@ -100,8 +100,11 @@ Concise boundaries for each module: what it owns, what it must not do, and how i
 - Trace logs: `--features trace-logs` (see `src/trace.rs` env gates).
 - Packaging: `PKGBUILD` (package `screenshot-niri`, conflicts with `screenshot-plain`).
 - **Release archives: `tools/package-release.sh` is the only sanctioned way to produce them.** It packs deterministically (`tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner` + `gzip -9n`) so the same binaries always yield the same bytes — a bare `tar czf` stamps the packing time into the gzip header and changes the hash without changing the content (found.md lesson 44). `--check-repro` packs twice and asserts byte equality; `--verify DIR` downloads the published assets and compares them against a fresh pack. **Pin AUR `sha256sums` from the downloaded files, never from a local archive**, and only trust the pin after a real `makepkg -f` validated it.
+- **The packer refuses a mixed-variant release** (found.md lesson 45 — 0.2.2 shipped the `plain` binary inside the `niri` package because the binaries came from `target/` while the README came from whatever branch was checked out): it requires the checkout to be the branch `--pkg` names (or the exact `v<version>-<variant>` tag) with `README.md`/`LICENSE` unmodified, requires each binary's ELF machine to match its label, probes every natively runnable binary for `screenshot <version>` plus the variant's own `--help` markers and none of the other variant's, requires binaries newer than the newest tracked source, forbids two labels sharing one binary, and re-probes each finished archive after unpacking it. Never bypass it with a hand-rolled `tar czf`: a version string that matches proves nothing about which branch the binary came from.
 - Release binaries: x86_64 with `RUSTFLAGS="-C target-cpu=x86-64-v3"` (and a
-  `-x86_64-generic` fallback asset), aarch64 at the architecture default. The
+  `-x86_64-generic` fallback asset), aarch64 at the architecture default. Build
+  each CPU baseline into its own `CARGO_TARGET_DIR` (`target/`,
+  `target-generic/`) or the last build overwrites the asset. The
   AUR PKGBUILD lists both x86_64 sources and extracts/installs only the one the
   local CPU can run (`avx avx2 bmi1 bmi2 f16c fma movbe` plus `lzcnt` or AMD's
   `abm`); one binary is installed either way. PGO is not used: measured
