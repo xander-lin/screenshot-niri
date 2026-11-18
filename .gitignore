@@ -1,4 +1,7 @@
 /target/
+# The x86-64-generic baseline builds into its own target dir so it cannot
+# overwrite the v3 asset (see the release section in AGENTS.md).
+/target-generic/
 /pkg/
 /screenshot-niri/
 .idea/
